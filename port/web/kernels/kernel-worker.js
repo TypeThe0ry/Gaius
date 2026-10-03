@@ -11,6 +11,7 @@
 //   dealloc(ptr, len)           optional, releases the payload after the run
 //   release(hdr)                optional, releases the result after it was copied out
 //   reset()                     optional, called after every job (arena allocators)
+//   trim() / <name>_trim()      optional, drop cached state and scratch buffers (memory pressure)
 //
 // One worker can host several kernels (mesh, light, worldgen, noise), one instance each, so
 // the runtime keeps a single pool of generic workers and loads a kernel where it is needed.
@@ -23,10 +24,11 @@
 //   {type: "unload", kernel}
 //   {type: "job", id, kernel?, kind, payload}           kernel defaults to the init module
 //   {type: "cancel", id}
+//   {type: "trim"}                                      call the trim exports of every instance
 // Messages out:
 //   {type: "ready", kinds}, {type: "init-error", message}
 //   {type: "loaded", kernel, kinds, memoryBytes}, {type: "load-error", kernel, message}
-//   {type: "unloaded", kernel}
+//   {type: "unloaded", kernel}, {type: "trimmed", kernel, memoryBytes}
 //   {type: "result", id, result, execMs, kernel, memoryBytes}
 //   {type: "error", id, code, status?, message, execMs?, kernel}
 //   {type: "cancelled", id}
@@ -212,6 +214,25 @@
     }
   }
 
+  // Runs between jobs (message handlers never interleave with runJob). A trim that traps drops
+  // the instance like a trapping job does.
+  function trimAll() {
+    kernels.forEach((state, name) => {
+      if (state.instance === null) return;
+      const exports = state.instance.exports;
+      try {
+        for (const key of Object.keys(exports)) {
+          if ((key === "trim" || key.endsWith("_trim")) && typeof exports[key] === "function") exports[key]();
+        }
+      } catch (_) {
+        state.instance = null;
+        return;
+      }
+      const memory = memoryOf(exports, state);
+      post({type: "trimmed", kernel: name, memoryBytes: memory ? memory.buffer.byteLength : 0});
+    });
+  }
+
   function scheduleDrain() {
     if (draining || queue.length === 0 || kernels.size === 0) return;
     draining = true;
@@ -269,6 +290,8 @@
     } else if (message.type === "job") {
       queue.push(message);
       scheduleDrain();
+    } else if (message.type === "trim") {
+      trimAll();
     } else if (message.type === "cancel") {
       const index = queue.findIndex((job) => job.id === message.id);
       if (index >= 0) {

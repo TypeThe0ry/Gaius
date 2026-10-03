@@ -83,6 +83,33 @@ def exercise_profile(profile_path: Path, directory: Path) -> None:
     text = first_bytes.decode("utf-8")
     require(text, f"<title>Gaius Client {profile_id}</title>", profile_id)
     require(text, f'window.__gaiusProfileId = "{profile_id}";', profile_id)
+    # The quality layer reads the profile id: it is set in <head> before the boot script tag,
+    # and once more with the storage globals.
+    head = text.split("</head>", 1)[0]
+    early = head.find('<script data-gaius-profile-early="v1">')
+    boot = head.find('<script data-gaius-boot="v1" src="gaius-boot.js"></script>')
+    if early < 0 or boot < 0 or early > boot or head.count('data-gaius-profile-early="v1"') != 1:
+        raise AssertionError(f"launcher for {profile_id} does not set the profile id before gaius-boot.js")
+    if f'window.__gaiusProfileId = "{profile_id}";' not in head[early:boot]:
+        raise AssertionError(f"launcher for {profile_id} sets the wrong early profile id")
+    if text.count(f'window.__gaiusProfileId = "{profile_id}";') != 2 or 'window.__gaiusProfileId = "template";' in text:
+        raise AssertionError(f"launcher for {profile_id} has a stale profile id")
+    for contract in (
+        "window.__gaiusApplyQualityPixelRatio = function applyGaiusQualityPixelRatio()",
+        "quality.resolvePixelRatio(Number(devicePixelRatio) || 1.0)",
+        "try { GaiusQuality.caps.ensureTier(); } catch (e) {}",
+        "if (window.__gaiusApplyQualityPixelRatio) window.__gaiusApplyQualityPixelRatio();",
+        "if (gaiusRenderScaleGovernsFps()) {",
+        'canvas.style.imageRendering = wanted;',
+        'urlParams.get("gaiusPixelated") === "0"',
+    ):
+        require(text, contract, profile_id)
+    # ensureTier and the ratio cap run after storage is ready and before main(args).
+    fs_ready = text.index("await window.__gaiusFsReady;")
+    tier = text.index("try { GaiusQuality.caps.ensureTier(); } catch (e) {}")
+    main_call = text.index("main(window.__gaiusDefaultArgs);")
+    if not fs_ready < tier < main_call:
+        raise AssertionError(f"launcher for {profile_id} picks the quality tier outside the boot window")
     require(text, f"window.__gaiusWorldVersion = {profile['worldVersion']};", profile_id)
     require(text, f"window.__gaiusStorageSchema = {storage['schema']};", profile_id)
     require(text, f'window.__gaiusStorageDatabaseName = "{storage["databaseName"]}";', profile_id)

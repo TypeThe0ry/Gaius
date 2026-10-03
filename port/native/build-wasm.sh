@@ -13,8 +13,12 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=wasm32-unknown-unknown
 OUT="$HERE/target/$TARGET/release"
 BASELINE_OUT="$HERE/target/wasm-baseline/$TARGET/release"
-# crate name -> run_<kind> exports it must provide; the first one runs the probe jobs
-KERNELS=("gaius_noise_wasm:run_noise_points" "gaius_mesher_wasm:run_mesh_section,run_load_model_table")
+# crate name : run_<kind> exports it must provide (the first one runs the probe jobs) : probe
+# example (named per crate, since cargo examples share one output directory)
+KERNELS=(
+    "gaius_noise_wasm:run_noise_points:wasm_probe"
+    "gaius_mesher_wasm:run_mesh_section,run_load_model_table:mesher_wasm_probe"
+)
 
 check=0
 case "${1:-}" in
@@ -57,8 +61,10 @@ if (( check )); then
         crate="${entry%%:*}"
         probe="$HERE/target/wasm-probe/$crate"
         rm -rf "$probe"
-        cargo run --quiet --locked -p "${crate//_/-}" --example wasm_probe -- "$probe"
-        IFS=',' read -r -a exports <<< "${entry#*:}"
+        rest="${entry#*:}"
+        example="${rest##*:}"
+        cargo run --quiet --locked -p "${crate//_/-}" --example "$example" -- "$probe"
+        IFS=',' read -r -a exports <<< "${rest%%:*}"
         for dir in "$OUT" "$BASELINE_OUT"; do
             node "$HERE/wasm-check.mjs" "$dir/$crate.wasm" "$probe" "${exports[@]}"
         done

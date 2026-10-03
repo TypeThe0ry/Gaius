@@ -10,9 +10,11 @@
 // convention. Checks: the facade is unusable without a runner and usable with the client, jobs
 // carry the "worldgen" kernel and the chunk position, terrain and biome results reach the Java
 // callbacks as flat arrays of the right sizes, jobs carry the server-side distance hint, a kept
-// noise chunk plus its surface diff reproduce the full surface result, a transient refusal reports
-// "transient:" and keeps the generator, a kernel failure disables the generator, and drain()
-// settles a job the runner never answers.
+// noise chunk plus its surface diff reproduce the full surface result, ring biomes the neighbours
+// store reach the terrain and stored surface jobs (computed ones change nothing, an unknown biome
+// is a transient "worldgen-fallback:" refusal), a transient refusal reports "transient:" and keeps
+// the generator, a kernel failure disables the generator, and drain() settles a job the runner
+// never answers.
 import assert from "node:assert/strict";
 import {existsSync, readFileSync} from "node:fs";
 import {dirname, join} from "node:path";
@@ -148,6 +150,49 @@ for (const profile of ["26.3", "26.2"]) {
   const again = await call((ok, err) => facade.submitSurfaceStored(key, noise.value.token, 0, 0, new Int32Array(9), ok, err));
   assert.ok(!again.ok && again.message.startsWith("transient:"), "a kept chunk is consumed once");
 
+  // Ring biomes (what the neighbours store around chunk 0,0): neighbours storing the biomes the
+  // kernel computes change nothing; a biome outside the generator's table only refuses the chunk.
+  const neighbours = new Map();
+  for (let nx = -1; nx <= 1; nx++) {
+    for (let nz = -1; nz <= 1; nz++) {
+      if (nx === 0 && nz === 0) continue;
+      const ids = await call((ok, err) => facade.submitBiomes(key, nx, nz, ok, err));
+      assert.ok(ids.ok, ids.message);
+      neighbours.set(nx + "," + nz, ids.value);
+    }
+  }
+  const quartsY = full.value.sectionCount * 4;
+  const ring = [];
+  for (let gx = 0; gx < 6; gx++) {
+    for (let gz = 0; gz < 6; gz++) {
+      if (gx >= 1 && gx <= 4 && gz >= 1 && gz <= 4) continue;
+      const qx = gx - 1;
+      const qz = gz - 1;
+      const ids = neighbours.get((qx >> 2) + "," + (qz >> 2));
+      for (let y = 0; y < quartsY; y++) ring.push(ids[(y >> 2) * 64 + ((y & 3) * 4 + (qz & 3)) * 4 + (qx & 3)]);
+    }
+  }
+  const ringBiomes = new Int32Array(ring);
+  const sameChunk = (a, b) => a.palettes.join() === b.palettes.join() && a.indices.join() === b.indices.join()
+    && a.uniform.join() === b.uniform.join();
+  const ringed = await call((ok, err) => facade.submitTerrain(key, 0, 0, 1, new Int32Array(9), ok, err, ringBiomes));
+  assert.ok(ringed.ok, ringed.message);
+  assert.ok(sameChunk(ringed.value, full.value), "a ring of computed biomes keeps the terrain result");
+  const keptAgain = await call((ok, err) => facade.submitTerrain(key, 0, 0, keep, new Int32Array(9), ok, err));
+  assert.ok(keptAgain.ok, keptAgain.message);
+  const ringedDiff = await call((ok, err) => facade.submitSurfaceStored(key, keptAgain.value.token, 0, 0,
+    new Int32Array(9), ok, err, ringBiomes));
+  assert.ok(ringedDiff.ok, ringedDiff.message);
+  assert.equal(ringedDiff.value.positions.join(), diff.value.positions.join(), "a ring of computed biomes keeps the diff");
+  assert.equal(ringedDiff.value.states.join(), diff.value.states.join());
+  const foreign = ringBiomes.slice();
+  foreign[5] = 0x7fff0000;
+  const refusedRing = await call((ok, err) => facade.submitTerrain(key, 0, 0, 1, new Int32Array(9), ok, err, foreign));
+  assert.ok(!refusedRing.ok && refusedRing.message.startsWith("transient:")
+    && refusedRing.message.indexOf(facade.FALLBACK_PREFIX) >= 0, refusedRing.message);
+  assert.equal(facade.generatorUsable(key), true, "an unknown neighbour biome keeps the generator");
+  assert.ok(facade.telemetry().ringFallbacks >= 1);
+
   mode = "backpressure";
   const refused = await call((ok, err) => facade.submitTerrain(key, 4, -2, 1, new Int32Array(9), ok, err));
   assert.equal(refused.ok, false);
@@ -160,7 +205,7 @@ for (const profile of ["26.3", "26.2"]) {
   assert.ok(!trapped.message.startsWith("transient:"), trapped.message);
   assert.equal(facade.generatorUsable(key), false, "a kernel failure disables the generator");
   console.log(`ok   ${profile}: facade over the runtime client (terrain ${chunk.sectionCount} sections, biomes,`
-    + ` surface diff ${diff.value.count} blocks, transient and fatal errors)`);
+    + ` surface diff ${diff.value.count} blocks, ring biomes, transient and fatal errors)`);
   checks++;
 }
 assert.ok(checks > 0, `no example IR in ${wasmDir}`);

@@ -7,8 +7,8 @@
 //! | -------------------- | -------- | ----------------------------------------- |
 //! | `run_load_generator` | `0x0401` | generator IR, memory budget               |
 //! | `run_biomes`         | `0x0402` | chunk position                            |
-//! | `run_terrain`        | `0x0403` | chunk position, flags, beardifier inputs  |
-//! | `run_surface`        | `0x0404` | a filled chunk to run the surface rules on |
+//! | `run_terrain`        | `0x0403` | chunk position, flags, beardifier inputs, neighbour biomes |
+//! | `run_surface`        | `0x0404` | a filled chunk to run the surface rules on, neighbour biomes |
 //!
 //! Generators stay loaded in the instance between jobs; `reset` is not
 //! exported, so the kernel worker keeps the instance (and the generators) alive.

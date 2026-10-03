@@ -33,6 +33,12 @@ SOURCE_DIRECTORIES = (
     "port/overrides",
     "port/tools/src/main",
     "port/wasm/hotpath",
+    # The v0.4 page runtime every distribution ships next to (or inlined into) the launcher:
+    # boot script, Service Worker, kernel runtime/worker/job codecs and the quality layer.
+    "port/web/boot",
+    "port/web/sw",
+    "port/web/kernels",
+    "port/web/runtime",
 )
 SOURCE_FILES = (
     "VERSION",

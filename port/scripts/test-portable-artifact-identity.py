@@ -1056,6 +1056,35 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             self.assertNotIn("__gaiusShaderToolchain", html)
             self.assertNotIn("data-gaius-shader-toolchain", html)
 
+    def test_release_artifact_contract_reads_the_portable_payload(self) -> None:
+        """build-teavm-release.sh gates every release on this smoke; it must parse the page we emit."""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        smoke = Path(__file__).resolve().parents[2] / "apps" / "bridge" / "browser-full-path-artifact-contract-smoke.mjs"
+        markers = (b"__gaiusClientPacketDrainEnabled;clientPacketDrainSession;"
+                   b"clientPacketDrainDemandToken;clientPacketDrainDisabledRequests;")
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(
+                directory,
+                classes=b'"use strict";/*gaius-java-finite-long-cast*/target-attestation;262-startup;' + markers,
+            )
+            self.run_build(root, dist, output)
+            self.assertNotIn(b"\r", output.read_bytes(), "the portable page is written with LF on every host")
+            env = {key: value for key, value in os.environ.items() if not key.startswith("GAIUS_")}
+            env.update({"GAIUS_VERSION_PROFILE_PATH": "versions/26.2.json", "GAIUS_DIST_DIRECTORY": str(dist)})
+            for label in ("lf", "crlf"):
+                if label == "crlf":
+                    # A page that went through a CRLF checkout or editor still passes the gate.
+                    output.write_bytes(output.read_bytes().replace(b"\n", b"\r\n"))
+                result = subprocess.run([node, str(smoke)], env=env, text=True, capture_output=True,
+                                        timeout=120, check=False)
+                self.assertEqual(result.returncode, 0, f"{label}: {result.stderr}")
+                report = json.loads(result.stdout)
+                self.assertEqual(report["status"], "pass", label)
+                self.assertEqual(report["artifact"]["embeddedClassesBytes"],
+                                 len((dist / "classes.js").read_bytes()), label)
+
     def test_portable_bootstrap_unpacks_every_asset(self) -> None:
         """Runs the generated bootstrap in node with a fake DOM (main-thread decoder path)."""
         node = shutil.which("node")

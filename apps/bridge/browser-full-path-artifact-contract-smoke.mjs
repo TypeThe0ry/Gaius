@@ -46,19 +46,54 @@ function markerCounts(text) {
   ]));
 }
 
+// gaius-b7 (build-portable-html.py): every 8 characters carry 7 bytes as 7-bit groups; the
+// four groups an HTML text node would alter (NUL, LF, CR, '<') travel as U+0080..U+0083.
+const B7_ESCAPES = Object.freeze([0x00, 0x0a, 0x0d, 0x3c]);
+
+function decodeB7(text, length) {
+  const groups = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    groups[i] = code >= 0x80 && code <= 0x83 ? B7_ESCAPES[code - 0x80] : code;
+  }
+  const out = Buffer.alloc(Math.floor(groups.length / 8) * 7);
+  for (let s = 0, o = 0; s + 8 <= groups.length; s += 8, o += 7) {
+    const g = groups.subarray(s, s + 8);
+    out[o] = (g[0] << 1) | (g[1] >> 6);
+    out[o + 1] = ((g[1] & 63) << 2) | (g[2] >> 5);
+    out[o + 2] = ((g[2] & 31) << 3) | (g[3] >> 4);
+    out[o + 3] = ((g[3] & 15) << 4) | (g[4] >> 3);
+    out[o + 4] = ((g[4] & 7) << 5) | (g[5] >> 2);
+    out[o + 5] = ((g[5] & 3) << 6) | (g[6] >> 1);
+    out[o + 6] = ((g[6] & 1) << 7) | g[7];
+  }
+  assert.ok(length <= out.length, "gaius-b7 classes text is shorter than its declared length");
+  return out.subarray(0, length);
+}
+
 function embeddedClassesGzip(html) {
-  const prefix = "const embedded = ";
-  const start = html.indexOf(prefix);
-  assert.ok(start >= 0, "portable HTML has no embedded asset object");
-  const suffix = html.indexOf("const workerSource", start + prefix.length);
-  assert.ok(suffix >= 0, "portable HTML has no worker-source boundary");
-  const objectEnd = html.lastIndexOf("};", suffix);
-  assert.ok(objectEnd > start, "portable HTML embedded asset object is truncated");
-  const objectText = html.slice(start + prefix.length, objectEnd + 1);
-  const embedded = JSON.parse(objectText);
-  assert.ok(Array.isArray(embedded.classes) && embedded.classes.length > 0,
-    "portable HTML has no embedded classes gzip chunks");
-  return Buffer.from(embedded.classes.join(""), "base64");
+  const marker = "const portablePayload = ";
+  const start = html.indexOf(marker);
+  assert.ok(start >= 0, "portable HTML has no portable payload index");
+  // The index JSON holds names, numbers and hashes only (no ';'), and the page
+  // may have been written with CRLF line endings on Windows.
+  const end = html.indexOf(";", start + marker.length);
+  assert.ok(end > start, "portable payload index is truncated");
+  const index = JSON.parse(html.slice(start + marker.length, end));
+  assert.equal(index?.encoding, "gaius-b7-v1", "portable payload encoding mismatch");
+  const info = index?.assets?.classes;
+  assert.ok(info && info.gzip === true && info.bytes > 0,
+    "portable HTML has no embedded classes asset");
+  const pattern = /<script type="text\/x-gaius-b7" data-gaius-asset="classes" data-part="(\d+)">([^<]*)<\/script>/gu;
+  const parts = [];
+  for (const match of html.matchAll(pattern)) {
+    assert.equal(Number(match[1]), parts.length, "portable classes parts are out of order");
+    parts.push(match[2]);
+  }
+  assert.equal(parts.length, info.parts, "portable classes part count mismatch");
+  const bytes = decodeB7(parts.join(""), info.bytes);
+  assert.equal(sha256(bytes), info.sha256, "portable classes gzip hash mismatch");
+  return bytes;
 }
 
 async function inspectArtifact() {

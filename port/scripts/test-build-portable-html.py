@@ -126,8 +126,19 @@ setTimeout(() => {
         self.assertIn("gaius-boot.js", hashes)
         # The boot script runs last, after every module it would otherwise load.
         self.assertGreater(inline.rindex("__gaiusBoot ="), inline.rindex("data-gaius-boot-module"))
+        # The server Worker's scripts ride along as inert text the boot script hands over.
+        for name in PORTABLE.SERVER_WORKER_MODULES:
+            self.assertIn(f'<script type="text/plain" data-gaius-worker-script="{name}">\n', inline)
+            self.assertIn(f"server-worker/{name}", hashes)
+        self.assertNotIn('<script data-gaius-boot-module="kernels/worldgen-kernel.js">', inline)
+        for name in PORTABLE.QUALITY_MODULES:
+            self.assertIn(f'<script data-gaius-boot-module="{name}">', inline)
         template = (root / "port" / "web" / "launcher" / "index.template.html").read_text(encoding="utf-8")
         self.assertEqual(template.count(PORTABLE.BOOT_TAG), 1)
+        # The profile id the quality layer reads is set in <head> before the inlined modules.
+        early = template.index('<script data-gaius-profile-early="v1">')
+        self.assertLess(early, template.index(PORTABLE.BOOT_TAG))
+        self.assertLess(template.index(PORTABLE.BOOT_TAG), template.index("</head>"))
 
     def test_atomic_write_replaces_complete_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One command for the whole native kernel stack: golden fixtures, Rust parity and unit tests,
-# the release wasm build and the node checks of the wasm module and the kernel pool.
+# the release wasm builds of every kernel and the node checks of the modules, the kernel pool and
+# the kernel runtime.
 #
 #   port/native/check.sh           regenerate fixtures only when missing or older than the
 #                                  golden harness or the client jars, then run everything
@@ -103,8 +104,19 @@ command -v node > /dev/null || die "node not found"
 step "wasm kernel against the golden fixtures"
 node "$HERE/wasm-fixture-check.mjs" "$WASM"
 
+step "light kernel (simd128 and baseline) through light-job.js"
+./build-light-wasm.sh --check
+
+step "worldgen kernel (simd128 and baseline) and its pool"
+./build-worldgen-wasm.sh --check
+cargo run --quiet --locked -p gaius-worldgen-wasm --example example_ir -- target/wasm-worldgen
+node "$ROOT/port/scripts/worldgen-kernel-pool-smoke.mjs"
+
 step "kernel pool runtime (simulated workers)"
 node "$ROOT/port/scripts/kernel-pool-smoke.mjs"
+
+step "kernel runtime: priorities, budget, primers, trimming (simulated workers)"
+node "$ROOT/port/scripts/kernel-runtime-smoke.mjs"
 
 step "noise kernel through the kernel pool (worker threads)"
 node "$ROOT/port/scripts/native-noise-pool-smoke.mjs" "$WASM"

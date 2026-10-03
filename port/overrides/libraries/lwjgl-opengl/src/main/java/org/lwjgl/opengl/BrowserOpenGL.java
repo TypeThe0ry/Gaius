@@ -2757,6 +2757,17 @@ public final class BrowserOpenGL {
                 const gl=window.__gaiusWebGL;
                 const vao=this.getVaoEmu();
                 this.lastDrawMode=mode|0;
+                // Identity of the latest draw, read by terrainBatchDraw to prove that a run's
+                // vanilla lead draw really reached GL: serial, program, vertex array, index
+                // count and base vertex (-1 count for array draws).
+                const drawKind=kind|0;
+                this.drawSerial=((this.drawSerial|0)+1)|0;
+                this.lastDrawProgram=this.currentProgram|0;
+                this.lastDrawVao=vao;
+                this.lastDrawCount=(drawKind===1 || drawKind===3 || drawKind===4
+                  || drawKind===5 || drawKind===7) ? (a|0) : -1;
+                this.lastDrawBaseVertex=drawKind===4 ? (d|0)
+                  : ((drawKind===5 || drawKind===7) ? (e|0) : 0);
                 const drawFramebuffer=this.framebufferBindings.draw|0;
                 let disabled=null;
                 let stats=null;
@@ -3483,22 +3494,38 @@ public final class BrowserOpenGL {
      * {@code data} holds {@code drawCount} records of eight ints: index count, first index,
      * base vertex, index size in bytes, section origin x/y/z and the visibility float bits.
      * kind 0 reads the shared quad index buffer, kind 1 the baked copy of a custom index
-     * heap. Returns {@code drawCount} when every section was drawn and 0 when nothing was
-     * (the caller then draws the run through the vanilla path).
+     * heap. {@code leadSerial} is {@link #drawSerial()} read just before the vanilla call that
+     * ends with the run's lead draw, whose index count and base vertex follow: the batch is
+     * refused unless that draw was the last one issued (a vanilla call that drew nothing, as
+     * 26.2 does for a pipeline it cannot set up, leaves an earlier draw's state bound).
+     * Returns {@code drawCount} when every section was drawn and 0 when nothing was (the
+     * caller then draws the run through the vanilla path).
      */
-    public static int terrainMultiDraw(int kind, int[] data, int drawCount) {
+    public static int terrainMultiDraw(int kind, int[] data, int drawCount, int leadSerial,
+            int leadIndexCount, int leadBaseVertex) {
         if (drawCount <= 0 || data == null || data.length < drawCount * 8) {
             return 0;
         }
-        return terrainMultiDrawJs(kind, Int32Array.fromJavaArray(data), drawCount);
+        return terrainMultiDrawJs(kind, Int32Array.fromJavaArray(data), drawCount, leadSerial,
+                leadIndexCount, leadBaseVertex);
     }
 
-    @JSBody(params = {"kind", "data", "drawCount"}, script = """
+    @JSBody(params = {"kind", "data", "drawCount", "leadSerial", "leadCount", "leadBaseVertex"},
+            script = """
             const state=window.__gaiusGL;
             return state && state.terrainBatchDraw
-              ? (state.terrainBatchDraw(kind|0,data,drawCount|0)|0) : 0;
+              ? (state.terrainBatchDraw(kind|0,data,drawCount|0,leadSerial|0,leadCount|0,
+                  leadBaseVertex|0)|0) : 0;
             """)
-    private static native int terrainMultiDrawJs(int kind, Int32Array data, int drawCount);
+    private static native int terrainMultiDrawJs(int kind, Int32Array data, int drawCount,
+            int leadSerial, int leadCount, int leadBaseVertex);
+
+    /** Draws issued through executeDraw so far (wrapping); see {@link #terrainMultiDraw}. */
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            return state ? (state.drawSerial|0) : 0;
+            """)
+    public static native int drawSerial();
 
     /**
      * Writes bytes straight into a range of a buffer (for example a terrain heap allocation)
@@ -3999,29 +4026,43 @@ public final class BrowserOpenGL {
               const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
               stats.terrainBatchPrograms=this.terrainPrograms.size;
             };
-            // After linking: a program built from rewritten terrain shaders that fails to link
-            // is relinked from the untouched sources, so the rewrite can never cost a pipeline.
+            // After linking: a program built from rewritten terrain shaders that fails to link,
+            // or that pairs one with a shader whose rewrite was reverted (compileShader, or an
+            // earlier link fallback of a shared shader), is relinked from the untouched sources
+            // and stays unbatched, so the rewrite can never cost a pipeline and a batched draw
+            // never reads the lead draw's vanilla ChunkSection values.
             state.finishTerrainLink=function(program) {
               const id=program|0;
               const object=this.programs.get(id);
               if (!object) return;
               const attached=this.programAttachments.get(id);
               let rewritten=false;
+              let reverted=false;
               if (attached) {
                 attached.forEach(function(shader) {
                   if (state.terrainShaderOriginals.has(shader|0)) rewritten=true;
+                  if (state.terrainShaderReverted && state.terrainShaderReverted.has(shader|0)) {
+                    reverted=true;
+                  }
                 });
               }
               if (!rewritten) {
                 this.terrainPrograms.delete(id);
                 return;
               }
-              if (!gl.getProgramParameter(object,gl.LINK_STATUS)) {
+              const linked=!!gl.getProgramParameter(object,gl.LINK_STATUS);
+              if (reverted || !linked) {
                 const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
-                stats.terrainShaderLinkFallbacks=(stats.terrainShaderLinkFallbacks||0)+1;
-                try {
-                  stats.terrainShaderLinkFallbackLog=String(gl.getProgramInfoLog(object) || '').slice(0,512);
-                } catch (ignored) {}
+                if (linked) {
+                  stats.terrainShaderMixedFallbacks=(stats.terrainShaderMixedFallbacks||0)+1;
+                } else {
+                  stats.terrainShaderLinkFallbacks=(stats.terrainShaderLinkFallbacks||0)+1;
+                  try {
+                    stats.terrainShaderLinkFallbackLog=String(gl.getProgramInfoLog(object) || '').slice(0,512);
+                  } catch (ignored) {}
+                }
+                const revertedSet=state.terrainShaderReverted
+                  || (state.terrainShaderReverted=new Set());
                 attached.forEach(function(shader) {
                   const original=state.terrainShaderOriginals.get(shader|0);
                   const shaderObject=state.shaders.get(shader|0);
@@ -4029,6 +4070,8 @@ public final class BrowserOpenGL {
                   gl.shaderSource(shaderObject,original);
                   gl.compileShader(shaderObject);
                   state.terrainShaderOriginals.delete(shader|0);
+                  if (state.terrainShaderAlternates) state.terrainShaderAlternates.delete(shader|0);
+                  revertedSet.add(shader|0);
                 });
                 gl.linkProgram(object);
                 this.terrainPrograms.delete(id);
@@ -4044,8 +4087,10 @@ public final class BrowserOpenGL {
             };
             // data: 8 ints per draw [indexCount, firstIndex, baseVertex, indexBytes,
             // sectionX, sectionY, sectionZ, visibilityBits]. kind 0 = sequential quad
-            // indices, kind 1 = custom index heap. Draws all or nothing; returns the count.
-            state.terrainBatchDraw=function(kind,data,drawCount) {
+            // indices, kind 1 = custom index heap. leadSerial is drawSerial before the vanilla
+            // call that ends with the run's lead draw (leadCount indices, leadBaseVertex).
+            // Draws all or nothing; returns the count.
+            state.terrainBatchDraw=function(kind,data,drawCount,leadSerial,leadCount,leadBaseVertex) {
               const n=drawCount|0;
               if (n<=0 || !data || data.length<n*8) return 0;
               if (!this.terrainBatchEnabled || this.gpuSubmissionBlocked || this.gpuContextLost) {
@@ -4054,6 +4099,18 @@ public final class BrowserOpenGL {
               const info=this.terrainPrograms.get(this.currentProgram|0);
               if (!info || !info.ready) return this.terrainBatchReject('program');
               const vao=this.getVaoEmu();
+              // The batch reuses the lead draw's program, vertex array, index buffer and
+              // uniforms, so that draw must have been the last one issued. A vanilla call that
+              // drew nothing (26.2 returns early when its pipeline cannot be set up) leaves
+              // an earlier draw's state bound, often for another vertex heap.
+              if ((this.drawSerial|0)===(leadSerial|0)) {
+                return this.terrainBatchReject('no-lead-draw');
+              }
+              if (this.lastDrawVao!==vao || (this.lastDrawProgram|0)!==(this.currentProgram|0)
+                  || (this.lastDrawCount|0)!==(leadCount|0)
+                  || (this.lastDrawBaseVertex|0)!==(leadBaseVertex|0)) {
+                return this.terrainBatchReject('lead-draw');
+              }
               if ((vao.drawReadyGeneration|0)!==(this.drawProgramGeneration|0)) {
                 return this.terrainBatchReject('attribs');
               }
@@ -5869,16 +5926,22 @@ public final class BrowserOpenGL {
 
     /**
      * Hands the translated source to WebGL. Terrain shaders that read the per-section
-     * ChunkSection uniform get the batch rewrite; the untouched source is kept so a link
-     * failure can rebuild the program without it.
+     * ChunkSection uniform get the batch rewrite; the untouched source is kept so a compile or
+     * link failure can rebuild the shader or program without it. In WEBGL_multi_draw mode the
+     * uniform-indexed rewrite (mode 2) is kept as well, as the first compile fallback.
      */
     private static void applyShaderSource(int shader, String translated) {
-        String rewritten = BrowserTerrainShaders.rewrite(translated, terrainBatchMode());
+        int mode = terrainBatchMode();
+        String rewritten = BrowserTerrainShaders.rewrite(translated, mode);
         if (rewritten == null || rewritten.equals(translated)) {
             shaderSourceJs(shader, translated);
             return;
         }
-        shaderSourceRewrittenJs(shader, rewritten, translated);
+        String alternate = mode == 1 ? BrowserTerrainShaders.rewrite(translated, 2) : null;
+        if (alternate != null && (alternate.equals(rewritten) || alternate.equals(translated))) {
+            alternate = null;
+        }
+        shaderSourceRewrittenJs(shader, rewritten, translated, alternate);
     }
 
     public static void shaderSourceNative(int shader, int count, long strings, long lengths) {
@@ -6014,22 +6077,91 @@ public final class BrowserOpenGL {
             const state=window.__gaiusGL;
             window.__gaiusWebGL.shaderSource(state.shaders.get(shader),source);
             if (state.terrainShaderOriginals) state.terrainShaderOriginals.delete(shader|0);
+            if (state.terrainShaderAlternates) state.terrainShaderAlternates.delete(shader|0);
+            if (state.terrainShaderReverted) state.terrainShaderReverted.delete(shader|0);
             """)
     private static native void shaderSourceJs(int shader, String source);
 
-    @JSBody(params = {"shader", "source", "original"}, script = """
+    @JSBody(params = {"shader", "source", "original", "alternate"}, script = """
             const state=window.__gaiusGL;
             window.__gaiusWebGL.shaderSource(state.shaders.get(shader),source);
             if (state.terrainShaderOriginals) state.terrainShaderOriginals.set(shader|0,original);
+            const alternates=state.terrainShaderAlternates
+              || (state.terrainShaderAlternates=new Map());
+            if (typeof alternate==='string') {
+              alternates.set(shader|0,alternate);
+            } else {
+              alternates.delete(shader|0);
+            }
+            if (state.terrainShaderReverted) state.terrainShaderReverted.delete(shader|0);
             const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
             stats.terrainShaderRewrites=(stats.terrainShaderRewrites||0)+1;
             """)
-    private static native void shaderSourceRewrittenJs(int shader, String source, String original);
+    private static native void shaderSourceRewrittenJs(
+            int shader, String source, String original, String alternate);
 
+    /**
+     * glCompileShader. Both vanilla backends read COMPILE_STATUS before linking and mark the
+     * pipeline invalid when it is false, so a rewritten terrain shader that does not compile
+     * falls back here, on the same shader object: first to the uniform-indexed rewrite (later
+     * terrain shaders then use that mode too), then to the original source, which also keeps
+     * the program it is linked into unbatched (finishTerrainLink).
+     */
+    public static void compileShader(int shader) {
+        if (compileShaderJs(shader) == 1 && terrainBatchMode == 1) {
+            terrainBatchMode = 2;
+            System.out.println("[Gaius] terrain shader rewrite for WEBGL_multi_draw did not compile;"
+                    + " terrain batches use one draw per section");
+        }
+    }
+
+    /** 0 compiled as given (or not a rewritten terrain shader), 1 alternate rewrite, 2 original. */
     @JSBody(params = {"shader"}, script = """
-            window.__gaiusWebGL.compileShader(window.__gaiusGL.shaders.get(shader));
+            const state=window.__gaiusGL, gl=window.__gaiusWebGL;
+            const id=shader|0;
+            const object=state.shaders.get(shader);
+            gl.compileShader(object);
+            const originals=state.terrainShaderOriginals;
+            if (!object || !originals || !originals.has(id)) return 0;
+            const alternates=state.terrainShaderAlternates;
+            // Only rewritten shaders pay this status query, and vanilla makes the same one next.
+            if (gl.getShaderParameter(object,gl.COMPILE_STATUS) || gl.isContextLost()) {
+              if (alternates) alternates.delete(id);
+              return 0;
+            }
+            const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            let log='';
+            try {
+              log=String(gl.getShaderInfoLog(object) || '').slice(0,512);
+            } catch (ignored) {
+              log='';
+            }
+            stats.terrainShaderCompileFallbacks=(stats.terrainShaderCompileFallbacks||0)+1;
+            stats.terrainShaderCompileFallbackLog=log;
+            if (stats.terrainShaderCompileFallbacks===1 && window.console && window.console.warn) {
+              window.console.warn('[Gaius] rewritten terrain shader did not compile, falling back: '+log);
+            }
+            const alternate=alternates ? alternates.get(id) : undefined;
+            if (alternates) alternates.delete(id);
+            if (typeof alternate==='string') {
+              gl.shaderSource(object,alternate);
+              gl.compileShader(object);
+              if (gl.getShaderParameter(object,gl.COMPILE_STATUS)) {
+                stats.terrainShaderAlternateCompiles=(stats.terrainShaderAlternateCompiles||0)+1;
+                state.terrainBatchMode=2;
+                const caps=globalThis.__gaiusGpuCaps;
+                if (caps) caps.terrainBatchMode=2;
+                return 1;
+              }
+            }
+            gl.shaderSource(object,originals.get(id));
+            originals.delete(id);
+            (state.terrainShaderReverted || (state.terrainShaderReverted=new Set())).add(id);
+            gl.compileShader(object);
+            stats.terrainShaderCompileReverts=(stats.terrainShaderCompileReverts||0)+1;
+            return 2;
             """)
-    public static native void compileShader(int shader);
+    private static native int compileShaderJs(int shader);
 
     @JSBody(params = {"program", "shader"}, script = """
             const state=window.__gaiusGL;
@@ -6095,6 +6227,8 @@ public final class BrowserOpenGL {
             const state=window.__gaiusGL, object=state.shaders.get(shader);
             if (object) window.__gaiusWebGL.deleteShader(object); state.shaders.delete(shader);
             if (state.terrainShaderOriginals) state.terrainShaderOriginals.delete(shader|0);
+            if (state.terrainShaderAlternates) state.terrainShaderAlternates.delete(shader|0);
+            if (state.terrainShaderReverted) state.terrainShaderReverted.delete(shader|0);
             """)
     public static native void deleteShader(int shader);
 

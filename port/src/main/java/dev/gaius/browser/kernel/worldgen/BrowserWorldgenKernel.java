@@ -96,15 +96,21 @@ public final class BrowserWorldgenKernel {
      * where SURFACE is its own step); the result's {@code token} field names it (0: not kept).
      */
     public static final int FLAG_KEEP_NOISE = 1 << 8;
+    private static final int[] NO_RING = new int[0];
 
     /**
      * Submits a terrain job. {@code beard} is the packed beardifier
      * ({@code [flags, affected x6, rigidCount, (minX, minY, minZ, maxX, maxY, maxZ, adjustment,
-     * groundDelta)*, junctionCount, (x, groundY, z)*]}).
+     * groundDelta)*, junctionCount, (x, groundY, z)*]}). {@code ringBiomes} are the biome registry
+     * ids the neighbouring chunks store around the chunk (20 quart columns, each over the level
+     * height; {@code gaius-worldgen-wasm} job.rs documents the order) for the surface rules, or
+     * {@code null} to let the kernel compute them. A neighbour biome the kernel does not know is a
+     * transient refusal ({@code transient:worldgen-fallback:...}).
      */
-    public static void submitTerrain(
-            int key, int chunkX, int chunkZ, int flags, int[] beard, ChunkCallback onResult, ErrorCallback onError) {
-        submitTerrainNative(key, chunkX, chunkZ, flags, beard, onResult, onError);
+    public static void submitTerrain(int key, int chunkX, int chunkZ, int flags, int[] beard, int[] ringBiomes,
+            ChunkCallback onResult, ErrorCallback onError) {
+        submitTerrainNative(key, chunkX, chunkZ, flags, beard, ringBiomes == null ? NO_RING : ringBiomes,
+                onResult, onError);
     }
 
     public static void submitBiomes(int key, int chunkX, int chunkZ, IdsCallback onResult, ErrorCallback onError) {
@@ -119,11 +125,13 @@ public final class BrowserWorldgenKernel {
     /**
      * Runs the surface rules on the noise chunk kept under {@code token}. The result lists the
      * changed blocks: {@code count}, {@code positions} ({@code section << 12 | y << 8 | z << 4 | x})
-     * and {@code states} (block state ids). The kept chunk is consumed.
+     * and {@code states} (block state ids). The kept chunk is consumed. {@code ringBiomes} as for
+     * {@link #submitTerrain}.
      */
-    public static void submitSurface(
-            int key, int token, int chunkX, int chunkZ, int[] beard, ChunkCallback onResult, ErrorCallback onError) {
-        submitSurfaceNative(key, token, chunkX, chunkZ, beard, onResult, onError);
+    public static void submitSurface(int key, int token, int chunkX, int chunkZ, int[] beard, int[] ringBiomes,
+            ChunkCallback onResult, ErrorCallback onError) {
+        submitSurfaceNative(key, token, chunkX, chunkZ, beard, ringBiomes == null ? NO_RING : ringBiomes,
+                onResult, onError);
     }
 
     /** Releases a kept noise chunk that will not reach the kernel surface step. */
@@ -221,13 +229,14 @@ public final class BrowserWorldgenKernel {
             + "return !!k && k.generatorUsable(key);")
     private static native boolean generatorUsableNative(int key);
 
-    @JSBody(params = {"key", "chunkX", "chunkZ", "flags", "beard", "onResult", "onError"},
+    @JSBody(params = {"key", "chunkX", "chunkZ", "flags", "beard", "ring", "onResult", "onError"},
             script = "var k = globalThis.GaiusWorldgenKernel;"
             + "if (!k) { onError('worldgen kernel facade missing'); return; }"
             + "k.submitTerrain(key, chunkX, chunkZ, flags, new Int32Array(beard),"
-            + " function (chunk) { onResult(chunk); }, function (message) { onError(String(message)); });")
+            + " function (chunk) { onResult(chunk); }, function (message) { onError(String(message)); },"
+            + " ring.length > 0 ? new Int32Array(ring) : null);")
     private static native void submitTerrainNative(int key, int chunkX, int chunkZ, int flags, @JSByRef int[] beard,
-            ChunkCallback onResult, ErrorCallback onError);
+            @JSByRef int[] ring, ChunkCallback onResult, ErrorCallback onError);
 
     @JSBody(params = {"key", "chunkX", "chunkZ", "onResult", "onError"},
             script = "var k = globalThis.GaiusWorldgenKernel;"
@@ -241,13 +250,14 @@ public final class BrowserWorldgenKernel {
             + "return !!k && typeof k.submitSurfaceStored === 'function';")
     private static native boolean surfaceSupportedNative();
 
-    @JSBody(params = {"key", "token", "chunkX", "chunkZ", "beard", "onResult", "onError"},
+    @JSBody(params = {"key", "token", "chunkX", "chunkZ", "beard", "ring", "onResult", "onError"},
             script = "var k = globalThis.GaiusWorldgenKernel;"
             + "if (!k || !k.submitSurfaceStored) { onError('transient:worldgen kernel surface missing'); return; }"
             + "k.submitSurfaceStored(key, token, chunkX, chunkZ, new Int32Array(beard),"
-            + " function (diff) { onResult(diff); }, function (message) { onError(String(message)); });")
+            + " function (diff) { onResult(diff); }, function (message) { onError(String(message)); },"
+            + " ring.length > 0 ? new Int32Array(ring) : null);")
     private static native void submitSurfaceNative(int key, int token, int chunkX, int chunkZ, @JSByRef int[] beard,
-            ChunkCallback onResult, ErrorCallback onError);
+            @JSByRef int[] ring, ChunkCallback onResult, ErrorCallback onError);
 
     @JSBody(params = "token", script = "var k = globalThis.GaiusWorldgenKernel;"
             + "if (k && k.dropStored) { k.dropStored(token); }")

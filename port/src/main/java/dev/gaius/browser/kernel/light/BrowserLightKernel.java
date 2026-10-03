@@ -14,6 +14,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -31,8 +32,11 @@ import org.teavm.jso.JSObject;
  * <p>{@code dev.gaius.tools.kernel.LightKernelPatches} routes
  * {@code ThreadedLevelLightEngine.lightChunk} here. For a chunk that is not lit yet, the
  * PRE_UPDATE task in which vanilla calls {@code propagateLightSources} instead turns the column's
- * light on and snapshots it into a job: the palettes of its sections and of the four
- * neighbours, their stored light and which sections store light. When the result arrives,
+ * light on and snapshots it into a job: the palettes of its sections, its stored light and which
+ * sections store light, and of the four neighbours only the one-block ring the kernel reads (the
+ * states and stored levels of the cells that touch the column). The light table stays out of the
+ * job; {@link LightKernelHost} splices it in when a kernel instance does not hold it yet. When
+ * the result arrives,
  * another PRE_UPDATE task writes the new layers into the vanilla storage (through
  * {@code getDataLayerToWrite}, so the changed sections reach clients like any vanilla light
  * change) and replays the light that leaves the column into the neighbours with vanilla's own
@@ -54,8 +58,9 @@ public final class BrowserLightKernel {
     private static final int RESULT_MAGIC = 0x53524b47;
     private static final int ABI_VERSION = 1;
     private static final int KIND_LIGHT_COLUMN = 0x0301;
-    private static final int JOB_VERSION = 1;
-    private static final int RESULT_VERSION = 1;
+    /** Job version 2: neighbours travel as ring slices, the table only on demand. */
+    private static final int JOB_VERSION = 2;
+    private static final int RESULT_VERSION = 2;
     private static final int HEADER_LEN = 16;
     private static final int RESULT_HEADER_LEN = 32;
     private static final int OPS_INITIAL = 1;
@@ -69,7 +74,10 @@ public final class BrowserLightKernel {
     private static final int BLOCK_DATA = 8;
     private static final int ENCODING_SINGLE = 0;
     private static final int ENCODING_NETWORK = 1;
+    private static final int ENCODING_RING_PALETTE = 3;
     private static final int LAYER_BYTES = 2048;
+    private static final int RING_CELLS = 256;
+    private static final int RING_LAYER_BYTES = 128;
     private static final int OUTGOING_LEN = 12;
     private static final int MAX_FAILURES = 3;
     /** Ring sides in job order: north (z-1), south, west (x-1), east. */
@@ -80,7 +88,11 @@ public final class BrowserLightKernel {
 
     /** Chunks whose PRE_UPDATE task found every job slot taken, oldest first. */
     private static final ArrayDeque<Runnable> WAITING = new ArrayDeque<>();
-    /** Snapshotted columns whose result is not applied yet, by {@code ChunkPos.pack}. */
+    /**
+     * Snapshotted columns whose result is not applied yet, by {@code ChunkPos.pack}. Each level
+     * has its own light engine, so one column can have a job per dimension: they are chained
+     * through {@link Job#nextSameColumn}.
+     */
     private static final Long2ObjectOpenHashMap<Job> IN_FLIGHT = new Long2ObjectOpenHashMap<>();
     private static boolean disabled;
     private static String disabledReason = "";
@@ -97,6 +109,9 @@ public final class BrowserLightKernel {
     private static int length;
     private static ByteBuf sectionBuffer;
     private static FriendlyByteBuf sectionWriter;
+    /** Ring slice scratch: palette ids and one palette index per touching cell. */
+    private static final int[] RING_PALETTE = new int[RING_CELLS];
+    private static final byte[] RING_INDEX = new byte[RING_CELLS];
 
     private BrowserLightKernel() {
     }
@@ -122,6 +137,8 @@ public final class BrowserLightKernel {
         final byte[] storing;
         long[] recheck;
         int recheckCount;
+        /** The next in-flight job of the same column (another dimension's engine). */
+        Job nextSameColumn;
 
         Job(ThreadedLevelLightEngine engine, BrowserLightEngineHooks hooks, ChunkAccess chunk,
                 CompletableFuture<ChunkAccess> done, int id, LightEngine<?, ?> sky, LightEngine<?, ?> block) {
@@ -228,9 +245,35 @@ public final class BrowserLightKernel {
     }
 
     private static void noteCheck(ThreadedLevelLightEngine engine, int chunkX, int chunkZ, long pos) {
-        Job job = IN_FLIGHT.get(ChunkPos.pack(chunkX, chunkZ));
-        if (job != null && job.engine == engine) {
-            job.addRecheck(pos);
+        for (Job job = IN_FLIGHT.get(ChunkPos.pack(chunkX, chunkZ)); job != null; job = job.nextSameColumn) {
+            if (job.engine == engine) {
+                job.addRecheck(pos);
+            }
+        }
+    }
+
+    private static void track(Job job) {
+        job.nextSameColumn = IN_FLIGHT.put(job.column, job);
+    }
+
+    /** Removes this job (and only this one) from its column's chain; a no-op when it is not on it. */
+    private static void untrack(Job job) {
+        Job head = IN_FLIGHT.get(job.column);
+        if (head == job) {
+            if (job.nextSameColumn == null) {
+                IN_FLIGHT.remove(job.column);
+            } else {
+                IN_FLIGHT.put(job.column, job.nextSameColumn);
+            }
+            job.nextSameColumn = null;
+            return;
+        }
+        for (Job j = head; j != null; j = j.nextSameColumn) {
+            if (j.nextSameColumn == job) {
+                j.nextSameColumn = job.nextSameColumn;
+                job.nextSameColumn = null;
+                return;
+            }
         }
     }
 
@@ -267,13 +310,14 @@ public final class BrowserLightKernel {
         }
         submitted++;
         jobs++;
-        IN_FLIGHT.put(job.column, job);
-        boolean sent = LightKernelHost.submit(scratch, length, job.chunkX, job.chunkZ, job.id,
+        track(job);
+        boolean sent = LightKernelHost.submit(scratch, length, BrowserLightStateTable.bytes(), job.chunkX, job.chunkZ,
+                job.id,
                 result -> runOnJavaThread(() -> onResult(job, result)),
                 failure -> runOnJavaThread(() -> onFailure(job, failure)));
         if (!sent) {
             submitted--;
-            IN_FLIGHT.remove(job.column);
+            untrack(job);
             // Same task, nothing applied yet: light it the vanilla way right here.
             lightVanillaInTask(hooks, chunk, done);
         }
@@ -307,7 +351,7 @@ public final class BrowserLightKernel {
         }
         release();
         schedule(job, () -> {
-            IN_FLIGHT.remove(job.column);
+            untrack(job);
             try {
                 apply(job, result);
                 failuresInARow = 0;
@@ -330,7 +374,7 @@ public final class BrowserLightKernel {
         release();
         noteFailure(failure, LightKernelHost.isTransient(failure));
         schedule(job, () -> {
-            IN_FLIGHT.remove(job.column);
+            untrack(job);
             lightVanillaInTask(job.hooks, job.chunk, job.done);
         });
     }
@@ -342,7 +386,7 @@ public final class BrowserLightKernel {
             job.engine.tryScheduleUpdate();
         } catch (RuntimeException error) {
             // The engine is closing with its level; nothing waits for this chunk any more.
-            IN_FLIGHT.remove(job.column);
+            untrack(job);
             job.done.completeExceptionally(error);
         }
     }
@@ -507,14 +551,12 @@ public final class BrowserLightKernel {
         putByte(neighbours);
         putByte(0);
         putShort(0);
-        // The table goes inline every time: the kernel skips decoding it when the epoch matches
-        // its cached copy, and the pool may hand the job to a fresh worker.
-        putInt(table.length);
+        // Only the table's epoch: an instance that holds it reuses it, a fresh one answers "table
+        // missing" and LightKernelHost resends the job with the table spliced in.
+        putInt(0);
         putLong(tableEpoch);
         putInt(0); // no checkBlock positions
         putInt(0);
-        putBytes(table, 0, table.length);
-        pad8();
 
         // Section flags; the data bits name the stored layers that follow.
         DataLayer[][] layers = new DataLayer[5][];
@@ -558,11 +600,9 @@ public final class BrowserLightKernel {
             for (int index = 0; index < sectionCount; index++) {
                 LevelChunkSection section = sections[index];
                 if (section == null || section.hasOnlyAir()) {
-                    putByte(ENCODING_SINGLE);
-                    putByte(0);
-                    putShort(0);
-                    putInt(4);
-                    putInt(airId);
+                    putSingle(airId);
+                } else if (slot > 0) {
+                    putRing(section, slot - 1);
                 } else {
                     FriendlyByteBuf writer = sectionWriter();
                     section.getStates().write(writer);
@@ -574,8 +614,8 @@ public final class BrowserLightKernel {
                     ensure(bytes);
                     sectionBuffer.getBytes(0, scratch, length, bytes);
                     length += bytes;
+                    pad8();
                 }
-                pad8();
             }
         }
 
@@ -587,6 +627,12 @@ public final class BrowserLightKernel {
                 for (int light = 0; light < job.lightSections; light++) {
                     DataLayer data = layers[slot][half * job.lightSections + light];
                     if (data == null) {
+                        continue;
+                    }
+                    if (slot > 0) {
+                        ensure(RING_LAYER_BYTES);
+                        GaiusLightColumnAccess.copyRing(data, slot - 1, scratch, length);
+                        length += RING_LAYER_BYTES;
                         continue;
                     }
                     ensure(LAYER_BYTES);
@@ -603,6 +649,65 @@ public final class BrowserLightKernel {
         }
         setInt(12, length - payloadStart);
         return job;
+    }
+
+    private static void putSingle(int stateId) {
+        putByte(ENCODING_SINGLE);
+        putByte(0);
+        putShort(0);
+        putInt(4);
+        putInt(stateId);
+        pad8();
+    }
+
+    /**
+     * Writes the ring slice of a neighbour section on {@code side}: the 16 x 16 cells that touch
+     * the column, cell {@code (y << 4) | along} (along is x for north and south, z for west and
+     * east), as one state id or a palette with one index byte per cell.
+     */
+    private static void putRing(LevelChunkSection section, int side) {
+        int count = 0;
+        BlockState last = null;
+        int lastIndex = 0;
+        for (int y = 0; y < 16; y++) {
+            for (int along = 0; along < 16; along++) {
+                int x = side == 2 ? 15 : side == 3 ? 0 : along;
+                int z = side == 0 ? 15 : side == 1 ? 0 : along;
+                BlockState state = section.getBlockState(x, y, z);
+                if (state != last) {
+                    int id = Block.getId(state);
+                    int found = -1;
+                    for (int i = 0; i < count; i++) {
+                        if (RING_PALETTE[i] == id) {
+                            found = i;
+                            break;
+                        }
+                    }
+                    if (found < 0) {
+                        found = count;
+                        RING_PALETTE[count++] = id;
+                    }
+                    last = state;
+                    lastIndex = found;
+                }
+                RING_INDEX[(y << 4) | along] = (byte) lastIndex;
+            }
+        }
+        if (count == 1) {
+            putSingle(RING_PALETTE[0]);
+            return;
+        }
+        putByte(ENCODING_RING_PALETTE);
+        putByte(0);
+        putShort(0);
+        putInt(4 + 4 * count + RING_CELLS);
+        putShort(count);
+        putShort(0);
+        for (int i = 0; i < count; i++) {
+            putInt(RING_PALETTE[i]);
+        }
+        putBytes(RING_INDEX, 0, RING_CELLS);
+        pad8();
     }
 
     private static FriendlyByteBuf sectionWriter() {
@@ -641,6 +746,10 @@ public final class BrowserLightKernel {
         int base = HEADER_LEN;
         if ((result[base] & 0xff) != RESULT_VERSION || u16(result, base + 2) != job.lightSections) {
             throw new IllegalStateException("light_column result does not match the column");
+        }
+        if (result[base + 1] != 0) {
+            // LightKernelHost resends a "table missing" answer with the table; one must not land here.
+            throw new IllegalStateException("light_column result without a light table");
         }
         int records = i32(result, base + 12);
         int flagsAt = base + RESULT_HEADER_LEN;

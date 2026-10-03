@@ -12,8 +12,8 @@ import net.minecraft.world.level.block.state.BlockState;
  * Bulk install of worldgen kernel sections into a proto chunk. A kernel section (palette plus one
  * palette index per block) becomes a block state container the way a saved section is loaded
  * ({@link PalettedContainer#unpack}: palette list and bit-packed indices), instead of 4096
- * {@code setBlockState} calls with their palette lookups and resizes. The new section keeps the
- * old section's biomes and counts its blocks once ({@code recalcBlockCounts}).
+ * {@code setBlockState} calls with their palette lookups and resizes. The caller's new section
+ * keeps the old section's biomes and counts its blocks once ({@code recalcBlockCounts}).
  *
  * <p>Lives in the vanilla package for {@code Strategy.getConfigurationForPaletteSize}, which
  * decides the storage bits {@code unpack} expects. Identical copies exist for 26.2 and 26.3.
@@ -34,26 +34,12 @@ public final class GaiusKernelSections {
     }
 
     /**
-     * Replaces section {@code sectionIndex} of {@code chunk} with the kernel section
-     * {@code palette[from .. from + size)}; {@code indices[offset .. offset + 4096)} holds the
-     * palette index (u16) of each block in y, z, x order, unless {@code uniform}. Returns false
-     * (and changes nothing) when the palette has duplicates, so the caller can set the blocks one
-     * by one instead.
-     */
-    public static boolean install(ChunkAccess chunk, int sectionIndex, BlockState[] palette, int from, int size,
-            short[] indices, int offset, boolean uniform) {
-        PalettedContainer<BlockState> states = container(palette, from, size, indices, offset, uniform);
-        if (states == null) {
-            return false;
-        }
-        LevelChunkSection[] sections = chunk.getSections();
-        sections[sectionIndex] = new LevelChunkSection(states, sections[sectionIndex].getBiomes());
-        return true;
-    }
-
-    /**
-     * The block state container of a kernel section, or {@code null} when the palette has
-     * duplicates (the disk format cannot express those).
+     * The block state container of the kernel section {@code palette[from .. from + size)};
+     * {@code indices[offset .. offset + 4096)} holds the palette index (u16) of each block in
+     * y, z, x order, unless {@code uniform}. {@code null} when the palette has duplicates (the disk
+     * format cannot express those), so the caller can set the blocks one by one instead. Builds a
+     * new container only: the caller swaps the section in once every section of the chunk is
+     * built.
      */
     public static PalettedContainer<BlockState> container(BlockState[] palette, int from, int size,
             short[] indices, int offset, boolean uniform) {

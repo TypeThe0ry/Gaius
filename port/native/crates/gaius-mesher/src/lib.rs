@@ -41,12 +41,7 @@ use table::ModelTable;
 
 /// Job kinds of the mesh family; `port/web/kernels/mesh-job.js` uses the same values.
 pub mod kinds {
-    use gaius_kernel_abi::kind::MESH_FAMILY;
-
-    /// `run_load_model_table`.
-    pub const LOAD_MODEL_TABLE: u16 = MESH_FAMILY | 0x01;
-    /// `run_mesh_section`.
-    pub const MESH_SECTION: u16 = MESH_FAMILY | 0x02;
+    pub use gaius_kernel_abi::kind::{LOAD_MODEL_TABLE, MESH_SECTION};
 }
 
 /// One worker's mesher: the resident model table and the reusable buffers.

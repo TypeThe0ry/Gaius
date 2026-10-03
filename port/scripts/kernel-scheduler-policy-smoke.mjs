@@ -34,11 +34,33 @@ check("priority classes order visible mesh, visible light, near gen, far gen, ba
   assert.equal(job({kernel: "worldgen", background: true}), P.PRIORITY.BACKGROUND);
   assert.equal(job({kernel: "mesh", priorityClass: 4}), P.PRIORITY.BACKGROUND);
   assert.equal(job({kernel: "mesher"}), P.PRIORITY.VISIBLE_MESH, "crate-derived names keep their role");
-  // A class never interleaves with another, whatever the distance or age.
+  // Below the starvation limit a class never interleaves with another, whatever the distance.
   const now = 1e6;
   const farMesh = P.score({cls: 0, distance: 1e9, submittedAt: now}, predictor, now);
-  const nearLight = P.score({cls: 1, distance: 0, submittedAt: 0}, predictor, now);
-  assert.ok(farMesh < nearLight, "every P0 job sorts before every P1 job");
+  const nearLight = P.score({cls: 1, distance: 0, submittedAt: now - P.STARVATION_MS}, predictor, now);
+  assert.ok(farMesh < nearLight, "every P0 job sorts before every P1 job that has not starved");
+});
+
+check("starved P1 and P2 jobs compete one class up; far and background work never does", () => {
+  const predictor = new P.MotionPredictor();
+  predictor.update({x: 0, z: 0, t: 0});
+  const now = 1e6;
+  const starved = now - P.STARVATION_MS - 1000;
+  // A server light job behind a flood of fresh visible mesh jobs.
+  const freshMesh = P.score({cls: 0, distance: 8, submittedAt: now}, predictor, now);
+  const starvedLight = P.score({cls: 1, distance: 2, submittedAt: starved}, predictor, now);
+  assert.ok(starvedLight < freshMesh, "a light job queued past the limit overtakes fresh P0 work");
+  assert.ok(starvedLight < P.CLASS_SPAN, "it competes inside P0");
+  const starvedNearGen = P.score({cls: 2, distance: 0, submittedAt: starved}, predictor, now);
+  assert.ok(starvedNearGen >= P.CLASS_SPAN && starvedNearGen < 2 * P.CLASS_SPAN, "P2 rises to P1, not further");
+  const starvedFar = P.score({cls: 3, distance: 0, submittedAt: 0}, predictor, now);
+  const starvedBackground = P.score({cls: 4, distance: 0, submittedAt: 0}, predictor, now);
+  assert.ok(starvedFar >= 3 * P.CLASS_SPAN, "far generation stays behind its worker cap");
+  assert.ok(starvedBackground >= 4 * P.CLASS_SPAN);
+  // Bounded wait: once past the limit, a P1 job sorts ahead of P0 work at its own distance or
+  // farther, so under a P0 flood it waits STARVATION_MS plus about one rescore interval.
+  const sameDistanceMesh = P.score({cls: 0, distance: 2, submittedAt: now}, predictor, now);
+  assert.ok(starvedLight < sameDistanceMesh);
 });
 
 check("within a class nearer chunks first and aging lifts long-waiting jobs", () => {
@@ -50,7 +72,9 @@ check("within a class nearer chunks first and aging lifts long-waiting jobs", ()
   const agedFar = P.score({cls: 2, cx: 6, cz: 0, submittedAt: 0}, predictor, 10_000);
   const freshNear = P.score({cls: 2, cx: 1, cz: 0, submittedAt: 10_000}, predictor, 10_000);
   assert.ok(agedFar < freshNear, "a far job queued for 10 s overtakes a fresh near one");
-  assert.ok(agedFar >= 2 * P.CLASS_SPAN, "aging never leaves the class");
+  const agedWithin = P.score({cls: 2, cx: 6, cz: 0, submittedAt: 0}, predictor, P.STARVATION_MS);
+  assert.ok(agedWithin >= 2 * P.CLASS_SPAN, "aging below the starvation limit never leaves the class");
+  assert.ok(agedFar >= P.CLASS_SPAN, "a starved job rises one class at most");
 });
 
 check("movement prediction favours chunks ahead of the player", () => {
@@ -224,9 +248,38 @@ check("memory budget: class shares, backpressure and the progress guarantee", ()
   budget.dropInstancesWithPrefix("1:");
   assert.equal(budget.instanceBytes, 30 * MB);
   assert.ok(Math.abs(budget.pressure() - 0.3) < 1e-9);
+  // Queued payloads count against admission but not against what the workers hold.
+  budget.queue(50 * MB);
+  assert.ok(Math.abs(budget.pressure() - 0.8) < 1e-9);
+  assert.ok(Math.abs(budget.residentPressure() - 0.3) < 1e-9, "resident memory ignores the queue");
+  budget.unqueue(50 * MB);
   const snapshot = budget.snapshot();
   assert.equal(snapshot.limit, 100 * MB);
   assert.equal(snapshot.held, 2);
+});
+
+check("a long P0 queue does not shrink the pool or refuse near generation (4 GB desktop)", () => {
+  const plan = P.initialPlan({hardwareConcurrency: 4, deviceMemory: 4});
+  const budget = new P.MemoryBudget(plan.budgetBytes);
+  budget.setInstance("1:mesher", 8 * MB);
+  // Entering a world at render distance 12: hundreds of visible mesh jobs queue. Only their
+  // payloads (about 24 KB each) are charged while queued; results are charged at dispatch.
+  for (let i = 0; i < 600; i++) {
+    assert.equal(budget.canQueue(24 * 1024 + 600 * 1024, P.PRIORITY.VISIBLE_MESH), true);
+    budget.queue(24 * 1024);
+  }
+  budget.begin(2 * 640 * 1024);
+  assert.ok(budget.pressure() < 1, "the queued payloads alone stay inside the budget");
+  assert.equal(budget.canQueue(2 * MB, P.PRIORITY.NEAR_GEN), true, "server worldgen still queues");
+  const sizer = new P.PoolSizer(plan);
+  const before = sizer.size;
+  let t = 0;
+  for (let i = 0; i < 6; i++) {
+    t += 1000;
+    sizer.sample({now: t, completed: i * 20, busyMs: t * before, queuedHigh: 600, queued: 600,
+      heapPressure: 0.3, budgetPressure: budget.residentPressure()});
+  }
+  assert.ok(sizer.size >= before, `the pool keeps its workers (${before} -> ${sizer.size})`);
 });
 
 let failed = 0;

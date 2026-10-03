@@ -16,7 +16,9 @@ import org.teavm.jso.JSBody;
  * shares a vertex heap and index buffer stays a vanilla draw, which binds the pipeline, the
  * vertex array and all uniforms; the rest of the run is packed here into eight-int records and
  * drawn by {@link BrowserOpenGL#terrainMultiDraw} in one WEBGL_multi_draw call per 256
- * sections. Anything the batch cannot draw falls back to the vanilla call for that run.</p>
+ * sections. The GL layer draws the batch only when that vanilla lead draw was really the last
+ * draw issued (a vanilla call that skipped its draws leaves another draw's state bound).
+ * Anything the batch cannot draw falls back to the vanilla call for that run.</p>
  *
  * <p>Switches: URL {@code gaiusTerrainBatch=0} (or {@code globalThis.__gaiusTerrainBatch =
  * false}) turns batching and the shader rewrite off; {@code gaiusTerrainAlign=0} keeps the
@@ -147,14 +149,18 @@ public final class BrowserTerrainBatch {
     }
 
     /**
-     * Draws the packed run. Returns true when every draw was issued; false means nothing was
-     * drawn and the caller must submit the run through the vanilla path.
+     * Draws the packed run. {@code leadSerial} is {@link BrowserOpenGL#drawSerial()} read
+     * before the vanilla call that ended with the run's lead draw, whose index count and base
+     * vertex follow. Returns true when every draw was issued; false means nothing was drawn
+     * and the caller must submit the run through the vanilla path.
      */
-    public static boolean submit(int kind, int[] packed, int draws) {
+    public static boolean submit(int kind, int[] packed, int draws, int leadSerial,
+            int leadIndexCount, int leadBaseVertex) {
         if (draws <= 0) {
             return true;
         }
-        int drawn = BrowserOpenGL.terrainMultiDraw(kind, packed, draws);
+        int drawn = BrowserOpenGL.terrainMultiDraw(
+                kind, packed, draws, leadSerial, leadIndexCount, leadBaseVertex);
         if (drawn != draws) {
             fallbackRuns++;
             return false;

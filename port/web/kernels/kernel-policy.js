@@ -34,7 +34,8 @@
     BACKGROUND: 4,
   });
   const CLASS_COUNT = 5;
-  // Score units per class. A sub-score is clamped below this, so classes never interleave.
+  // Score units per class. A sub-score is clamped below this, so classes never interleave
+  // (except for starved jobs, see STARVATION_MS).
   const CLASS_SPAN = 1 << 24;
   // Share of the memory budget a class may fill before it is held back. P0 may use it all.
   const CLASS_BUDGET_SHARE = Object.freeze([1.0, 0.95, 0.85, 0.7, 0.5]);
@@ -42,6 +43,10 @@
   const CHUNK_UNIT = 1024;
   // Aging: a queued job gains one chunk of distance every AGING_MS_PER_CHUNK.
   const AGING_MS_PER_CHUNK = 160;
+  // A P1 or P2 job queued longer than this competes one class up (with its aged sub-score), so
+  // a flood of P0 mesh work cannot hold server light and near worldgen past their timeouts. The
+  // runtime rescores queued jobs about once a second.
+  const STARVATION_MS = 2000;
 
   const clamp = (value, low, high) => (value < low ? low : (value > high ? high : value));
   const finite = (value) => typeof value === "number" && value === value && value !== Infinity && value !== -Infinity;
@@ -229,8 +234,15 @@
 
   // Lower runs first. Within a class: motion-weighted chunk distance when the job names a
   // chunk, otherwise its own distance hint, then its numeric priority; queue time lowers it.
+  // job.cls itself never changes (pump accounting and budget shares stay per class).
   function score(job, predictor, now) {
-    const cls = job.cls;
+    let cls = job.cls;
+    // Only P1 and P2 are lifted: far and background jobs stay behind the runtime's worker caps,
+    // and one of them at the head of the queue would hold back the near work behind it.
+    if (cls > 0 && cls <= PRIORITY.NEAR_GEN && finite(job.submittedAt) && finite(now)
+        && now - job.submittedAt > STARVATION_MS) {
+      cls -= 1;
+    }
     let sub;
     if (finite(job.cx) && finite(job.cz) && predictor && predictor.known) {
       sub = predictor.chunkDistance(job.cx, job.cz) * CHUNK_UNIT;
@@ -317,6 +329,17 @@
       return this.used() / this.limit;
     }
 
+    // Memory the workers actually hold: live instances and the jobs running in them. Queued
+    // payloads sit on the page and shrinking the pool frees none of them, so pool sizing and
+    // idle unloading look at this rather than at pressure().
+    resident() {
+      return this.instanceBytes + this.inflightBytes;
+    }
+
+    residentPressure() {
+      return this.resident() / this.limit;
+    }
+
     classLimit(cls) {
       return this.limit * CLASS_BUDGET_SHARE[clamp(cls | 0, 0, CLASS_COUNT - 1)];
     }
@@ -379,7 +402,7 @@
 
     snapshot() {
       return {
-        limit: this.limit, used: this.used(), pressure: this.pressure(),
+        limit: this.limit, used: this.used(), pressure: this.pressure(), residentPressure: this.residentPressure(),
         instanceBytes: this.instanceBytes, queuedBytes: this.queuedBytes,
         inflightBytes: this.inflightBytes, inflightCount: this.inflightCount,
         rejected: this.rejected, held: this.held,
@@ -533,7 +556,7 @@
   }
 
   const api = Object.freeze({
-    PRIORITY, CLASS_COUNT, CLASS_SPAN, CLASS_BUDGET_SHARE, CHUNK_UNIT, AGING_MS_PER_CHUNK,
+    PRIORITY, CLASS_COUNT, CLASS_SPAN, CLASS_BUDGET_SHARE, CHUNK_UNIT, AGING_MS_PER_CHUNK, STARVATION_MS,
     MotionPredictor, yawToDirection, kernelRole, classify, score, initialPlan, isMobileAgent,
     MemoryBudget, PoolSizer,
   });

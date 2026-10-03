@@ -17,8 +17,11 @@
 //! quart origin `section * 4 - 1` on every axis, index `(qy * 6 + qz) * 6 + qx`,
 //! each a palette index. The client fills it with `level.getNoiseBiome(qx, qy, qz)`
 //! (the resolver `BiomeManager` uses, with its height clamp and unloaded-chunk
-//! fallback) and the palette with the biome's colors. Blend radius is 0 in the
-//! browser, so a block's tint is its own biome's color.
+//! fallback) and the palette with the biome's colors. With a biome blend radius
+//! r (`flags::BIOME_BLEND`, r <= 2) a block's tint averages the colors of the
+//! (2r + 1)^2 columns around it at the same height, as
+//! `ClientLevel.calculateBlockTint` does; the quart grid already reaches the
+//! blocks two columns outside the section.
 //!
 //! # Payload (after the ABI job header), little-endian
 //!
@@ -33,14 +36,17 @@
 //! @56  f32 camera[3]        camera position minus the section origin (translucency sort)
 //! @68  u32 inline_table_len 0, or a model table follows the job (flags::INLINE_TABLE)
 //! @72  i64 biome_zoom_seed  BiomeManager.biomeZoomSeed of the client level
-//! @80  u32 reserved[4]      0
+//! @80  u32 blend_radius     Options.biomeBlendRadius (0..=2), read with flags::BIOME_BLEND
+//! @84  u32 reserved[3]      0
 //! @96  states               8000 x u16 global state ids (8000 x u32 with flags::WIDE_IDS)
 //!      light                8000 x u8: (sky << 4) | block
 //!      biome_quarts         216 x u8 palette indices
 //!      pad8, biome_palette  len x 5 x i32: grass_base, grass_modifier (0 none, 1 dark forest,
 //!                           2 swamp), foliage, dry_foliage, water
 //!      swamp_mask           32 bytes: bit (z * 16 + x) set when the swamp grass modifier picks
-//!                           its "below -0.1" color for that column (all zero without swamps)
+//!                           its "below -0.1" color for that column (all zero without swamps);
+//!                           with flags::BIOME_BLEND 50 bytes covering the columns x, z in
+//!                           -2..=17, bit ((z + 2) * 20 + (x + 2))
 //!      pad8, model table    inline_table_len bytes (only with flags::INLINE_TABLE)
 //! ```
 
@@ -76,8 +82,17 @@ pub mod flags {
     pub const INLINE_TABLE: u32 = 1 << 7;
     /// Return translucent quad centroids (for later resorts on the client).
     pub const EMIT_CENTROIDS: u32 = 1 << 8;
-    pub const KNOWN: u32 = (1 << 9) - 1;
+    /// `blend_radius` is set and the swamp mask covers the 20 x 20 columns of the region.
+    pub const BIOME_BLEND: u32 = 1 << 9;
+    pub const KNOWN: u32 = (1 << 10) - 1;
 }
+
+/// Swamp mask bytes of the legacy layout (16 x 16 columns).
+pub const SWAMP_LEN: usize = 32;
+/// Swamp mask bytes with `flags::BIOME_BLEND` (20 x 20 columns, x and z in -2..=17).
+pub const SWAMP_BLEND_LEN: usize = 50;
+/// Largest biome blend radius the quart grid and the swamp mask cover.
+pub const MAX_BLEND_RADIUS: u32 = 2;
 
 /// One biome palette entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -109,7 +124,10 @@ pub struct SectionJob<'a> {
     pub light: &'a [u8],
     pub biome_quarts: &'a [u8],
     pub palette: Vec<BiomeColors>,
-    pub swamp_mask: [u8; 32],
+    /// Options.biomeBlendRadius; 0 without flags::BIOME_BLEND.
+    pub blend_radius: i32,
+    /// SWAMP_LEN bytes, or SWAMP_BLEND_LEN with flags::BIOME_BLEND (the rest is zero).
+    pub swamp_mask: [u8; SWAMP_BLEND_LEN],
     pub inline_table: Option<&'a [u8]>,
 }
 
@@ -149,7 +167,13 @@ impl<'a> SectionJob<'a> {
         }
         let inline_len = r.u32().map_err(t)?;
         let biome_zoom_seed = r.i64().map_err(t)?;
-        r.take(16).map_err(t)?;
+        let blend_field = r.u32().map_err(t)?;
+        r.take(12).map_err(t)?;
+        let blend = flags & flags::BIOME_BLEND != 0;
+        if blend && blend_field > MAX_BLEND_RADIUS {
+            return Err(bad("biome blend radius out of range"));
+        }
+        let blend_radius = if blend { blend_field as i32 } else { 0 };
         let id_width = if flags & flags::WIDE_IDS != 0 { 4 } else { 2 };
         let states = r.take(VOLUME * id_width).map_err(t)?;
         let light = r.take(VOLUME).map_err(t)?;
@@ -168,8 +192,9 @@ impl<'a> SectionJob<'a> {
                 water: r.i32().map_err(t)?,
             });
         }
-        let mut swamp_mask = [0u8; 32];
-        swamp_mask.copy_from_slice(r.take(32).map_err(t)?);
+        let swamp_len = if blend { SWAMP_BLEND_LEN } else { SWAMP_LEN };
+        let mut swamp_mask = [0u8; SWAMP_BLEND_LEN];
+        swamp_mask[..swamp_len].copy_from_slice(r.take(swamp_len).map_err(t)?);
         let inline_table = if flags & flags::INLINE_TABLE != 0 {
             if inline_len == 0 {
                 return Err(bad("inline table flag without a table"));
@@ -192,6 +217,7 @@ impl<'a> SectionJob<'a> {
             light,
             biome_quarts,
             palette,
+            blend_radius,
             swamp_mask,
             inline_table,
         })
@@ -250,6 +276,10 @@ pub struct SectionJobData {
     pub biome_quarts: Vec<u8>,
     pub palette: Vec<BiomeColors>,
     pub swamp_mask: [u8; 32],
+    /// Some(radius) writes flags::BIOME_BLEND with `swamp_mask_blend` (SWAMP_BLEND_LEN bytes,
+    /// zero padded) in place of `swamp_mask`.
+    pub blend_radius: Option<u32>,
+    pub swamp_mask_blend: Vec<u8>,
     pub inline_table: Vec<u8>,
 }
 
@@ -289,6 +319,9 @@ impl SectionJobData {
         if wide {
             flags |= flags::WIDE_IDS;
         }
+        if self.blend_radius.is_some() {
+            flags |= flags::BIOME_BLEND;
+        }
         let mut o = Vec::with_capacity(HEADER_LEN + VOLUME * 3 + 512 + self.inline_table.len());
         for v in [self.table_epoch, self.request_seq, self.section_version, flags] {
             o.extend_from_slice(&v.to_le_bytes());
@@ -302,7 +335,8 @@ impl SectionJobData {
         }
         o.extend_from_slice(&(self.inline_table.len() as u32).to_le_bytes());
         o.extend_from_slice(&self.biome_zoom_seed.to_le_bytes());
-        o.extend_from_slice(&[0u8; 16]);
+        o.extend_from_slice(&self.blend_radius.unwrap_or(0).to_le_bytes());
+        o.extend_from_slice(&[0u8; 12]);
         debug_assert_eq!(o.len(), HEADER_LEN);
         for &s in &self.states {
             if wide {
@@ -321,7 +355,14 @@ impl SectionJobData {
                 o.extend_from_slice(&v.to_le_bytes());
             }
         }
-        o.extend_from_slice(&self.swamp_mask);
+        if self.blend_radius.is_some() {
+            let mut mask = [0u8; SWAMP_BLEND_LEN];
+            let n = self.swamp_mask_blend.len().min(SWAMP_BLEND_LEN);
+            mask[..n].copy_from_slice(&self.swamp_mask_blend[..n]);
+            o.extend_from_slice(&mask);
+        } else {
+            o.extend_from_slice(&self.swamp_mask);
+        }
         if !self.inline_table.is_empty() {
             while !o.len().is_multiple_of(8) {
                 o.push(0);

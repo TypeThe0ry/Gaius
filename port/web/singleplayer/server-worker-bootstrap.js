@@ -2764,8 +2764,10 @@ function normalize(path) {
 // root.__gaiusKernelClientListeners; it runs once per client.
 // The same message may carry kernelScripts ([{name, url} | {name, source}]: the worldgen job codec
 // and facade, plus kernel-policy.js/kernel-runtime.js when this worker hosts its own worldgen
-// kernel workers) and worldgenKernel (merged into root.__gaiusWorldgenKernelConfig, see
-// port/web/kernels/worldgen-kernel.js); they load before the client exists.
+// kernel workers), worldgenKernel (merged into root.__gaiusWorldgenKernelConfig, see
+// port/web/kernels/worldgen-kernel.js) and lightKernel (merged into root.__gaiusLightKernelConfig:
+// {enabled, maxInFlight?, timeoutMs?}, read by dev.gaius.browser.kernel.light.LightKernelHost);
+// they load before the client exists.
 // (Guarded: the lifecycle harnesses run this script with a minimal worker scope.)
 if (typeof root.addEventListener === "function") root.addEventListener("message", (event) => {
   const message = event.data;
@@ -2794,6 +2796,10 @@ function loadKernelHostScripts(message) {
   if (message.worldgenKernel && typeof message.worldgenKernel === "object") {
     root.__gaiusWorldgenKernelConfig = Object.assign({}, root.__gaiusWorldgenKernelConfig || {},
       message.worldgenKernel);
+  }
+  if (message.lightKernel && typeof message.lightKernel === "object") {
+    root.__gaiusLightKernelConfig = Object.assign({}, root.__gaiusLightKernelConfig || {},
+      message.lightKernel);
   }
   const entries = Array.isArray(message.kernelScripts) ? message.kernelScripts : defaultKernelHostScripts();
   for (const entry of entries) {

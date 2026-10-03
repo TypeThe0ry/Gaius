@@ -8,10 +8,15 @@ run-name: Deploy Gaius Pages [${{ inputs.release_token || github.sha }}]
 # site's Service Worker caches immutably, the singleplayer server loaded only
 # when a world opens, and sounds streamed after the client starts. Each archive
 # is extracted to <profile>/, and Gaius-<profile>.html at the root becomes a
-# redirect to it so existing links keep working. Older releases (no site
-# archives) still publish exactly the three single-file clients
-# (Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html); the portable
-# single files remain release downloads either way.
+# redirect to it so existing links keep working. The content-hashed files of
+# the site release deployed before (named by the live gaius-pages.json and
+# verified against that release's own SHA256SUMS) stay published next to the
+# new ones, so a tab opened before the deploy can still load its lazy assets.
+# Older releases (no site archives) still publish the three single-file clients
+# (Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html), plus a
+# <profile>/gaius-sw.js that unregisters the Service Worker of an earlier site
+# deploy and a <profile>/index.html that redirects to the single file; the
+# portable single files remain release downloads either way.
 #
 # Nothing in the repository checkout is published, so the workflow runs only on
 # dispatch. Without release_tag it follows the repository's Latest release;
@@ -51,6 +56,7 @@ jobs:
       # No checkout: nothing from the repository is published, and every step
       # below reads only release assets (gh release download --repo).
       - name: Configure Pages
+        id: pages
         uses: actions/configure-pages@v5
       - name: Resolve release tag
         id: release
@@ -84,6 +90,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PAGES_RELEASE_TAG: ${{ steps.release.outputs.tag }}
           PAGES_RELEASE_SOURCE: ${{ steps.release.outputs.source }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -153,6 +160,7 @@ jobs:
               tar -xzf "$archive" -C "pages-publish/$profile" --no-same-owner --no-same-permissions
               test -s "pages-publish/$profile/index.html"
               test -s "pages-publish/$profile/gaius-sw.js"
+              test -s "pages-publish/$profile/gaius-site.json"
               # The single-file URL of earlier releases now opens the site, keeping query and fragment.
               printf '%s\n' \
                 '<!doctype html>' \
@@ -165,6 +173,81 @@ jobs:
               echo "sha256_site_${profile//./_}=${site_sha256}" >> "$GITHUB_OUTPUT"
               summary+=("- Gaius-site-${profile}.tar.gz sha256: \`${site_sha256}\` (matches the release SHA256SUMS), served at \`${profile}/\`")
             done
+            # A tab opened before this deploy still loads lazy assets (singleplayer server, kernel
+            # worker and wasm) by its own hashed names, so the hashed files of the previously
+            # deployed site release stay published next to the new ones. The previous tag comes
+            # from the live gaius-pages.json and is only a hint: that release's archives must
+            # verify against its own SHA256SUMS, only content-hashed names are merged (never
+            # index.html, gaius-sw.js or gaius-site.json), the big boot-time packs are left out,
+            # and a merge that would cross the size limit is undone. Any failure skips the merge.
+            previous_tag=""
+            if [ -n "${PAGES_BASE_URL:-}" ]; then
+              previous_tag="$(curl -fsSL --max-time 20 "${PAGES_BASE_URL%/}/gaius-pages.json" 2>/dev/null | jq -r 'select(.layout == "site") | .tag // empty' 2>/dev/null || true)"
+            fi
+            previous_dir="${RUNNER_TEMP}/pages-previous-site"
+            merged_list="${RUNNER_TEMP}/pages-previous-merged.txt"
+            rm -rf "$previous_dir" "$merged_list"
+            : > "$merged_list"
+            merge_previous_generation() {
+              local profile previous_archive entry target
+              mkdir -p "$previous_dir"
+              gh release download "$previous_tag" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --pattern 'SHA256SUMS' \
+                --pattern 'Gaius-site-1.21.11.tar.gz' \
+                --pattern 'Gaius-site-26.2.tar.gz' \
+                --pattern 'Gaius-site-26.3.tar.gz' \
+                --dir "$previous_dir" \
+                --clobber || return 1
+              for profile in 1.21.11 26.2 26.3; do
+                previous_archive="Gaius-site-${profile}.tar.gz"
+                grep -E "^[0-9a-f]{64}  ${previous_archive//./[.]}\$" "$previous_dir/SHA256SUMS" > "$previous_dir/${previous_archive}.sha256" || return 1
+                [ "$(wc -l < "$previous_dir/${previous_archive}.sha256")" -eq 1 ] || return 1
+                (cd "$previous_dir" && sha256sum --check --strict --quiet "${previous_archive}.sha256") || return 1
+                if tar -tvzf "$previous_dir/$previous_archive" | awk 'substr($0, 1, 1) != "-" { bad = 1 } END { exit bad ? 0 : 1 }'; then
+                  return 1
+                fi
+                mkdir -p "$previous_dir/$profile"
+                while IFS= read -r entry; do
+                  if [[ ! "$entry" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$ ]] || [[ "/$entry/" == *"/../"* ]]; then
+                    return 1
+                  fi
+                done < <(tar -tzf "$previous_dir/$previous_archive")
+                tar -xzf "$previous_dir/$previous_archive" -C "$previous_dir/$profile" --no-same-owner --no-same-permissions || return 1
+                while IFS= read -r entry; do
+                  [[ "$entry" =~ \.[0-9a-f]{16}\.[A-Za-z0-9]+$ ]] || continue
+                  case "${entry##*/}" in
+                    classes.*|vanilla-assets.pack.*|vanilla-sounds.pack.*) continue ;;
+                  esac
+                  target="pages-publish/$profile/$entry"
+                  [ -e "$target" ] && continue
+                  mkdir -p "$(dirname "$target")"
+                  cp "$previous_dir/$profile/$entry" "$target" || return 1
+                  printf '%s\n' "$target" >> "$merged_list"
+                done < <(tar -tzf "$previous_dir/$previous_archive")
+              done
+              return 0
+            }
+            undo_previous_generation() {
+              local target
+              while IFS= read -r target; do
+                rm -f "$target"
+              done < "$merged_list"
+              : > "$merged_list"
+            }
+            if [[ "$previous_tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && [ "$previous_tag" != "$PAGES_RELEASE_TAG" ]; then
+              if merge_previous_generation; then
+                summary+=("- Kept $(wc -l < "$merged_list") hashed files of the previously deployed release \`${previous_tag}\` (verified against its SHA256SUMS)")
+              else
+                undo_previous_generation
+                echo "::warning::The previously deployed release has no verifiable site archives; its hashed files are not kept"
+              fi
+              if [ "$(du -sb pages-publish | cut -f 1)" -ge 1000000000 ]; then
+                undo_previous_generation
+                echo "::warning::Keeping the previous site generation would cross the 1 GB Pages limit; it is not kept"
+              fi
+            fi
+            rm -rf "$previous_dir"
             # GitHub Pages sites must stay below 1 GB.
             published_bytes="$(du -sb pages-publish | cut -f 1)"
             if [ "$published_bytes" -ge 1000000000 ]; then
@@ -212,7 +295,33 @@ jobs:
               echo "sha256_${profile//./_}=${page_sha256}" >> "$GITHUB_OUTPUT"
               summary+=("- Gaius-${profile}.html sha256: \`${page_sha256}\` (matches the release SHA256SUMS)")
             done
+            # After a site release, browsers still hold that site's Service Worker and caches for
+            # <profile>/. Publish a worker there that deletes the gaius-* caches and unregisters
+            # itself (the browser fetches it on its next update check), and an index.html that
+            # sends <profile>/ to the single-file client.
+            for profile in 1.21.11 26.2 26.3; do
+              mkdir -p "pages-publish/$profile"
+              printf '%s\n' \
+                '// Gaius retired this multi-file site: remove its caches and this worker.' \
+                'self.addEventListener("install", function () { self.skipWaiting(); });' \
+                'self.addEventListener("activate", function (event) {' \
+                '  event.waitUntil(caches.keys().then(function (names) {' \
+                '    return Promise.all(names.filter(function (name) { return name.indexOf("gaius-") === 0; })' \
+                '      .map(function (name) { return caches.delete(name); }));' \
+                '  }).then(function () { return self.registration.unregister(); }));' \
+                '});' \
+                > "pages-publish/$profile/gaius-sw.js"
+              printf '%s\n' \
+                '<!doctype html>' \
+                '<meta charset="utf-8">' \
+                "<title>Gaius ${profile}</title>" \
+                "<script>location.replace(\"../Gaius-${profile}.html\" + location.search + location.hash);</script>" \
+                "<meta http-equiv=\"refresh\" content=\"0; url=../Gaius-${profile}.html\">" \
+                > "pages-publish/$profile/index.html"
+            done
           fi
+          # The next deploy reads this to keep the hashed files of the generation it replaces.
+          printf '{"schema":1,"tag":"%s","layout":"%s"}\n' "$PAGES_RELEASE_TAG" "$layout" > pages-publish/gaius-pages.json
           echo "layout=${layout}" >> "$GITHUB_OUTPUT"
           # Only now, after every SHA256SUMS gate passed, announce the deployment.
           {

@@ -5,8 +5,8 @@
 //
 // Checks the site asset map (hashed client, hotpath, singleplayer URLs and the client preload),
 // ordered module loading, the sound-pack merge into the decoded vanilla pack, the kernel port
-// handed to the integrated server Worker, the kernel switch-off fallback and the dev and
-// portable modes.
+// handed to the integrated server Worker with its scripts and switches, the kernel switch-off
+// fallback and the dev, portable and file modes.
 
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
@@ -14,7 +14,7 @@ import vm from "node:vm";
 
 const source = await readFile(new URL("../web/boot/gaius-boot.js", import.meta.url), "utf8");
 
-function createPage({search = "", site = null, portable = false, protocol = "https:"} = {}) {
+function createPage({search = "", site = null, portable = false, protocol = "https:", inertScripts = {}, storage = {}} = {}) {
   const appended = [];
   const posted = [];
   const element = (tag) => ({
@@ -30,7 +30,15 @@ function createPage({search = "", site = null, portable = false, protocol = "htt
   const window = {
     location: {protocol, search, href: `${protocol}//example.invalid/Gaius/26.3/index.html${search}`},
     navigator: {hardwareConcurrency: 8},
-    document: {readyState: "loading", head, documentElement: head, createElement: element, getElementById: () => null},
+    document: {
+      readyState: "loading", head, documentElement: head, createElement: element, getElementById: () => null,
+      // Only the portable page's inert server Worker scripts are looked up by selector.
+      querySelector(selector) {
+        const match = /^script\[type="text\/plain"\]\[data-gaius-worker-script="([^"]+)"\]$/.exec(selector);
+        return match && inertScripts[match[1]] !== undefined ? {textContent: inertScripts[match[1]]} : null;
+      },
+    },
+    localStorage: {getItem: (key) => (Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : null), setItem() {}},
     performance: {now: () => 1, mark() {}, getEntriesByType: () => []},
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
     addEventListener() {},
@@ -188,6 +196,119 @@ check("dev and portable pages keep their own URLs", async () => {
   const portable = createPage({portable: true, protocol: "file:"});
   assert.equal(portable.window.__gaiusBoot.applyAssetUrls(), false);
   assert.equal(portable.appended.length, 0, "a portable page inlines its modules");
+});
+
+const WORLDGEN_SITE = Object.assign({}, SITE, {
+  assets: Object.assign({}, SITE.assets, {
+    "kernels/worldgen-job.js": "kernels/worldgen-job.5555555555555555.js",
+    "kernels/worldgen-kernel.js": "kernels/worldgen-kernel.6666666666666666.js",
+    "kernels/kernel-worker.js": "kernels/kernel-worker.7777777777777777.js",
+  }),
+  kernels: {
+    worldgen: {kinds: ["terrain"], variants: {simd: "kernels/worldgen.simd.8888888888888888.wasm", baseline: "kernels/worldgen.baseline.9999999999999999.wasm"}},
+  },
+});
+
+// Values from the page's realm, compared structurally.
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+function startWorker(page) {
+  const worker = new page.FakeWorker();
+  const channel = new MessageChannel();
+  worker.postMessage({type: "start", sessionId: "b".repeat(32), port: channel.port2}, [channel.port2]);
+  return channel;
+}
+
+function closePorts(page, channel) {
+  for (const entry of page.posted) if (entry.message.type === "gaius-kernel-port") entry.message.port.close();
+  channel.port1.close();
+}
+
+check("the kernel port carries the server Worker's scripts and the page switches", async () => {
+  const page = createPage({site: WORLDGEN_SITE, search: "?worldgenKernel=off&lightkernel=0"});
+  const channel = startWorker(page);
+  const message = page.posted[1].message;
+  assert.equal(message.type, "gaius-kernel-port");
+  assert.deepEqual(plain(message.kernelScripts.map((entry) => entry.url)), [
+    "https://example.invalid/Gaius/26.3/kernels/worldgen-job.5555555555555555.js",
+    "https://example.invalid/Gaius/26.3/kernels/worldgen-kernel.6666666666666666.js",
+  ]);
+  assert.deepEqual(plain(message.worldgenKernel), {enabled: false});
+  assert.deepEqual(plain(message.lightKernel), {enabled: false});
+  closePorts(page, channel);
+
+  // A site without the worldgen scripts hands over nothing it cannot serve; the stored light
+  // setting turns the light kernel off as well.
+  const bare = createPage({site: SITE, storage: {"gaius.lightKernel": "off"}});
+  const bareChannel = startWorker(bare);
+  assert.deepEqual(plain(bare.posted[1].message.kernelScripts), []);
+  assert.deepEqual(plain(bare.posted[1].message.worldgenKernel), {});
+  assert.deepEqual(plain(bare.posted[1].message.lightKernel), {enabled: false});
+  closePorts(bare, bareChannel);
+
+  const on = createPage({site: SITE, search: "?lightKernel=1"});
+  const onChannel = startWorker(on);
+  assert.deepEqual(plain(on.posted[1].message.lightKernel), {enabled: true});
+  closePorts(on, onChannel);
+});
+
+check("dev, portable and file pages hand the server Worker what they can", async () => {
+  const dev = createPage({protocol: "http:"});
+  const devChannel = startWorker(dev);
+  assert.deepEqual(plain(dev.posted[1].message.kernelScripts.map((entry) => entry.url)), [
+    "http://example.invalid/Gaius/26.3/kernels/worldgen-job.js",
+    "http://example.invalid/Gaius/26.3/kernels/worldgen-kernel.js",
+  ]);
+  closePorts(dev, devChannel);
+
+  const portable = createPage({portable: true, protocol: "file:", inertScripts: {
+    "kernels/worldgen-job.js": "\nself.GaiusWorldgenJob = {};\n",
+    "kernels/worldgen-kernel.js": "\nself.GaiusWorldgenKernel = {};\n",
+  }});
+  const portableChannel = startWorker(portable);
+  assert.deepEqual(plain(portable.posted[1].message.kernelScripts), [
+    {name: "kernels/worldgen-job.js", source: "\nself.GaiusWorldgenJob = {};\n"},
+    {name: "kernels/worldgen-kernel.js", source: "\nself.GaiusWorldgenKernel = {};\n"},
+  ]);
+  closePorts(portable, portableChannel);
+
+  const file = createPage({protocol: "file:"});
+  const fileChannel = startWorker(file);
+  assert.deepEqual(plain(file.posted[1].message.kernelScripts), [], "a dist opened from disk has no kernels");
+  closePorts(file, fileChannel);
+  // The quality layer still loads by tag there; kernel modules do not.
+  const sources = file.appended.filter((node) => node.tagName === "script").map((node) => node.src);
+  assert.deepEqual(plain(sources), [
+    "runtime/quality/gpu-caps.js", "runtime/quality/quality-profile.js", "runtime/quality/gl-pass.js",
+    "runtime/quality/upscaler.js", "runtime/quality/post-chain.js", "runtime/quality/quality-runtime.js",
+  ]);
+});
+
+check("?worldgenKernelHost=worker sends the port once the worldgen host configuration is known", async () => {
+  const page = createPage({site: WORLDGEN_SITE, search: "?worldgenKernelHost=worker"});
+  for (const node of page.appended) if (node.onload) node.onload();
+  const channel = startWorker(page);
+  assert.equal(page.posted.length, 1, "the port waits for the manifest");
+  for (let i = 0; i < 50 && page.posted.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  const message = page.posted[1].message;
+  assert.deepEqual(plain(message.kernelScripts.map((entry) => entry.name)), [
+    "kernels/kernel-policy.js", "kernels/kernel-runtime.js", "kernels/worldgen-job.js", "kernels/worldgen-kernel.js",
+  ]);
+  assert.equal(message.worldgenKernel.host, "worker");
+  assert.equal(message.worldgenKernel.workerUrl, "https://example.invalid/Gaius/26.3/kernels/kernel-worker.7777777777777777.js");
+  assert.deepEqual(plain(message.worldgenKernel.kernels.worldgen.variants), {
+    simd: {url: "https://example.invalid/Gaius/26.3/kernels/worldgen.simd.8888888888888888.wasm"},
+    baseline: {url: "https://example.invalid/Gaius/26.3/kernels/worldgen.baseline.9999999999999999.wasm"},
+  });
+  assert.equal(page.posted[1].transfer[0], message.port);
+  closePorts(page, channel);
+});
+
+check("a site page names its profile for the quality layer", async () => {
+  const page = createPage({site: SITE});
+  assert.equal(page.window.__gaiusProfileId, "26.3");
+  const dev = createPage();
+  assert.equal(dev.window.__gaiusProfileId, undefined);
 });
 
 let failed = 0;

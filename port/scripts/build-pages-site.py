@@ -194,7 +194,8 @@ def add_kernels(site: Site, dist: Path) -> dict[str, dict[str, object]]:
 def build(dist: Path, output: Path, archive: Path | None, split_sounds: bool) -> dict[str, object]:
     dist = dist.resolve()
     index_path = dist / "index.html"
-    index_html = require(index_path).decode("utf-8")
+    # postprocess-index-html.py on Windows once wrote CRLF; the tags below are matched as LF.
+    index_html = require(index_path).decode("utf-8").replace("\r\n", "\n")
     profile = profile_of(index_html)
     if BOOT_TAG not in index_html:
         raise RuntimeError("index.html has no gaius-boot.js tag (rebuild it from the current launcher template)")
@@ -248,6 +249,9 @@ def build(dist: Path, output: Path, archive: Path | None, split_sounds: bool) ->
             f'  <script data-gaius-shader-toolchain data-profile="{tag_profile}" src="{loader_url}"></script>\n',
             1,
         )
+    elif 'src="gaius-shader-toolchain.js' in index_html:
+        # An unrewritten loader reference would 404 on the site (only hashed copies ship).
+        raise RuntimeError("index.html references gaius-shader-toolchain.js but its loader tag is not recognised")
 
     site_id = sha256_bytes(json.dumps(site.assets, sort_keys=True).encode("utf-8"))[:HASH_LENGTH]
     descriptor = {

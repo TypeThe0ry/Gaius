@@ -48,15 +48,18 @@ class FakeCache {
   }
 }
 
-function createScope({coep = "credentialless", network} = {}) {
-  const caches = new Map();
+// sharedCaches: one origin's CacheStorage seen by the workers of several profiles.
+function createScope({coep = "credentialless", network, scopeUrl = SCOPE, sharedCaches, navigator, openFails} = {}) {
+  const caches = sharedCaches || new Map();
   const listeners = {};
   const fetches = [];
   const scope = {
-    location: {href: `${SCOPE}gaius-sw.js${coep === null ? "" : `?coep=${coep}`}`},
-    registration: {scope: SCOPE},
+    location: {href: `${scopeUrl}gaius-sw.js${coep === null ? "" : `?coep=${coep}`}`},
+    registration: {scope: scopeUrl},
+    navigator,
     caches: {
       async open(name) {
+        if (openFails) throw new DOMException("Unexpected internal error.", "UnknownError");
         if (!caches.has(name)) caches.set(name, new FakeCache());
         return caches.get(name);
       },
@@ -216,6 +219,59 @@ check("prune keeps the last two site generations", async () => {
   const status = await worker.status();
   assert.equal(status.coep, "credentialless");
   assert.equal(status.immutableEntries, 2);
+});
+
+check("prune and status only touch this worker's scope (profiles share the origin's caches)", async () => {
+  const origin = new URL(SCOPE).origin;
+  const scope262 = `${origin}/Gaius/26.2/`;
+  const scope263 = `${origin}/Gaius/26.3/`;
+  const shared = new Map();
+  const network = async () => new Response("x", {status: 200});
+  const env262 = createScope({network, scopeUrl: scope262, sharedCaches: shared});
+  const env263 = createScope({network, scopeUrl: scope263, sharedCaches: shared});
+  await dispatchFetch(env262, request(`${scope262}classes.0000000000000262.js`));
+  await dispatchFetch(env262, request(`${scope262}kernels/mesh.simd.0000000000000262.wasm`));
+  await dispatchFetch(env263, request(`${scope263}classes.0000000000000263.js`));
+  await dispatchFetch(env263, request(`${scope263}stale.0000000000000009.js`));
+  const result = await env263.scope.GaiusServiceWorker.worker.prune("gen-263", [`${scope263}classes.0000000000000263.js`]);
+  assert.equal(result.deleted, 1, "only the stale 26.3 entry goes");
+  assert.deepEqual([...shared.get("gaius-immutable-v1").entries.keys()].sort(), [
+    `${scope262}classes.0000000000000262.js`,
+    `${scope262}kernels/mesh.simd.0000000000000262.wasm`,
+    `${scope263}classes.0000000000000263.js`,
+  ], "the 26.2 profile keeps its entries after 26.3 prunes");
+  assert.equal((await env262.scope.GaiusServiceWorker.worker.status()).immutableEntries, 2);
+  assert.equal((await env263.scope.GaiusServiceWorker.worker.status()).immutableEntries, 1);
+});
+
+check("a CacheStorage failure falls back to the network with isolation headers", async () => {
+  let served = 0;
+  const env = createScope({openFails: true, network: async () => {
+    served++;
+    return new Response("classes", {status: 200, headers: {"Content-Type": "text/javascript"}});
+  }});
+  const script = await dispatchFetch(env, request("classes.0123456789abcdef.js", {destination: "script"}));
+  assert.equal(await script.text(), "classes");
+  assert.equal(script.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
+  const page = await dispatchFetch(env, request("", {mode: "navigate", destination: "document"}));
+  assert.equal(page.headers.get("Cross-Origin-Opener-Policy"), "same-origin");
+  // One fetch each: the hashed file falls back before any network request, and the navigation's
+  // failed shell write runs in waitUntil after its response.
+  assert.equal(served, 2);
+});
+
+check("large entries are not cached while the origin is short of quota", async () => {
+  const big = String(8 * 1024 * 1024);
+  const network = async () => new Response("payload", {status: 200, headers: {"Content-Length": big}});
+  const tight = createScope({network, navigator: {storage: {estimate: async () => ({quota: 1.5e9, usage: 1e9})}}});
+  await dispatchFetch(tight, request("singleplayer-server.0123456789abcdef.js"));
+  assert.equal((await tight.scope.caches.open("gaius-immutable-v1")).entries.size, 0);
+  const roomy = createScope({network, navigator: {storage: {estimate: async () => ({quota: 50e9, usage: 1e9})}}});
+  await dispatchFetch(roomy, request("singleplayer-server.0123456789abcdef.js"));
+  assert.equal((await roomy.scope.caches.open("gaius-immutable-v1")).entries.size, 1);
+  const unknown = createScope({network, navigator: {storage: {estimate: async () => { throw new Error("blocked"); }}}});
+  await dispatchFetch(unknown, request("singleplayer-server.0123456789abcdef.js"));
+  assert.equal((await unknown.scope.caches.open("gaius-immutable-v1")).entries.size, 1, "no estimate: cache as before");
 });
 
 check("activate removes caches of older worker versions only", async () => {

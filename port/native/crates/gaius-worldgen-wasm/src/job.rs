@@ -26,7 +26,7 @@
 //! (global biome ids, per section `(qy * 4 + qz) * 4 + qx`).
 //!
 //! `terrain` (kind `0x0403`): reference, `i32 chunk_x, chunk_z, u32 flags` (bit 0 run the
-//! surface rules, bit 1 return biomes), then the beardifier:
+//! surface rules, bit 1 return biomes, bit 2 ring biomes follow), then the beardifier:
 //!
 //! ```text
 //! u32 beard_flags (bit 0: affected box present), i32 affected[6] (min x y z, max x y z)
@@ -35,9 +35,21 @@
 //! u32 junction_count; junction: i32 source_x, source_ground_y, source_z
 //! ```
 //!
-//! `surface` (kind `0x0404`): reference, `i32 chunk_x, chunk_z, u32 flags (0)`, the
-//! beardifier, then a chunk in the result layout below (from `pad8`) without the
-//! biome block.
+//! and with flags bit 2 the biomes the neighbouring chunks store around the chunk (what
+//! vanilla's surface rules read through the `WorldGenRegion`):
+//!
+//! ```text
+//! u32 ring_len (20 * level_height / 4), u32 ring[ring_len]   global biome ids; for each quart
+//!     column of the 6 x 6 grid around the chunk outside its own 4 x 4 (x outer, z inner, from
+//!     chunk_x * 4 - 1 / chunk_z * 4 - 1), every quart y from the level bottom
+//! ```
+//!
+//! A ring that names a biome outside the generator's biome table fails the job with a
+//! `BadPayload` message starting with `worldgen-fallback:`: only that chunk takes the Java path.
+//!
+//! `surface` (kind `0x0404`): reference, `i32 chunk_x, chunk_z, u32 flags` (bit 2 ring biomes
+//! follow), the beardifier, the ring biomes, then a chunk in the result layout below (from
+//! `pad8`) without the biome block.
 //!
 //! Chunk result (terrain and surface):
 //!
@@ -54,19 +66,21 @@
 use gaius_kernel_abi::{KernelError, Status};
 use gaius_worldgen::beard::{Adjustment, Beard, Junction, Rigid};
 use gaius_worldgen::chunk::ChunkData;
-use gaius_worldgen::{Generator, TerrainRequest};
+use gaius_worldgen::{Generator, RingError, TerrainRequest};
 use std::cell::RefCell;
 
-pub const KIND_LOAD_GENERATOR: u16 = 0x0401;
-pub const KIND_BIOMES: u16 = 0x0402;
-pub const KIND_TERRAIN: u16 = 0x0403;
-pub const KIND_SURFACE: u16 = 0x0404;
+pub use gaius_kernel_abi::kind::{
+    BIOMES as KIND_BIOMES, LOAD_GENERATOR as KIND_LOAD_GENERATOR, SURFACE as KIND_SURFACE, TERRAIN as KIND_TERRAIN,
+};
 
 pub const MAX_GENERATORS: usize = 4;
 const MAX_STRUCTURE_PIECES: u32 = 1 << 16;
 
 pub const FLAG_SURFACE: u32 = 1;
 pub const FLAG_BIOMES: u32 = 2;
+pub const FLAG_RING_BIOMES: u32 = 4;
+/// Prefix of a job error that only sends that chunk to the Java path.
+pub const FALLBACK_PREFIX: &str = "worldgen-fallback:";
 
 fn bad(message: impl Into<String>) -> KernelError {
     KernelError::new(Status::BadPayload, message)
@@ -285,6 +299,47 @@ fn read_beard(c: &mut Cursor) -> Result<Beard, KernelError> {
     })
 }
 
+/// Reads the ring biomes of a job whose flags carry [`FLAG_RING_BIOMES`] (global ids).
+fn read_ring(c: &mut Cursor, flags: u32) -> Result<Option<Vec<u32>>, KernelError> {
+    if flags & FLAG_RING_BIOMES == 0 {
+        return Ok(None);
+    }
+    let len = c.u32()? as usize;
+    if len.checked_mul(4).is_none_or(|bytes| bytes > c.remaining()) {
+        return Err(truncated());
+    }
+    let mut ring = Vec::with_capacity(len);
+    for _ in 0..len {
+        ring.push(c.u32()?);
+    }
+    Ok(Some(ring))
+}
+
+/// Local biome indices of a decoded ring, checked against the generator.
+fn ring_locals(generator: &Generator, ring: Option<&[u32]>) -> Result<Option<Vec<u16>>, KernelError> {
+    let Some(ring) = ring else {
+        return Ok(None);
+    };
+    match generator.ring_biomes(ring) {
+        Ok(locals) => Ok(Some(locals)),
+        Err(RingError::Length(len)) => Err(bad(format!(
+            "ring biomes: {len} entries, the generator needs {}",
+            generator.ring_len()
+        ))),
+        Err(RingError::UnknownBiome(id)) => Err(bad(format!(
+            "{FALLBACK_PREFIX}neighbour biome {id} is not in the generator's biome table"
+        ))),
+    }
+}
+
+/// Writes the ring biomes block of a job (tests and tools).
+pub fn write_ring(out: &mut Vec<u8>, ring: &[u32]) {
+    out.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+    for id in ring {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+}
+
 /// Writes the beardifier block (empty when `beard` is `Beard::default()`).
 pub fn write_beard(out: &mut Vec<u8>, beard: &Beard) {
     let (flags, affected) = match beard.affected {
@@ -465,6 +520,7 @@ pub fn terrain(payload: &[u8]) -> Result<Vec<u8>, KernelError> {
     let chunk_z = c.i32()?;
     let flags = c.u32()?;
     let beard = read_beard(&mut c)?;
+    let ring = read_ring(&mut c, flags)?;
     with_generator(&r, |g| {
         let request = TerrainRequest {
             chunk_x,
@@ -472,6 +528,7 @@ pub fn terrain(payload: &[u8]) -> Result<Vec<u8>, KernelError> {
             beard,
             surface: flags & FLAG_SURFACE != 0,
             biomes: flags & FLAG_BIOMES != 0,
+            ring_biomes: ring_locals(g, ring.as_deref())?,
         };
         let result = g.run_terrain(&request);
         let out_flags = (result.biomes.is_some() as u32) | ((request.surface as u32) << 1);
@@ -485,15 +542,17 @@ pub fn surface(payload: &[u8]) -> Result<Vec<u8>, KernelError> {
     let r = read_ref(&mut c)?;
     let chunk_x = c.i32()?;
     let chunk_z = c.i32()?;
-    c.u32()?;
+    let flags = c.u32()?;
     let beard = read_beard(&mut c)?;
+    let ring = read_ring(&mut c, flags)?;
     c.align(8)?;
     with_generator(&r, |g| {
+        let ring = ring_locals(g, ring.as_deref())?;
         let mut chunk = read_chunk(&mut c, g)?;
         if chunk.chunk_x != chunk_x || chunk.chunk_z != chunk_z {
             return Err(bad("surface chunk position does not match the job"));
         }
-        g.run_surface(&mut chunk, beard);
+        g.run_surface_with(&mut chunk, beard, ring.as_deref());
         Ok(encode_chunk(g, &chunk, 2, None))
     })
 }
@@ -527,12 +586,29 @@ pub fn encode_surface(
     beard: &Beard,
     chunk: &[u8],
 ) -> Vec<u8> {
+    encode_surface_with(key, ir, inline, (chunk_x, chunk_z), beard, None, chunk)
+}
+
+/// [`encode_surface`] with optional ring biomes (global ids, see the module docs).
+pub fn encode_surface_with(
+    key: u32,
+    ir: &[u8],
+    inline: bool,
+    (chunk_x, chunk_z): (i32, i32),
+    beard: &Beard,
+    ring: Option<&[u32]>,
+    chunk: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::new();
     write_ref(&mut out, key, ir, inline);
     out.extend_from_slice(&chunk_x.to_le_bytes());
     out.extend_from_slice(&chunk_z.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    let flags = if ring.is_some() { FLAG_RING_BIOMES } else { 0 };
+    out.extend_from_slice(&flags.to_le_bytes());
     write_beard(&mut out, beard);
+    if let Some(ring) = ring {
+        write_ring(&mut out, ring);
+    }
     while out.len() % 8 != 0 {
         out.push(0);
     }

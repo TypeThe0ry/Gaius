@@ -71,6 +71,11 @@ public final class BrowserRenderScheduler {
     private static long currentUploadBytes;
     private static long uploadByteBudgetExhaustions;
     private static long lastInstallBytes;
+    private static long frameInstallBytes;
+    private static long frameInstallNanos;
+    private static boolean installWaitingForFrame;
+    private static boolean installing;
+    private static Runnable meshResultPump;
     private static long pumpSlices;
     private static long failedTasks;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
@@ -220,13 +225,67 @@ public final class BrowserRenderScheduler {
         renderFrames++;
         frameTasks = 0;
         frameWorkNanos = 0L;
-        Budget budget = budget();
-        if (BrowserMeshInstallQueue.readyCount() > 0) {
-            lastInstallBytes = BrowserMeshInstallQueue.drain(
-                    budget.installBytesPerFrame(),
-                    System.nanoTime() + budget.installNanosPerFrame());
-        }
+        frameInstallBytes = 0L;
+        frameInstallNanos = 0L;
+        installWaitingForFrame = false;
+        // Kernel mesh results that finished since the last frame join the install queue now.
+        pumpMeshResults();
+        installReadyMeshes();
         resumeAfterFrame();
+    }
+
+    /**
+     * Registers the step that moves finished asynchronous meshes into BrowserMeshInstallQueue
+     * (the mesh kernel's result drain, MeshKernelBridge.pumpResults). It runs at the start of
+     * every frame and on the frame watchdog, ahead of the installs.
+     */
+    public static void setMeshResultPump(Runnable pump) {
+        meshResultPump = pump;
+    }
+
+    private static void pumpMeshResults() {
+        Runnable pump = meshResultPump;
+        if (pump != null) {
+            pump.run();
+        }
+    }
+
+    /**
+     * Installs ready asynchronous meshes ({@link BrowserMeshInstallQueue}) within what is left
+     * of this frame's install budget, bytes and time. Runs at the start of every frame and
+     * whenever a mesh producer delivers results between frames, so a result never waits for an
+     * unrelated frame; whatever does not fit waits for the next frame, or for the frame
+     * watchdog when no frame is rendered.
+     */
+    public static void installReadyMeshes() {
+        if (installing || BrowserMeshInstallQueue.readyCount() == 0) {
+            return;
+        }
+        Budget budget = budget();
+        long bytesLeft = budget.installBytesPerFrame() - frameInstallBytes;
+        long nanosLeft = budget.installNanosPerFrame() - frameInstallNanos;
+        if (bytesLeft <= 0L || nanosLeft <= 0L) {
+            waitForInstallFrame();
+            return;
+        }
+        long startedAt = System.nanoTime();
+        installing = true;
+        try {
+            frameInstallBytes += BrowserMeshInstallQueue.drain(bytesLeft, startedAt + nanosLeft);
+        } finally {
+            installing = false;
+            frameInstallNanos += Math.max(0L, System.nanoTime() - startedAt);
+            lastInstallBytes = frameInstallBytes;
+        }
+        if (BrowserMeshInstallQueue.readyCount() > 0) {
+            waitForInstallFrame();
+        }
+    }
+
+    /** Ready meshes are left over: install them on the next frame or the frame watchdog. */
+    private static void waitForInstallFrame() {
+        installWaitingForFrame = true;
+        armFrameWatchdog();
     }
 
     /** A new frame budget is available: restart deferred dispatchers and the paused pump. */
@@ -869,7 +928,10 @@ public final class BrowserRenderScheduler {
         armFrameWatchdog();
     }
 
-    /** Resumes paused work when no frame is rendered for a while (paused world rendering). */
+    /**
+     * Resumes paused work, compile runs and mesh installs, when no frame is rendered for a
+     * while (paused world rendering).
+     */
     private static void armFrameWatchdog() {
         if (frameWatchdogArmed) {
             return;
@@ -879,18 +941,26 @@ public final class BrowserRenderScheduler {
         Platform.schedule(() -> {
             frameWatchdogArmed = false;
             if (renderFrames != framesAtArm) {
+                // A rendered frame reset the install budget and installed what fit.
                 if (waitingForFrame || anyDispatcherWaiting()) {
                     armFrameWatchdog();
                 }
                 return;
             }
-            if (!waitingForFrame && !anyDispatcherWaiting()) {
+            if (!waitingForFrame && !anyDispatcherWaiting() && !installWaitingForFrame) {
                 return;
             }
             frameWatchdogResumes++;
             frameTasks = 0;
             frameWorkNanos = 0L;
             compileRunsDuringUploadThisFrame = 0;
+            if (installWaitingForFrame) {
+                installWaitingForFrame = false;
+                frameInstallBytes = 0L;
+                frameInstallNanos = 0L;
+                pumpMeshResults();
+                installReadyMeshes();
+            }
             resumeAfterFrame();
         }, FRAME_WATCHDOG_MILLIS);
     }

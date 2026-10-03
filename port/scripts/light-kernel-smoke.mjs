@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Light kernel smoke: runs light_column jobs encoded by port/web/kernels/light-job.js through
 // the built wasm modules and checks a few hand-computed levels, then checks that the SIMD and
-// baseline builds return the same bytes.
+// baseline builds return the same bytes, that a job without its table gets "table missing" from
+// a fresh instance and runs once the table is spliced in, and that a full-height job with four
+// neighbours (ring slices only) stays under 100 KB.
 //
 //   node port/scripts/light-kernel-smoke.mjs <simd.wasm> [baseline.wasm]
 //
@@ -18,7 +20,7 @@ const [simdPath = join(native, "gaius_light_wasm.simd.wasm"), baselinePath = joi
   process.argv.slice(2);
 
 const context = vm.createContext({globalThis: undefined, BigInt, DataView, ArrayBuffer, Uint8Array, Uint16Array,
-  Int32Array, Math, Object, Array, Error, RangeError, TypeError, WebAssembly});
+  Uint32Array, Int32Array, Math, Object, Array, Error, RangeError, TypeError, WebAssembly});
 context.globalThis = context;
 vm.runInContext(readFileSync(join(here, "..", "web", "kernels", "light-job.js"), "utf8"), context);
 const codec = context.GaiusLightJob;
@@ -59,6 +61,10 @@ function networkSection(palette, pick) {
 
 function instantiate(path) {
   const module = new WebAssembly.Module(readFileSync(path));
+  return instance(module, path);
+}
+
+function instance(module, path) {
   const {exports} = new WebAssembly.Instance(module, {});
   for (const name of ["memory", "alloc", "dealloc", "release", "gaius_abi_version", "run_light_column"]) {
     assert.ok(name in exports, `${path} lacks export ${name}`);
@@ -116,6 +122,7 @@ function scene(random) {
 const runs = [simdPath, baselinePath].map((path) => [path, instantiate(path)]);
 for (const [path, run] of runs) {
   const result = codec.readLightColumn(run(codec.lightColumn(scene(null), 9)), 9);
+  assert.equal(result.tableMissing, false);
   assert.equal(result.lightSections, 4);
   const block1 = result.block[1];
   const sky1 = result.sky[1];
@@ -151,3 +158,69 @@ const checks = Object.assign({}, noisy, {ops: 0, checks: [8, 3, 8, 1, 5, 1], sky
 const second = runs.map(([, run]) => new Uint8Array(run(codec.lightColumn(checks, 2))));
 assert.deepEqual(second[0], second[1]);
 console.log("light-kernel-smoke: simd and baseline builds agree");
+
+// Table protocol: a job that names its table epoch without the bytes gets "table missing" from
+// an instance that never saw the table, the same job with the table spliced in runs, and the
+// instance then serves table-less jobs of that epoch.
+{
+  const module = new WebAssembly.Module(readFileSync(simdPath));
+  const run = instance(module, simdPath);
+  const full = scene(null);
+  const lean = Object.assign({}, full, {table: null});
+  const leanJob = codec.lightColumn(lean, 21);
+  const missing = run(leanJob.slice(0));
+  assert.ok(codec.isTableMissing(missing));
+  const decoded = codec.readLightColumn(missing, 21);
+  assert.equal(decoded.tableMissing, true);
+  assert.equal(decoded.lightSections, 4);
+  const spliced = codec.withTable(leanJob, lightTable());
+  assert.deepEqual(new Uint8Array(spliced), new Uint8Array(codec.lightColumn(full, 21)));
+  const lit = run(spliced);
+  assert.ok(!codec.isTableMissing(lit));
+  const again = run(codec.lightColumn(lean, 21));
+  assert.deepEqual(new Uint8Array(again), new Uint8Array(lit));
+  console.log("light-kernel-smoke: table-missing round trip ok");
+}
+
+// Job size: 24 sections, every neighbour present with noisy sections and stored layers in every
+// light section. Neighbours travel as ring slices (palette + one byte per touching cell, 128
+// bytes per layer), the table stays out of the job.
+{
+  let state = 0x9e3779b9;
+  const next = () => ((state = (state * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const sectionCount = 24;
+  const storing = codec.SECTION_FLAGS.SKY_STORING | codec.SECTION_FLAGS.BLOCK_STORING;
+  const noisyFlat = () => {
+    const flat = new Uint16Array(4096);
+    for (let i = 0; i < 4096; i++) flat[i] = next() < 0.6 ? 1 : (next() < 0.5 ? 0 : 3);
+    return flat;
+  };
+  const noisyLayer = () => {
+    const layer = new Uint8Array(2048);
+    for (let i = 0; i < 2048; i++) layer[i] = (next() * 256) | 0;
+    return layer;
+  };
+  const slot = (withLayers) => ({
+    flags: new Uint8Array(sectionCount + 2).fill(storing),
+    sections: Array.from({length: sectionCount}, () => ({flat: noisyFlat()})),
+    sky: withLayers ? Array.from({length: sectionCount + 2}, noisyLayer) : null,
+    block: withLayers ? Array.from({length: sectionCount + 2}, noisyLayer) : null,
+  });
+  const job = {
+    ops: codec.OPS.INITIAL, sky: true, block: true, emitOutgoing: true, omitUnchanged: true,
+    chunkX: 0, chunkZ: 0, minSection: -4, sectionCount, skyBottomSection: -5,
+    table: null, tableEpoch: 1234n,
+    column: {flags: new Uint8Array(sectionCount + 2).fill(storing),
+      sections: Array.from({length: sectionCount}, () => ({single: 0}))},
+    neighbours: {north: slot(true), south: slot(true), west: slot(true), east: slot(true)},
+  };
+  const bytes = codec.lightColumn(job, 5).byteLength;
+  // Before job version 2 the four neighbours alone carried 4 x 26 x 2 x 2048 bytes of layers.
+  assert.ok(bytes < 100 * 1024, `light_column job with four neighbours is ${bytes} bytes`);
+  const module = new WebAssembly.Module(readFileSync(simdPath));
+  const run = instance(module, simdPath);
+  const result = codec.readLightColumn(run(codec.withTable(codec.lightColumn(job, 5), lightTable())), 5);
+  assert.equal(result.tableMissing, false);
+  assert.equal(result.lightSections, sectionCount + 2);
+  console.log(`light-kernel-smoke: full-height job with four neighbours is ${bytes} bytes`);
+}

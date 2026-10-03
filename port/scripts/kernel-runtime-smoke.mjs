@@ -8,7 +8,8 @@
 // their transfer lists, and a fake WebAssembly implements the kernel ABI in JavaScript. The
 // checks cover priority dispatch across kernels, movement-aware ordering, lazy multi-kernel
 // loading, SIMD/baseline selection, budget backpressure, kernel disabling (the vanilla
-// fallback signal) and the MessagePort client the integrated server Worker uses.
+// fallback signal), primers for respawned workers, trimming under memory pressure and the
+// MessagePort client the integrated server Worker uses.
 
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
@@ -53,6 +54,7 @@ function makeInstance(desc, log) {
     return header;
   };
   const exports = {memory, alloc, reset: () => { top = 64; }};
+  if (desc.trim) exports[`${desc.name}_trim`] = () => { log.trims.push(desc.name); };
   for (const kind of desc.kinds) {
     exports[`run_${kind}`] = (ptr, length) => {
       const bytes = new Uint8Array(buffer, ptr, length).slice();
@@ -70,7 +72,7 @@ function makeInstance(desc, log) {
 }
 
 function createEnv({cores = 4, deviceMemory = 8, simd = true} = {}) {
-  const log = {order: [], instances: [], workers: [], posts: []};
+  const log = {order: [], instances: [], workers: [], posts: [], trims: []};
   const workerWasm = {
     Module: {exports: moduleExports, imports: () => []},
     compile: async (bytes) => decodeModule(bytes),
@@ -244,6 +246,82 @@ check("memory budget backpressure refuses far work and keeps visible work queued
   runtime.terminate();
 });
 
+check("queued jobs charge their payload only; the result estimate is charged while they run", async () => {
+  const env = createEnv();
+  const runtime = create(env, {switches: {enabled: true, off: new Set(), simd: "auto", size: 1, budgetBytes: 16 * 1024 * 1024}});
+  await runtime.warm();
+  const blocker = runtime.submit("spin", tagged(1), {kernel: "mesh"});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  // 200 visible mesh jobs with a 1 MB result estimate each: 200 MB of estimates, 3.2 KB queued.
+  const meshes = [];
+  for (let i = 0; i < 200; i++) meshes.push(runtime.submit("mesh_section", tagged(1000 + i), {visible: true, resultBytes: 1 << 20}));
+  assert.equal(runtime.budget.queuedBytes, 200 * 16, "only payloads are queued");
+  assert.ok(runtime.budget.residentPressure() < 1, "the queue is not memory the workers hold");
+  const nearGen = runtime.submit("gen_chunk", tagged(2), {cx: 1, cz: 0, priorityClass: 2});
+  assert.equal(tagOf(await nearGen), 2, "near generation still queues behind a long P0 queue");
+  await blocker;
+  assert.equal((await Promise.all(meshes)).length, 200);
+  assert.equal(runtime.budget.queuedBytes, 0);
+  assert.equal(runtime.budget.inflightBytes, 0);
+  runtime.terminate();
+});
+
+check("an unloaded reply never drops a newer load of the same kernel", async () => {
+  const env = createEnv();
+  const runtime = create(env);
+  assert.equal(tagOf(await runtime.submit("mesh_section", tagged(3), {kernel: "mesh"})), 3);
+  const slot = runtime.slots[0];
+  // An idle unload dropped the entry and posted "unload"; a new job loads the kernel again
+  // before the worker's "unloaded" reply arrives.
+  slot.loaded.delete("mesh");
+  runtime.budget.setInstance(slot.id + ":mesh", 0);
+  slot.loaded.set("mesh", {state: "loading", memoryBytes: 0, lastUsed: Date.now(), memory: null});
+  runtime.budget.setInstance(slot.id + ":mesh", 1 << 20);
+  runtime.onMessage(slot, {type: "unloaded", kernel: "mesh"});
+  assert.equal(slot.loaded.get("mesh") && slot.loaded.get("mesh").state, "loading", "the newer load stays");
+  assert.equal(runtime.budget.instances.get(slot.id + ":mesh"), 1 << 20);
+  runtime.onMessage(slot, {type: "loaded", kernel: "mesh", memoryBytes: 3 << 20});
+  assert.equal(runtime.budget.instances.get(slot.id + ":mesh"), 3 << 20, "the instance is accounted when it loads");
+  // A ready instance is still dropped by its unloaded reply (disableKernel relies on it).
+  runtime.onMessage(slot, {type: "unloaded", kernel: "mesh"});
+  assert.equal(slot.loaded.has("mesh"), false);
+  runtime.terminate();
+});
+
+check("port clients: keys are scoped per port, shared results are copied, detach cancels", async () => {
+  const env = createEnv();
+  const runtime = create(env);
+  await runtime.warm();
+  const oldChannel = new MessageChannel();
+  const newChannel = new MessageChannel();
+  runtime.attachPort(oldChannel.port1);
+  runtime.attachPort(newChannel.port1);
+  const oldClient = env.Runtime.connect(oldChannel.port2);
+  const newClient = env.Runtime.connect(newChannel.port2);
+  await Promise.all([oldClient.ready, newClient.ready]);
+  const blocker = runtime.submit("spin", tagged(1), {kernel: "mesh"});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  // A restarted server Worker reuses keys and versions: the two ports never share a job.
+  const fromOld = oldClient.submit("light_section", tagged(31), {kernel: "light", key: "light:0,0", version: 1});
+  const fromNew = newClient.submit("light_section", tagged(32), {kernel: "light", key: "light:0,0", version: 1});
+  // One port asking twice for the same job gets the result twice (the first answer is a copy).
+  const twiceA = newClient.submit("light_section", tagged(33), {kernel: "light", key: "light:1,0", version: 1});
+  const twiceB = newClient.submit("light_section", tagged(33), {kernel: "light", key: "light:1,0", version: 1});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  // The old Worker is replaced: its queued job is cancelled, not left holding a worker.
+  assert.equal(runtime.detachPort(oldChannel.port1), true);
+  const oldOutcome = await fromOld.then(() => "result", (error) => error.code);
+  assert.equal(oldOutcome, "cancelled");
+  assert.equal(tagOf(await fromNew), 32);
+  assert.equal(tagOf(await twiceA), 33);
+  assert.equal(tagOf(await twiceB), 33);
+  await blocker;
+  assert.equal(runtime.detachPort(oldChannel.port1), false, "detaching twice is a no-op");
+  runtime.terminate();
+  oldChannel.port2.close();
+  newChannel.port2.close();
+});
+
 check("a kernel that keeps trapping is disabled; its callers fall back", async () => {
   const env = createEnv();
   const runtime = create(env, {maxKernelFailures: 3});
@@ -302,6 +380,50 @@ check("the server Worker client: MessagePort submit, viewer and status", async (
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(client.available(), false, "a terminated runtime tells its clients");
   channel.port2.close();
+});
+
+check("a load_model_table job primes every new mesher instance, once per load", async () => {
+  const env = createEnv();
+  const mesher = {kinds: ["mesh_section", "load_model_table"], variants: {simd: {bytes: encodeModule(
+    {name: "mesher", kinds: ["mesh_section", "load_model_table"], trim: true})}}};
+  const runtime = create(env, {kernels: {mesher}});
+  assert.equal(tagOf(await runtime.submit("load_model_table", tagged(500, 64), {kernel: "mesher", version: 3})), 500);
+  assert.equal(runtime.telemetry().kernels.mesher.primer.bytes, 64);
+  assert.equal(runtime.budget.instances.get("primer:mesher"), 64, "the retained primer counts in the budget");
+  assert.equal(tagOf(await runtime.submit("mesh_section", tagged(501), {kernel: "mesher"})), 501);
+  const before = env.log.order.filter((entry) => entry === "mesher:load_model_table:500").length;
+  assert.equal(before, 1, "the job that set the primer is not primed twice");
+  // The worker dies; its replacement runs the primer before its first mesh job.
+  runtime.crash(runtime.slots[0], {code: "worker-crashed", message: "test crash"});
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const mark = env.log.order.length;
+  assert.equal(tagOf(await runtime.submit("mesh_section", tagged(600), {kernel: "mesher"})), 600);
+  assert.deepEqual(env.log.order.slice(mark), ["mesher:load_model_table:500", "mesher:mesh_section:600"]);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(runtime.telemetry().primed, 1);
+  // An older version never replaces the primer; clearing it stops priming.
+  assert.equal(runtime.setPrimer("mesher", {kind: "load_model_table", payload: tagged(400, 8), version: 2}), false);
+  assert.equal(runtime.setPrimer("mesher", null), true);
+  assert.equal(runtime.budget.instances.has("primer:mesher"), false);
+  runtime.terminate();
+});
+
+check("memory pressure trims loaded instances, at most once per interval", async () => {
+  const env = createEnv();
+  const mesher = {kinds: ["mesh_section"], variants: {simd: {bytes: encodeModule(
+    {name: "mesher", kinds: ["mesh_section"], trim: true})}}};
+  const runtime = create(env, {kernels: {mesher}, trimIntervalMs: 60_000});
+  assert.equal(tagOf(await runtime.submit("mesh_section", tagged(1), {kernel: "mesher"})), 1);
+  runtime.reportPressure(0.5);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(env.log.trims, [], "no trim below the threshold");
+  runtime.reportPressure(0.95);
+  runtime.reportPressure(0.97);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(env.log.trims, ["mesher"], "one trim per interval");
+  assert.equal(runtime.telemetry().trims, 1);
+  assert.equal(tagOf(await runtime.submit("mesh_section", tagged(2), {kernel: "mesher"})), 2, "the instance keeps working");
+  runtime.terminate();
 });
 
 let failed = 0;

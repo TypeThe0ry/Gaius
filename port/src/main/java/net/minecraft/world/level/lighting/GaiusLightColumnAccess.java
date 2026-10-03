@@ -57,6 +57,37 @@ public final class GaiusLightColumnAccess {
         }
     }
 
+    /**
+     * Copies the ring slice of a neighbour's layer into {@code out} (128 bytes): the levels of the
+     * cells that touch the column, cell {@code (y << 4) | along} packed like a {@code DataLayer}.
+     * {@code side} is where the neighbour lies: 0 north (its z 15 row), 1 south (z 0), 2 west
+     * (its x 15 column), 3 east (x 0); along is x for north and south, z for west and east.
+     */
+    public static void copyRing(DataLayer layer, int side, byte[] out, int offset) {
+        if (layer.isDefinitelyHomogenous()) {
+            int level = layer.get(0, 0, 0) & 15;
+            byte packed = (byte) (level | level << 4);
+            for (int i = 0; i < 128; i++) {
+                out[offset + i] = packed;
+            }
+            return;
+        }
+        byte[] data = layer.getData();
+        for (int i = 0; i < 128; i++) {
+            out[offset + i] = 0;
+        }
+        for (int y = 0; y < 16; y++) {
+            for (int along = 0; along < 16; along++) {
+                int x = side == 2 ? 15 : side == 3 ? 0 : along;
+                int z = side == 0 ? 15 : side == 1 ? 0 : along;
+                int index = y << 8 | z << 4 | x;
+                int level = data[index >> 1] >> ((index & 1) << 2) & 15;
+                int ring = y << 4 | along;
+                out[offset + (ring >> 1)] |= (byte) (level << ((ring & 1) << 2));
+            }
+        }
+    }
+
     /** {@code SkyLightSectionStorage.getBottomSectionY()} ({@code currentLowestY}). */
     public static int skyBottomSection(LightEngine<?, ?> sky) {
         return ((SkyLightSectionStorage) sky.storage).getBottomSectionY();

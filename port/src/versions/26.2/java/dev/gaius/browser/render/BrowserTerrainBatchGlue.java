@@ -9,6 +9,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.function.BiConsumer;
 import net.minecraft.client.renderer.DynamicUniforms;
+import org.lwjgl.opengl.BrowserOpenGL;
 
 /**
  * Minecraft 26.2 (blaze3d) side of the batched terrain draw path; see
@@ -113,11 +114,14 @@ public final class BrowserTerrainBatchGlue {
             if (end - start > 1) {
                 // The run's first draw stays vanilla and ends the pending span: as the last
                 // draw of that call it leaves pipeline, vertex array, index buffer and every
-                // uniform bound for the batch. A rejected batch just extends the span.
+                // uniform bound for the batch. The GL layer checks that it really was the last
+                // draw issued (26.2 returns without drawing when the pipeline cannot be set
+                // up). A rejected batch just extends the span.
+                int leadSerial = BrowserOpenGL.drawSerial();
                 pass.drawMultipleIndexed(
                         list.subList(spanStart, start + 1), indexBuffer, indexType,
                         uniformNames, sectionSlices);
-                spanStart = submitRun(list, start + 1, end, runIndexType, custom)
+                spanStart = submitRun(list, start + 1, end, runIndexType, custom, leadSerial, first)
                         ? end
                         : start + 1;
             }
@@ -132,7 +136,8 @@ public final class BrowserTerrainBatchGlue {
 
     private static boolean submitRun(
             List<RenderPass.Draw<GpuBufferSlice[]>> list, int from, int to,
-            IndexType indexType, boolean custom) {
+            IndexType indexType, boolean custom, int leadSerial,
+            RenderPass.Draw<GpuBufferSlice[]> lead) {
         if (indexType == null) {
             BrowserTerrainBatch.noteFallback();
             return false;
@@ -151,7 +156,7 @@ public final class BrowserTerrainBatchGlue {
         }
         return BrowserTerrainBatch.submit(
                 custom ? BrowserTerrainBatch.KIND_CUSTOM_INDEX : BrowserTerrainBatch.KIND_SEQUENTIAL,
-                records, count);
+                records, count, leadSerial, lead.indexCount(), lead.baseVertex());
     }
 
     /** Uploads one section's ChunkSection slice, as the vanilla lambda did. */

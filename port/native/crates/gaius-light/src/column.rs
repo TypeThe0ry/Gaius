@@ -22,7 +22,7 @@
 
 use crate::dir::{self, opposite, DOWN, EAST, NORTH, SOUTH, UP, WEST};
 use crate::nibble::{pack_row, unpack_row, LAYER_BYTES};
-use crate::section::{DecodedSection, SectionStates};
+use crate::section::{emitting_props, lookup, transparent_props, DecodedSection, SectionStates};
 use crate::table::{dampening, emission, is_empty_shape, opacity, shape_class, LightTable, Props};
 use alloc::vec::Vec;
 
@@ -46,6 +46,14 @@ pub const SIDE_EAST: usize = 3;
 /// Most world sections a column may have (`LevelHeightAccessor` caps the
 /// height at 4064 blocks).
 pub const MAX_SECTIONS: usize = 254;
+
+/// Cells of one ring slice: the 16 x 16 cells of a neighbour section that
+/// touch the column, indexed `(y << 4) | along` (along = x for north and
+/// south, z for west and east).
+pub const RING_CELLS: usize = 256;
+/// Nibble bytes of one ring slice of a light layer, packed like a
+/// `DataLayer` (index `(y << 4) | along`, the even index in the low nibble).
+pub const RING_LAYER_BYTES: usize = RING_CELLS / 2;
 
 /// Per light section flags, one byte per section and slot.
 pub mod flags {
@@ -456,6 +464,104 @@ impl LightColumn {
                     for z in 0..16 {
                         let index = (y << 8) | (z << 4) | nx;
                         let level = (nibbles[index >> 1] >> ((index & 1) << 2)) & 15;
+                        levels[cell(rx, base + y, z as i32)] = level;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads the ring slice of world section `section` on `side`: the
+    /// neighbour cells that touch the column, as `palette` ids picked by one
+    /// byte per cell from `indices` ([`RING_CELLS`], `(y << 4) | along`), or
+    /// a single id for the whole slice when `indices` is `None`. The column
+    /// reads nothing else of a neighbour's states, so this lights exactly like
+    /// [`LightColumn::load_section`] with the full neighbour section.
+    pub fn load_ring_states(
+        &mut self,
+        side: usize,
+        section: usize,
+        palette: &[u32],
+        indices: Option<&[u8]>,
+        table: &LightTable,
+    ) -> Result<(), &'static str> {
+        if side > 3 || section >= self.spec.section_count {
+            return Err("ring slice is out of range");
+        }
+        if !self.neighbour_present(side) {
+            return Err("ring slice for a neighbour that is not present");
+        }
+        if palette.is_empty() || palette.len() > RING_CELLS {
+            return Err("ring slice palette must hold 1..=256 ids");
+        }
+        if indices.is_none() && palette.len() != 1 {
+            return Err("a ring slice without indices names exactly one id");
+        }
+        if indices.is_some_and(|indices| indices.len() != RING_CELLS) {
+            return Err("ring slice indices must cover 256 cells");
+        }
+        let LightColumn {
+            props,
+            palette_scratch,
+            section_hints,
+            ..
+        } = self;
+        palette_scratch.clear();
+        for &id in palette {
+            palette_scratch.push(lookup(table, id)?);
+        }
+        let mut hints = 0;
+        if palette_scratch.iter().all(|&p| transparent_props(p)) {
+            hints |= HINT_TRANSPARENT;
+        }
+        if palette_scratch.iter().any(|&p| emitting_props(p)) {
+            hints |= HINT_MAY_EMIT;
+        }
+        section_hints[side + 1][section] = hints;
+        let base = (section + 1) * 16;
+        for y in 0..16 {
+            for along in 0..16 {
+                let value = match indices {
+                    Some(indices) => *palette_scratch
+                        .get(indices[(y << 4) | along] as usize)
+                        .ok_or("ring slice index is outside its palette")?,
+                    None => palette_scratch[0],
+                };
+                let (x, z) = ring_xz(side, along as i32);
+                props[cell(x, base + y, z)] = value;
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads the stored levels of the ring slice of light section
+    /// `light_section` on `side` ([`RING_LAYER_BYTES`] nibble bytes).
+    pub fn load_ring_layer(
+        &mut self,
+        side: usize,
+        light_section: usize,
+        layer: Layer,
+        nibbles: &[u8],
+    ) -> Result<(), &'static str> {
+        if side > 3 || light_section >= self.light_sections || nibbles.len() < RING_LAYER_BYTES {
+            return Err("ring layer is out of range");
+        }
+        let base = light_section * 16;
+        let levels = self.levels_mut(layer);
+        for y in 0..16 {
+            let row = &nibbles[y * 8..y * 8 + 8];
+            match side {
+                SIDE_NORTH | SIDE_SOUTH => {
+                    let rz = if side == SIDE_NORTH { -1 } else { 16 };
+                    let start = cell(0, base + y, rz);
+                    unpack_row(row, &mut levels[start..start + 16]);
+                }
+                _ => {
+                    let rx = if side == SIDE_WEST { -1 } else { 16 };
+                    let mut unpacked = [0u8; 16];
+                    unpack_row(row, &mut unpacked);
+                    for (z, &level) in unpacked.iter().enumerate() {
                         levels[cell(rx, base + y, z as i32)] = level;
                     }
                 }

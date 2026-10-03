@@ -18,11 +18,14 @@
 //     ?gaiusSw=0 unregisters it; ?gaiusCoi=0|credentialless|require-corp picks the COEP mode.
 //   - runtime modules: kernel-policy.js, kernel-runtime.js and the kernel job codecs, then the
 //     quality layer (runtime/quality/*, owned by the graphics workstream) in its load order.
-//     beforeMain() waits for them (bounded) and runs GaiusQuality.caps.ensureTier().
+//     beforeMain() waits for them (bounded) and runs GaiusQuality.caps.ensureTier(). The
+//     quality layer reads window.__gaiusProfileId, which the launcher sets in <head>.
 //   - kernel runtime: window.__gaiusKernels creates GaiusKernelRuntime lazily, feeds it the
 //     player position from window.__gaiusMinecraftState for motion prediction, and gives the
 //     integrated server Worker a MessagePort into it ({type: "gaius-kernel-port"} right after
-//     the singleplayer "start" message).
+//     the singleplayer "start" message) together with the worldgen kernel scripts and the
+//     page's worldgen and light switches (?worldgenKernel=0, ?worldgenKernelHost=,
+//     ?lightKernel=0 or gaius.lightKernel=off), which that Worker cannot read itself.
 //   - lazy singleplayer: the server Worker payload is only loaded when a world starts; while
 //     the title screen idles it is prefetched (?gaiusPrefetch=0 turns that off).
 //   - sounds on demand (site): the vanilla pack is split into a core pack and a sounds pack;
@@ -49,6 +52,11 @@
   })();
   const nowMs = () => (perf && perf.now ? perf.now() : Date.now());
   const site = global.__gaiusSite && typeof global.__gaiusSite === "object" ? global.__gaiusSite : null;
+  // The quality layer caps the canvas ratio by profile. The launcher sets the id in <head>; a
+  // site page from an older launcher still names it in its descriptor.
+  if (site && typeof site.profile === "string" && site.profile && !global.__gaiusProfileId) {
+    global.__gaiusProfileId = site.profile;
+  }
   // The portable page sets __gaiusBootPortable before this script (its own bootstrap, which sets
   // __gaiusPortableBuild, runs later in the body).
   const isPortable = () => global.__gaiusPortableBuild === true || global.__gaiusBootPortable === true;
@@ -187,9 +195,10 @@
       promise = Promise.resolve(true);
     } else if (!doc || !doc.createElement) {
       promise = Promise.resolve(false);
-    } else if (isPortable() || (isFile && !site)) {
-      // A portable page inlines what it has; a dist opened from disk cannot load siblings
-      // reliably, so missing modules are simply absent.
+    } else if (isPortable() || (isFile && !site && name.indexOf("runtime/quality/") !== 0)) {
+      // A portable page inlines what it has. A dist opened from disk has no kernels (no Worker
+      // from a file: URL, no kernels.json fetch), so their modules are not loaded there; the
+      // quality layer is plain script and loads by tag like classes.js does.
       promise = Promise.resolve(false);
     } else {
       const url = assetUrl(name) || name;
@@ -427,7 +436,90 @@
     }, 200);
   }
 
+  // --- integrated server Worker ---------------------------------------------------------------
+
+  // The server Worker sees neither the page URL nor its storage, so the page passes the kernel
+  // switches and the scripts that Worker imports before its kernel client exists along with the
+  // port (server-worker-bootstrap.js loadKernelHostScripts).
+  const SERVER_KERNEL_SCRIPTS = ["kernels/worldgen-job.js", "kernels/worldgen-kernel.js"];
+  const OFF_VALUE = /^(0|off|false|no)$/i;
+
+  // "worker": the server Worker runs its own worldgen kernel workers; "shared": worldgen only
+  // goes through this page's runtime; empty: the facade decides (auto).
+  function worldgenHostMode() {
+    const value = String(params.get("worldgenKernelHost") || "").toLowerCase();
+    return value === "worker" || value === "shared" ? value : "";
+  }
+
+  // [{name, url}] for a site or dist over http(s), [{name, source}] from the inert copies a
+  // portable page carries (build-portable-html.py), nothing for a dist opened from disk.
+  function serverWorkerKernelScripts() {
+    const names = (worldgenHostMode() === "worker" ? KERNEL_RUNTIME_SCRIPTS : []).concat(SERVER_KERNEL_SCRIPTS);
+    if (isPortable()) {
+      const out = [];
+      for (const name of names) {
+        const element = doc && doc.querySelector
+          ? doc.querySelector('script[type="text/plain"][data-gaius-worker-script="' + name + '"]')
+          : null;
+        if (element && element.textContent) out.push({name, source: element.textContent});
+      }
+      return out;
+    }
+    if (isFile && !site) return [];
+    const out = [];
+    for (const name of names) {
+      // A site that does not list a script never had it: the Worker keeps the vanilla path.
+      if (site && !hasAsset(name)) continue;
+      out.push({name, url: new URL(assetUrl(name) || name, loc.href).href});
+    }
+    return out;
+  }
+
+  function serverWorldgenConfig() {
+    const config = {};
+    const value = params.get("worldgenKernel");
+    if (value !== null && OFF_VALUE.test(value)) config.enabled = false;
+    const host = worldgenHostMode();
+    if (host) config.host = host;
+    return config;
+  }
+
+  // ?lightKernel=0 (also lightkernel, off/false/no) or the stored gaius.lightKernel=off setting.
+  function serverLightConfig() {
+    const value = params.get("lightKernel") !== null ? params.get("lightKernel") : params.get("lightkernel");
+    const off = (value !== null && OFF_VALUE.test(value)) || storageGet("gaius.lightKernel") === "off";
+    return {enabled: !off};
+  }
+
+  // ?worldgenKernelHost=worker: the server Worker starts its own kernel runtime, so it needs the
+  // worldgen modules and the kernel worker script itself. Portable modules travel as bytes
+  // (copied, the page runtime keeps its own), URLs stay URLs.
+  async function serverWorldgenHost() {
+    try {
+      const manifest = await kernelManifest();
+      const entry = manifest && manifest.kernels ? manifest.kernels.worldgen : null;
+      if (!entry || !manifest.worker) return null;
+      const variants = {};
+      for (const variant of Object.keys(entry.variants || {})) {
+        const source = entry.variants[variant];
+        if (source && source.url) variants[variant] = {url: source.url};
+        else if (source && typeof source.load === "function") variants[variant] = {bytes: await source.load()};
+      }
+      if (Object.keys(variants).length === 0) return null;
+      const host = {kernels: {worldgen: {kinds: entry.kinds || [], memory: entry.memory, variants}}};
+      if (manifest.worker.workerUrl) host.workerUrl = manifest.worker.workerUrl;
+      else if (manifest.worker.workerSource) host.workerSource = manifest.worker.workerSource;
+      else return null;
+      return host;
+    } catch (error) {
+      record("worldgen-host-config-failed", error && error.message);
+      return null;
+    }
+  }
+
   // The integrated server Worker gets a port into this runtime right after its start message.
+  let serverKernelPort = null;
+
   function installServerWorkerHook() {
     const WorkerClass = global.Worker;
     if (typeof WorkerClass !== "function" || !WorkerClass.prototype || WorkerClass.prototype.__gaiusKernelHook) return;
@@ -439,10 +531,36 @@
         if (message && message.type === "start" && message.port && !this.__gaiusKernelPortSent && !kernelSwitchOff()) {
           this.__gaiusKernelPortSent = true;
           const channel = new global.MessageChannel();
-          nativePostMessage.call(this, {type: "gaius-kernel-port", port: channel.port2}, [channel.port2]);
+          const portMessage = {
+            type: "gaius-kernel-port",
+            port: channel.port2,
+            kernelScripts: serverWorkerKernelScripts(),
+            worldgenKernel: serverWorldgenConfig(),
+            lightKernel: serverLightConfig(),
+          };
+          if (worldgenHostMode() === "worker") {
+            // The host configuration needs the resolved manifest; bounded, and without it the
+            // Worker's worldgen simply stays on vanilla Java.
+            const worker = this;
+            withTimeout(serverWorldgenHost(), 15000).then((host) => {
+              if (host) Object.assign(portMessage.worldgenKernel, host);
+              try {
+                nativePostMessage.call(worker, portMessage, [channel.port2]);
+              } catch (error) {
+                record("kernel-port-failed", error && error.message);
+              }
+            });
+          } else {
+            nativePostMessage.call(this, portMessage, [channel.port2]);
+          }
           runtime().then((created) => {
-            if (created) created.attachPort(channel.port1);
-            else {
+            if (created) {
+              // One integrated server at a time: a new start replaces the previous Worker, whose
+              // queued jobs would only hold kernel workers (detachPort cancels them).
+              if (serverKernelPort && typeof created.detachPort === "function") created.detachPort(serverKernelPort);
+              serverKernelPort = channel.port1;
+              created.attachPort(channel.port1);
+            } else {
               channel.port1.postMessage({type: "status", status: {enabled: false, kernels: {}}});
               channel.port1.close();
             }

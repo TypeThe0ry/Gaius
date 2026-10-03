@@ -18,7 +18,10 @@
 //     light: Uint8Array(8000),               // (sky << 4) | block
 //     biomeQuarts: Uint8Array(216),          // palette indices, quart origin section * 4 - 1
 //     biomePalette: Int32Array(n * 5) | [{grass, grassModifier, foliage, dryFoliage, water}],
-//     swampMask: Uint8Array(32),             // optional
+//     swampMask: Uint8Array(32),             // optional; bit z * 16 + x
+//     biomeBlend: 0..2,                      // optional Options.biomeBlendRadius; with it the
+//                                            // swampMask is Uint8Array(50), bit (z + 2) * 20 + (x + 2)
+//                                            // for the columns x, z in -2..17
 //   }, {priority, key, version, ...});
 //   // submit(kind, payload, opts) -> Promise<ArrayBuffer>, e.g. (k, p, o) => runtime.submit(k, p, o)
 //   // result.status: "meshed" | "needs-vanilla"; result.layers.solid.vertices is a Uint8Array of
@@ -52,6 +55,9 @@
   const RESULT_HEADER_LEN = 160;
   const VANILLA_VERTEX = 28;
   const COMPACT_VERTEX = 12;
+  const SWAMP_BYTES = 32;
+  const SWAMP_BLEND_BYTES = 50;
+  const MAX_BIOME_BLEND = 2;
 
   const FLAGS = Object.freeze({
     AMBIENT_OCCLUSION: 1 << 0,
@@ -63,6 +69,7 @@
     GREEDY: 1 << 6,
     INLINE_TABLE: 1 << 7,
     EMIT_CENTROIDS: 1 << 8,
+    BIOME_BLEND: 1 << 9,
   });
   const RESULT_FLAGS = Object.freeze({VANILLA: 1, COMPACT: 2, SORTED: 4, CENTROIDS: 8, EMPTY: 16});
   const STATUS = Object.freeze({MESHED: 0, TABLE_MISSING: 1, NEEDS_VANILLA: 2});
@@ -156,6 +163,16 @@
     });
   }
 
+  // Options.biomeBlendRadius of the job, or -1 for the legacy layout (radius 0, 16 x 16 swamp mask).
+  function biomeBlend(input) {
+    const blend = input.biomeBlend;
+    if (blend === undefined || blend === null) return -1;
+    if (!Number.isInteger(blend) || blend < 0 || blend > MAX_BIOME_BLEND) {
+      throw new RangeError(`biomeBlend must be an integer in 0..${MAX_BIOME_BLEND}`);
+    }
+    return blend;
+  }
+
   function jobFlags(input, wide, withTable) {
     let flags = 0;
     if (input.ao !== false) flags |= FLAGS.AMBIENT_OCCLUSION;
@@ -166,6 +183,7 @@
     if (input.centroids) flags |= FLAGS.EMIT_CENTROIDS;
     if (wide) flags |= FLAGS.WIDE_IDS;
     if (withTable) flags |= FLAGS.INLINE_TABLE;
+    if (biomeBlend(input) >= 0) flags |= FLAGS.BIOME_BLEND;
     return flags;
   }
 
@@ -181,14 +199,18 @@
     const paletteCount = paletteLength(input.biomePalette);
     if (paletteCount > 256) throw new RangeError("biomePalette holds more than 256 biomes");
     const tableBytes = table ? toBytes(table, "model table") : null;
+    const blend = biomeBlend(input);
+    const swampBytes = blend >= 0 ? SWAMP_BLEND_BYTES : SWAMP_BYTES;
+    const swamp = input.swampMask ? toBytes(input.swampMask, "swampMask") : null;
+    if (swamp && swamp.byteLength !== swampBytes) throw new RangeError(`swampMask must hold ${swampBytes} bytes`);
 
     const statesAt = JOB_HEADER_LEN;
     const lightAt = statesAt + VOLUME * (wide ? 4 : 2);
     const quartsAt = lightAt + VOLUME;
     const paletteAt = pad(quartsAt + QUART_VOLUME, 8);
     const swampAt = paletteAt + PALETTE_ENTRY_LEN * paletteCount;
-    const tableAt = pad(swampAt + 32, 8);
-    const payloadLength = tableBytes ? tableAt + tableBytes.byteLength : swampAt + 32;
+    const tableAt = pad(swampAt + swampBytes, 8);
+    const payloadLength = tableBytes ? tableAt + tableBytes.byteLength : swampAt + swampBytes;
 
     const buffer = frame(KIND_MESH_SECTION, payloadLength, jobId);
     const view = new DataView(buffer, HEADER_LEN);
@@ -208,12 +230,13 @@
     for (let i = 0; i < 3; i++) view.setFloat32(56 + 4 * i, camera[i], true);
     view.setUint32(68, tableBytes ? tableBytes.byteLength : 0, true);
     view.setBigInt64(72, BigInt.asIntN(64, BigInt(input.biomeZoomSeed || 0)), true);
+    view.setUint32(80, blend >= 0 ? blend : 0, true);
 
     writeIds(buffer, HEADER_LEN + statesAt, input.states, wide);
     new Uint8Array(buffer, HEADER_LEN + lightAt, VOLUME).set(light);
     new Uint8Array(buffer, HEADER_LEN + quartsAt, QUART_VOLUME).set(quarts);
     writePalette(view, paletteAt, input.biomePalette);
-    if (input.swampMask) new Uint8Array(buffer, HEADER_LEN + swampAt, 32).set(toBytes(input.swampMask, "swampMask"));
+    if (swamp) new Uint8Array(buffer, HEADER_LEN + swampAt, swampBytes).set(swamp);
     if (tableBytes) new Uint8Array(buffer, HEADER_LEN + tableAt, tableBytes.byteLength).set(tableBytes);
     return buffer;
   }
@@ -424,6 +447,7 @@
   global.GaiusMeshJob = Object.freeze({
     ABI_VERSION, KIND_LOAD_MODEL_TABLE, KIND_MESH_SECTION, FLAGS, RESULT_FLAGS, STATUS, LAYERS, CARDINAL,
     GRASS_MODIFIER, REGION, MARGIN, VOLUME, QUART_VOLUME, VANILLA_VERTEX, COMPACT_VERTEX,
+    SWAMP_BYTES, SWAMP_BLEND_BYTES, MAX_BIOME_BLEND,
     regionIndex, tableEpoch, loadModelTable, readModelTableLoaded, meshSection, readResult, readMeshSection,
     sortedIndices, sortOrder, estimateResultBytes, enabled, noteSuccess, noteFailure, status,
     session: (tableBytes, epoch) => new MeshTableSession(tableBytes, epoch),

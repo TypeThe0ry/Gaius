@@ -6,15 +6,19 @@ import com.mojang.blaze3d.vertex.VertexSorting;
 import com.mojang.renderpearl.api.pipeline.IndexType;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.vertex.VertexFormat;
+import dev.gaius.browser.BrowserRenderScheduler;
+import dev.gaius.browser.BrowserSectionAudit;
 import dev.gaius.browser.render.BrowserMeshInstall;
 import dev.gaius.browser.render.BrowserMeshInstallQueue;
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.SectionBufferBuilderPack;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
 import net.minecraft.client.renderer.chunk.RenderSectionRegion;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
@@ -50,8 +54,19 @@ import org.teavm.jso.JSObject;
  *
  * <p>Stale results are dropped: the install queue checks the request sequence and the level and
  * resource epochs, and a task that vanilla cancelled (re-dirtied, reset, moved) never installs.
+ * At most one request per section is out: a task created while one is (the section was dirtied
+ * again before the kernel answered) runs the vanilla compiler, so every re-dirty still makes
+ * progress.
  * A job the kernel refused (a state it cannot express), a failed job or a disabled kernel sends
  * the task through the vanilla compiler instead.</p>
+ *
+ * <p>No section waits on the kernel forever: a job without an answer after
+ * {@value #ANSWER_TIMEOUT_MILLIS} ms, or any job still out when the kernel gets disabled, is
+ * handed to the install queue as a failure and compiled by vanilla (the timeout counts as a
+ * kernel failure, so a hung kernel disables itself). Until then the section stays pending in
+ * {@link BrowserMeshInstallQueue}, which keeps BrowserSectionAudit from re-dirtying it. A
+ * dropped result whose section was left with no compile at all (cancelled, same position, still
+ * uncompiled, no newer request) is marked dirty again.</p>
  */
 public final class MeshKernelHooks {
     /** The kernel result was consumed, or vanilla compiled the task. */
@@ -63,12 +78,16 @@ public final class MeshKernelHooks {
     private static final int NEARBY_BLOCKS = 32;
     private static final long EXPORT_SLICE_NANOS = 4_000_000L;
     private static final long EXPORT_GAP_NANOS = 12_000_000L;
+    private static final long ANSWER_TIMEOUT_MILLIS = 10_000L;
+    private static final long ANSWER_TIMEOUT_NANOS = ANSWER_TIMEOUT_MILLIS * 1_000_000L;
     private static final ChunkSectionLayer[] LAYERS = {
         ChunkSectionLayer.SOLID, ChunkSectionLayer.CUTOUT, ChunkSectionLayer.TRANSLUCENT};
     private static final Direction[] DIRECTIONS = Direction.values();
 
     private static final MeshJobBuffers BUFFERS = new MeshJobBuffers();
     private static final HashMap<Integer, InFlight> IN_FLIGHT = new HashMap<>();
+    /** Submitted jobs, oldest first, for the answer timeout; answered ones are skipped lazily. */
+    private static final ArrayDeque<InFlight> SUBMIT_ORDER = new ArrayDeque<>();
     private static int nextTicket = 1;
     private static boolean drainerRegistered;
     private static MeshModelTable table;
@@ -88,18 +107,24 @@ public final class MeshKernelHooks {
         final int requestSeq;
         final int levelEpoch;
         final int resourceEpoch;
+        final int ticket;
+        final long submittedNanos;
         final List<BlockEntity> blockEntities;
         /** Point of view of the camera the kernel sorted the translucent quads for. */
         final TranslucencyPointOfView pointOfView;
+        /** An answer (or the timeout) was handed to the install queue. */
+        boolean answered;
 
         InFlight(MeshKernelAccess.Task task, SectionRenderDispatcher.RenderSection section, long node,
-                int requestSeq, List<BlockEntity> blockEntities, Vec3 camera) {
+                int requestSeq, int ticket, List<BlockEntity> blockEntities, Vec3 camera) {
             this.task = task;
             this.section = section;
             this.node = node;
             this.requestSeq = requestSeq;
             this.levelEpoch = BrowserMeshInstallQueue.levelEpoch();
             this.resourceEpoch = BrowserMeshInstallQueue.resourceEpoch();
+            this.ticket = ticket;
+            this.submittedNanos = System.nanoTime();
             this.blockEntities = blockEntities;
             this.pointOfView = TranslucencyPointOfView.of(camera, node);
         }
@@ -107,6 +132,26 @@ public final class MeshKernelHooks {
         boolean alive() {
             return task.gaius$meshKernelState() == this && !task.gaius$meshKernelCancelled()
                     && section.getSectionNode() == node;
+        }
+
+        /**
+         * Called when this job's result is dropped because the task is no longer alive. Vanilla
+         * cancels a task when it replaces it or moves the section, so normally another compile
+         * follows; a section that is still uncompiled at the same position, with no compile and
+         * no newer kernel request, would stay a hole, so it is marked dirty again. With uploads
+         * queued a finished vanilla compile may still be on its way to the section, so that case
+         * is left to BrowserSectionAudit.
+         */
+        void redirtyIfOrphaned() {
+            if (levelEpoch != BrowserMeshInstallQueue.levelEpoch()
+                    || section.getSectionNode() != node
+                    || section.getSectionMesh() != CompiledSectionMesh.UNCOMPILED
+                    || section.gaius$hasPendingCompile()
+                    || !BrowserMeshInstallQueue.isLatest(node, requestSeq)
+                    || BrowserRenderScheduler.uploadBacklog() > 0) {
+                return;
+            }
+            BrowserSectionAudit.requeueAfterKernelDrop(section);
         }
     }
 
@@ -144,15 +189,18 @@ public final class MeshKernelHooks {
         }
         try {
             drainResults();
-            if (Minecraft.getInstance().options.biomeBlendRadius().get() != 0) {
-                // The kernel tints with blend radius 0 only.
+            int blend = Minecraft.getInstance().options.biomeBlendRadius().get();
+            if (blend < 0 || blend > MeshKernelBridge.MAX_BIOME_BLEND) {
+                // The snapshot's biome grid reaches two columns past the section; wider blends
+                // stay with the vanilla compiler.
+                MeshKernelBridge.noteBlendSkip();
                 return false;
             }
             MeshModelTable current = currentTable(compiler);
             if (current == null) {
                 return false;
             }
-            return submit(task, compiler, camera, current);
+            return submit(task, compiler, camera, current, blend);
         } catch (RuntimeException error) {
             MeshKernelBridge.noteFailure("snapshot: " + error);
             return false;
@@ -160,7 +208,7 @@ public final class MeshKernelHooks {
     }
 
     private static boolean submit(MeshKernelAccess.Task task, SectionCompiler compiler, Vec3 camera,
-            MeshModelTable current) {
+            MeshModelTable current, int blend) {
         long start = System.nanoTime();
         SectionRenderDispatcher.RenderSection section = task.gaius$meshSection();
         RenderSectionRegion region = task.gaius$meshRegion();
@@ -168,9 +216,16 @@ public final class MeshKernelHooks {
             return false;
         }
         long node = section.getSectionNode();
+        if (BrowserMeshInstallQueue.isPending(node)) {
+            // A request for this section is still out and vanilla just replaced its task (the
+            // section was dirtied again): compile this one directly, so a section re-dirtied
+            // faster than the kernel round trip (redstone clocks, the loading frontier) still
+            // gets a mesh. The old result is dropped as not alive when it arrives.
+            return false;
+        }
         List<BlockEntity> blockEntities = new ArrayList<>();
         MeshJobBuffers b = BUFFERS;
-        if (!SectionSnapshot.capture(b, region, node, current, camera, blockEntities)) {
+        if (!SectionSnapshot.capture(b, region, node, current, camera, blockEntities, blend)) {
             return false;
         }
         MeshKernelAccess.Compiler options = (MeshKernelAccess.Compiler) (Object) compiler;
@@ -200,6 +255,7 @@ public final class MeshKernelHooks {
         h[MeshKernelBridge.H_REQUEST_SEQ] = requestSeq;
         h[MeshKernelBridge.H_NON_AIR] = SectionSnapshot.lastNonAir;
         h[MeshKernelBridge.H_DISTANCE] = distance;
+        h[MeshKernelBridge.H_BLEND] = blend;
         boolean sent;
         try {
             sent = MeshKernelBridge.submit(h, b.ids16, b.ids32, b.light, b.quarts, b.palette, b.swamp, b.floats);
@@ -211,8 +267,9 @@ public final class MeshKernelHooks {
             BrowserMeshInstallQueue.cancel(node, requestSeq);
             return false;
         }
-        InFlight job = new InFlight(task, section, node, requestSeq, blockEntities, camera);
+        InFlight job = new InFlight(task, section, node, requestSeq, ticket, blockEntities, camera);
         IN_FLIGHT.put(ticket, job);
+        SUBMIT_ORDER.addLast(job);
         task.gaius$setMeshKernelState(job);
         MeshKernelBridge.noteSnapshotNanos(System.nanoTime() - start);
         return true;
@@ -242,14 +299,19 @@ public final class MeshKernelHooks {
         return compiler.compile(pos, region, sorting, pack);
     }
 
-    /** Moves finished kernel jobs into the install queue. */
+    /**
+     * Moves finished kernel jobs into the install queue, then hands jobs the kernel did not
+     * answer in time (or any job, once the kernel is disabled) to it as failures.
+     */
     public static void drainResults() {
         JSObject record;
         while ((record = MeshKernelBridge.poll()) != null) {
             InFlight job = IN_FLIGHT.remove(MeshKernelBridge.ticket(record));
             if (job == null) {
+                // Timed out before: vanilla compiled the task already.
                 continue;
             }
+            job.answered = true;
             int status = MeshKernelBridge.status(record);
             int bytes = 0;
             if (status == MeshKernelBridge.STATUS_MESHED) {
@@ -264,6 +326,30 @@ public final class MeshKernelHooks {
                 }
             }
             BrowserMeshInstallQueue.enqueue(new Install(job, record, status, bytes));
+        }
+        expireUnanswered();
+    }
+
+    /** Oldest-first sweep; cheap while the oldest job out is young. */
+    private static void expireUnanswered() {
+        long now = System.nanoTime();
+        while (!SUBMIT_ORDER.isEmpty()) {
+            InFlight job = SUBMIT_ORDER.peekFirst();
+            if (job.answered) {
+                SUBMIT_ORDER.pollFirst();
+                continue;
+            }
+            boolean kernelOff = MeshKernelBridge.disabled();
+            if (!kernelOff && now - job.submittedNanos < ANSWER_TIMEOUT_NANOS) {
+                return;
+            }
+            SUBMIT_ORDER.pollFirst();
+            IN_FLIGHT.remove(job.ticket);
+            job.answered = true;
+            if (!kernelOff) {
+                MeshKernelBridge.noteFailure("no answer within " + ANSWER_TIMEOUT_MILLIS + " ms");
+            }
+            BrowserMeshInstallQueue.enqueue(new Install(job, null, MeshKernelBridge.STATUS_FAILED, 0));
         }
     }
 
@@ -329,6 +415,7 @@ public final class MeshKernelHooks {
         JSObject record = ready.record;
         SectionCompiler.Results results = new SectionCompiler.Results();
         MeshData[] built = new MeshData[LAYERS.length];
+        ByteBufferBuilder[] touched = new ByteBufferBuilder[LAYERS.length];
         try {
             for (int layer = 0; layer < LAYERS.length; layer++) {
                 int quads = MeshKernelBridge.quadCount(record, layer);
@@ -342,7 +429,12 @@ public final class MeshKernelHooks {
                 }
                 int vertices = quads * 4;
                 int bytes = vertices * VANILLA_VERTEX_BYTES;
+                if (MeshKernelBridge.vertexBytes(record, layer) != bytes) {
+                    // Checked before anything is reserved in the pack's buffer.
+                    throw new IllegalStateException("kernel vertex bytes do not match the quad count");
+                }
                 ByteBufferBuilder buffer = pack.buffer(sectionLayer);
+                touched[layer] = buffer;
                 long pointer = buffer.reserve(bytes);
                 copyVertices(record, layer, pointer, bytes);
                 ByteBufferBuilder.Result vertexBuffer = buffer.build();
@@ -362,6 +454,22 @@ public final class MeshKernelHooks {
             for (MeshData mesh : built) {
                 if (mesh != null) {
                     mesh.close();
+                }
+            }
+            // Bytes reserved but never built would prefix the mesh of the vanilla compile that
+            // follows on the same buffers: build them into a result and free it, which rewinds
+            // the buffer (or moves its next result past them).
+            for (ByteBufferBuilder buffer : touched) {
+                if (buffer == null) {
+                    continue;
+                }
+                try {
+                    ByteBufferBuilder.Result leftover = buffer.build();
+                    if (leftover != null) {
+                        leftover.close();
+                    }
+                } catch (RuntimeException ignored) {
+                    // A closed buffer: the vanilla compile reports it; keep the original error.
                 }
             }
             throw error;
@@ -471,6 +579,7 @@ public final class MeshKernelHooks {
             JSObject result = record;
             record = null;
             if (!job.alive()) {
+                job.redirtyIfOrphaned();
                 return true;
             }
             if (status == MeshKernelBridge.STATUS_MESHED && result != null) {
@@ -492,6 +601,8 @@ public final class MeshKernelHooks {
                 job.task.gaius$setMeshKernelState(VANILLA);
                 MeshKernelBridge.noteVanillaFallback();
                 job.task.gaius$requeueForMeshKernel();
+            } else {
+                job.redirtyIfOrphaned();
             }
         }
     }

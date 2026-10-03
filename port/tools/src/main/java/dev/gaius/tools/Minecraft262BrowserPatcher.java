@@ -1,5 +1,6 @@
 package dev.gaius.tools;
 
+import dev.gaius.tools.kernel.MeshKernelPatches;
 import dev.gaius.tools.quality.GraphicsPresetStartupPatcher;
 import dev.gaius.tools.render.TerrainBatchPatches;
 import java.io.IOException;
@@ -111,9 +112,13 @@ public final class Minecraft262BrowserPatcher {
         // After patchLiveFrameTargeting: that patch writes Minecraft.class from the input jar,
         // while this one reads Minecraft and Options back from root and composes with it.
         PatchRegistry.run("Minecraft262BrowserPatcher.patchGraphicsPresetStartupReplay", () -> patchGraphicsPresetStartupReplay(jar, root));
-        // Last: it reads LevelRenderer, LevelExtractor and RenderSection as the patches above
-        // left them in root, and nothing after it in this step rewrites those classes.
+        // It reads LevelRenderer, LevelExtractor and RenderSection as the patches above left
+        // them in root, and nothing after it in this step rewrites those classes.
         PatchRegistry.run("Minecraft262BrowserPatcher.terrainBatchPatches", () -> terrainBatchPatches(jar, root, minecraftVersion));
+        // Last: after every patch that rewrites CompileTask.doTask (upload retry yields, bounded
+        // cancellation, latest-mesh guard) and RenderSection; reads them back from root and adds
+        // the mesh kernel prologue and compile hook to doTask.
+        PatchRegistry.run("Minecraft262BrowserPatcher.meshKernelPatches", () -> meshKernelPatches(jar, root, minecraftVersion));
         PatchRegistry.printSummary();
     }
 
@@ -135,6 +140,18 @@ public final class Minecraft262BrowserPatcher {
     private static void terrainBatchPatches(String jar, Path root, String minecraftVersion)
             throws IOException {
         TerrainBatchPatches.apply(jar, root, minecraftVersion);
+    }
+
+    /**
+     * Section compiles through the mesh kernel (see {@link MeshKernelPatches}). Both modern
+     * profiles must take it; the patch class itself refuses a doTask whose shape it does not know.
+     */
+    private static void meshKernelPatches(String jar, Path root, String minecraftVersion)
+            throws IOException {
+        if (!MeshKernelPatches.apply(jar, root, minecraftVersion)) {
+            throw new IllegalStateException(
+                    "Minecraft " + minecraftVersion + " must route section compiles through the mesh kernel");
+        }
     }
 
     /**

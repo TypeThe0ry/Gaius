@@ -10,15 +10,33 @@
 // the single-file page next to it. It installs globalThis.GaiusKernelRuntime:
 //
 //   const runtime = await GaiusKernelRuntime.create({
-//     kernels: {mesh: {kinds: ["mesh_section"], variants: {simd: {url}, baseline: {url}}}, ...},
+//     kernels: {mesher: {kinds: ["mesh_section"], variants: {simd: {url}, baseline: {url}}}, ...},
 //     workerUrl | workerSource,             // kernel-worker.js (a URL keeps the V8 code cache)
 //   });
-//   runtime.submit("mesh_section", payload, {kernel: "mesh", key, version, visible: true,
+//   runtime.submit("mesh_section", payload, {kernel: "mesher", key, version, visible: true,
 //                                           cx, cz, distance, resultBytes, signal, transfer});
 //   runtime.setViewer({x, y, z, yaw, vx?, vz?, viewDistance?});    // movement prediction
-//   runtime.available("mesh")             // false: use the vanilla Java path
+//   runtime.available("mesher")           // false: use the vanilla Java path
+//   runtime.setPrimer("mesher", {kind, payload})   // job run on every new instance (see below)
+//   runtime.reportPressure(0..1)          // heap pressure seen by the page (Java BrowserMemory)
 //   runtime.attachPort(port)              // serve a remote client (the server Worker)
 //   GaiusKernelRuntime.connect(port)      // that remote client, in the other realm
+//
+// Kernel names are the crate names without "gaius-" and "-wasm": mesher, light, worldgen, noise.
+//
+// Primers: a kernel that keeps state between jobs (the mesher's model table) may name a job
+// that every new instance runs before its first real job, so a worker that was just spawned,
+// respawned after a crash or reloaded after an idle unload does not answer its first job with
+// "table missing". A submitted job whose kind is in options.primeKinds (load_model_table by
+// default) becomes its kernel's primer automatically; setPrimer sets or clears one directly. The
+// retained primer payload counts against the memory budget, and so does the state it creates in
+// each instance (estimated by its size until the worker reports its memory).
+//
+// Memory pressure: when the heap pressure (performance.memory, or the level the page reports
+// through reportPressure) reaches options.trimPressure, every worker is asked, at most once per
+// options.trimIntervalMs, to call the trim exports of its instances (mesh_trim, light_trim and
+// any other export named trim or *_trim), which drop the cached tables and scratch buffers. A
+// trimmed mesher answers its next job with "table missing" and recovers through its session.
 //
 // Kernels are compiled once on this thread (simd128 build when WebAssembly.validate accepts a
 // SIMD probe, the baseline build otherwise or when the SIMD module does not compile) and the
@@ -32,7 +50,7 @@
 // repeatedly or cannot be loaded is disabled (its jobs reject with code "kernel-disabled");
 // a pool that cannot keep workers alive halts ("runtime-unavailable"); jobs refused by the
 // memory budget reject with "backpressure". URL switches: ?gaiusKernels=0 (all off),
-// ?gaiusKernelsOff=mesh,light, ?gaiusKernelSimd=0|1, ?gaiusKernelWorkers=<n>,
+// ?gaiusKernelsOff=mesher,light, ?gaiusKernelSimd=0|1, ?gaiusKernelWorkers=<n>,
 // ?gaiusKernelBudgetMB=<n>; the same settings persist under localStorage
 // gaius.kernels.settings.v1 ({enabled, off, simd, workers, budgetMB}).
 (function (global) {
@@ -57,6 +75,9 @@
     instanceEstimateBytes: 16 * 1024 * 1024,
     sharedMemory: "auto",
     simd: "auto",
+    primeKinds: Object.freeze(["load_model_table"]),
+    trimPressure: 0.85,
+    trimIntervalMs: 15000,
   });
 
   // (module (func (result v128) i32.const 0 i8x16.splat i8x16.popcnt))
@@ -302,6 +323,11 @@
       this.byKey = new Map();
       this.slots = [];
       this.ports = new Set();
+      this.portDetach = new Map();   // port -> detach(): cancels that client's keyed jobs
+      this.nextPortId = 0;
+      // promise -> {waiters}: a deduplicated job's result goes to several port listeners; all but
+      // the last get a copy, since a transferred ArrayBuffer cannot be posted again.
+      this.portResultWaiters = new WeakMap();
       this.nextJobId = 1;
       this.nextSlotId = 1;
       this.seq = 0;
@@ -312,10 +338,14 @@
       this.pumpScheduled = false;
       this.respawnTimer = null;
       this.retiredBusyMs = 0;
+      this.externalPressure = 0;
+      this.externalPressureAt = 0;
+      this.lastTrimAt = -Infinity;
+      this.primeKinds = new Set(Array.isArray(options.primeKinds) ? options.primeKinds.map(String) : []);
       this.stats = {
         submitted: 0, completed: 0, failed: 0, cancelled: 0, superseded: 0, deduped: 0, stale: 0,
         dropped: 0, retried: 0, crashes: 0, spawned: 0, respawns: 0, retired: 0, backpressure: 0,
-        loads: 0, unloads: 0, rescores: 0,
+        loads: 0, unloads: 0, rescores: 0, primed: 0, primeErrors: 0, trims: 0,
       };
       this.classStats = [];
       for (let i = 0; i < P.CLASS_COUNT; i++) this.classStats.push({completed: 0, totalMs: 0, maxMs: 0});
@@ -335,7 +365,7 @@
         module: null, compiling: null, variant: null, bytes: null, importsMemory: false,
         disabled: this.switches.off.has(name) ? "disabled-by-switch" : null,
         trapStreak: 0, loadFailures: 0, parked: [], stats: {completed: 0, failed: 0, totalExecMs: 0, maxExecMs: 0},
-        compileMs: 0, compileError: null,
+        compileMs: 0, compileError: null, primer: null,
       };
       const kinds = spec && Array.isArray(spec.kinds) ? spec.kinds : [];
       for (const kind of kinds) {
@@ -485,10 +515,11 @@
       } catch (error) {
         return Promise.reject(error);
       }
+      if (this.primeKinds.has(kind)) this.setPrimer(kernel.name, {kind, payload: buffer, version});
       const P = this.P;
       const job = {
         id: this.nextJobId++, seq: this.seq++, kernel: kernel.name, kind, key, userKey: o.key, version,
-        payload: buffer, bytes: 0, transfer: o.transfer !== false, retry: o.retry !== false,
+        payload: buffer, bytes: 0, queueBytes: 0, transfer: o.transfer !== false, retry: o.retry !== false,
         attempts: 0, state: "new", settled: false, slot: null, entry: null,
         visible: o.visible, background: o.background === true, near: o.near,
         priorityClass: o.priorityClass, priority: o.priority, distance: o.distance,
@@ -496,6 +527,9 @@
         submittedAt: now(), detachSignal: null, promise: null, resolve: null, reject: null,
       };
       job.bytes = buffer.byteLength + (finite(o.resultBytes) ? o.resultBytes : buffer.byteLength);
+      // A queued job holds its payload; the result estimate is only charged while it runs, so a
+      // long P0 queue does not fill the budget with results nobody has allocated yet.
+      job.queueBytes = buffer.byteLength;
       job.cls = P.classify(job, this.predictor);
       if (!this.budget.canQueue(job.bytes, job.cls)) {
         this.stats.backpressure++;
@@ -507,7 +541,7 @@
         job.resolve = resolve;
         job.reject = reject;
       });
-      this.budget.queue(job.bytes);
+      this.budget.queue(job.queueBytes);
       if (key !== null) this.byKey.set(key, job);
       if (o.signal) this.watchSignal(job, o.signal);
       this.stats.submitted++;
@@ -577,7 +611,7 @@
         if (index >= 0) kernel.parked.splice(index, 1);
       }
       // In-flight bytes are released when the worker answers (finish/crash), queued ones now.
-      if (job.state !== "inflight") this.budget.unqueue(job.bytes);
+      if (job.state !== "inflight") this.budget.unqueue(job.queueBytes);
       job.settled = true;
       job.state = job.state === "inflight" ? "inflight-settled" : "done";
       job.payload = null;
@@ -592,6 +626,88 @@
       const kernel = this.kernels.get(job.kernel);
       if (kernel) kernel.stats.failed++;
       this.settle(job, error);
+    }
+
+    // --- primers -----------------------------------------------------------------------------
+
+    // primer: {kind, payload (ArrayBuffer or view, kept as a copy), version?} or null to clear.
+    // An older version never replaces a newer primer.
+    setPrimer(name, primer) {
+      const kernel = this.kernels.get(name);
+      if (!kernel) return false;
+      if (!primer) {
+        kernel.primer = null;
+        this.budget.setInstance("primer:" + name, 0);
+        return true;
+      }
+      const version = finite(primer.version) ? primer.version : 0;
+      if (kernel.primer && version < kernel.primer.version) return false;
+      let bytes;
+      try {
+        bytes = toArrayBuffer(primer.payload).slice(0);
+      } catch (_) {
+        return false;
+      }
+      kernel.primer = {kind: String(primer.kind), payload: bytes, version};
+      this.budget.setInstance("primer:" + name, bytes.byteLength);
+      return true;
+    }
+
+    // Posts the kernel's primer to a worker right behind its load message, so it runs before
+    // any job of that instance. Its result only updates the memory figures.
+    primeSlot(slot, kernel) {
+      const primer = kernel.primer;
+      if (!primer || slot.dead) return false;
+      const id = this.nextJobId++;
+      const payload = primer.payload.slice(0);
+      try {
+        slot.worker.postMessage({type: "job", id, kernel: kernel.name, kind: primer.kind, payload}, [payload]);
+      } catch (_) {
+        this.stats.primeErrors++;
+        return false;
+      }
+      slot.primers.set(id, kernel.name);
+      // The instance holds the primed state before the worker reports its memory.
+      const key = slot.id + ":" + kernel.name;
+      const known = this.budget.instances.get(key) || 0;
+      this.budget.setInstance(key, Math.max(known, this.options.instanceEstimateBytes + payload.byteLength));
+      return true;
+    }
+
+    finishPrimer(slot, message) {
+      const name = slot.primers.get(message.id);
+      slot.primers.delete(message.id);
+      if (message.type === "result") {
+        this.stats.primed++;
+        if (finite(message.memoryBytes)) {
+          const loaded = slot.loaded.get(name);
+          if (loaded) loaded.memoryBytes = message.memoryBytes;
+          this.budget.setInstance(slot.id + ":" + name, message.memoryBytes);
+        }
+      } else if (message.type === "error") {
+        // The instance answers its first job with "table missing" instead; nothing to undo.
+        this.stats.primeErrors++;
+      }
+    }
+
+    // --- memory pressure --------------------------------------------------------------------
+
+    // Asks every worker to trim its instances when the heap is under pressure (rate limited).
+    maybeTrim(t) {
+      if (this.terminated || !this.enabled) return false;
+      if (this.heapPressure() < this.options.trimPressure) return false;
+      if (t - this.lastTrimAt < this.options.trimIntervalMs) return false;
+      this.lastTrimAt = t;
+      let posted = 0;
+      for (const slot of this.slots) {
+        if (slot.dead || slot.loaded.size === 0) continue;
+        try {
+          slot.worker.postMessage({type: "trim"});
+          posted++;
+        } catch (_) { /* gone */ }
+      }
+      if (posted > 0) this.stats.trims++;
+      return posted > 0;
     }
 
     // --- motion and rescoring ---------------------------------------------------------------
@@ -728,7 +844,8 @@
       return b.instanceBytes + b.inflightBytes + this.options.instanceEstimateBytes <= b.limit;
     }
 
-    loadKernel(slot, kernel) {
+    // skipPrimer: the job that triggers the load is itself a primer job.
+    loadKernel(slot, kernel, skipPrimer) {
       const message = {type: "load", kernel: kernel.name};
       const transfer = [];
       if (kernel.importsMemory) {
@@ -749,6 +866,7 @@
           slot.loaded.set(kernel.name, {state: "loading", memoryBytes: 0, lastUsed: now(), memory: message.memory || null});
           this.budget.setInstance(slot.id + ":" + kernel.name, this.options.instanceEstimateBytes);
           this.stats.loads++;
+          if (!skipPrimer) this.primeSlot(slot, kernel);
           return true;
         } catch (error) {
           // Engines that cannot clone a WebAssembly.Module into a Worker get the bytes instead.
@@ -759,7 +877,7 @@
       return false;
     }
 
-    async loadKernelBytes(slot, kernel) {
+    async loadKernelBytes(slot, kernel, skipPrimer) {
       if (!kernel.bytes) {
         const source = kernel.variants[kernel.variant];
         if (source.url) {
@@ -777,18 +895,20 @@
       const bytes = kernel.bytes.slice(0);
       slot.worker.postMessage({type: "load", kernel: kernel.name, bytes}, [bytes]);
       this.stats.loads++;
+      if (!skipPrimer) this.primeSlot(slot, kernel);
     }
 
     dispatch(slot, job) {
       const kernel = this.kernels.get(job.kernel);
       if (!slot.loaded.has(job.kernel)) {
-        if (!this.loadKernel(slot, kernel)) {
+        const skipPrimer = !!kernel.primer && kernel.primer.kind === job.kind;
+        if (!this.loadKernel(slot, kernel, skipPrimer)) {
           // The bytes path may have to fetch first; jobs for this slot wait for the load
           // message so the worker never sees a job before its kernel.
           const loading = {state: "loading", memoryBytes: 0, lastUsed: now(), memory: null, pending: null};
           slot.loaded.set(kernel.name, loading);
           this.budget.setInstance(slot.id + ":" + kernel.name, this.options.instanceEstimateBytes);
-          loading.pending = this.loadKernelBytes(slot, kernel).then(() => {
+          loading.pending = this.loadKernelBytes(slot, kernel, skipPrimer).then(() => {
             loading.pending = null;
           }, (error) => {
             this.crash(slot, new KernelRuntimeError("worker-load-failed", String(error && error.message || error)));
@@ -808,7 +928,7 @@
           && buffer.byteLength <= this.options.retryCopyLimit;
         job.payload = keepCopy ? buffer.slice(0) : null;
       }
-      this.budget.unqueue(job.bytes);
+      this.budget.unqueue(job.queueBytes);
       this.budget.begin(job.bytes);
       if (slot.inflight.size === 0) slot.busySince = now();
       slot.inflight.set(job.id, job);
@@ -863,7 +983,7 @@
     spawn() {
       const slot = {
         id: this.nextSlotId++, worker: null, ready: false, draining: false, dead: false,
-        loaded: new Map(), inflight: new Map(), completed: 0, watchdog: null,
+        loaded: new Map(), inflight: new Map(), primers: new Map(), completed: 0, watchdog: null,
         busySince: NaN, busyMs: 0,
       };
       slot.worker = new global.Worker(this.workerUrl, {name: `${this.name}-${slot.id}`});
@@ -908,18 +1028,35 @@
           }
           return;
         }
-        case "unloaded":
-          slot.loaded.delete(message.kernel);
-          this.budget.setInstance(slot.id + ":" + message.kernel, 0);
+        case "unloaded": {
+          const current = slot.loaded.get(message.kernel);
+          const kernel = this.kernels.get(message.kernel);
+          // An idle unload already dropped its entry; an entry still loading here is a newer
+          // load sent after that unload (the worker answers them in order), so it stays. A
+          // disabled kernel drops everything.
+          if (current && (current.state !== "loading" || (kernel && kernel.disabled))) {
+            slot.loaded.delete(message.kernel);
+            this.budget.setInstance(slot.id + ":" + message.kernel, 0);
+          }
           this.schedulePump();
           return;
+        }
+        case "trimmed": {
+          const loaded = slot.loaded.get(message.kernel);
+          if (loaded && finite(message.memoryBytes)) {
+            loaded.memoryBytes = message.memoryBytes;
+            this.budget.setInstance(slot.id + ":" + message.kernel, message.memoryBytes);
+          }
+          return;
+        }
         case "init-error":
           this.crash(slot, new KernelRuntimeError("worker-init-failed", `kernel worker ${slot.id}: ${message.message}`));
           return;
         case "result":
         case "error":
         case "cancelled":
-          this.finish(slot, message);
+          if (slot.primers.has(message.id)) this.finishPrimer(slot, message);
+          else this.finish(slot, message);
           return;
         default:
           return;
@@ -970,7 +1107,7 @@
           this.stats.retried++;
           job.slot = null;
           job.state = "new";
-          this.budget.queue(job.bytes);
+          this.budget.queue(job.queueBytes);
           this.enqueue(job);
         } else {
           if (code === "kernel-trap" && kernel && ++kernel.trapStreak >= this.options.maxKernelFailures) {
@@ -1002,7 +1139,7 @@
         if (job.retry && job.attempts < this.options.maxAttempts && job.payload) {
           this.stats.retried++;
           job.state = "new";
-          this.budget.queue(job.bytes);
+          this.budget.queue(job.queueBytes);
           this.enqueue(job);
         } else {
           this.fail(job, new KernelRuntimeError(error.code, `${error.message} (${job.kind}, attempt ${job.attempts})`,
@@ -1122,10 +1259,12 @@
       return value;
     }
 
-    // Heap pressure reported by the page (e.g. the Java side seeing allocation failures).
+    // Heap pressure reported by the page (e.g. the Java side seeing allocation failures); it
+    // counts for 10 s. A level at the trim threshold trims the workers right away.
     reportPressure(level) {
       this.externalPressure = Math.max(0, Math.min(1, Number(level) || 0));
       this.externalPressureAt = now();
+      if (this.externalPressure >= this.options.trimPressure) this.maybeTrim(this.externalPressureAt);
     }
 
     heapPressure() {
@@ -1153,17 +1292,18 @@
       const before = this.sizer.size;
       const decision = this.sizer.sample({
         now: t, completed: this.stats.completed, busyMs: this.totalBusyMs(), queuedHigh, queued: this.queued,
-        heapPressure: this.heapPressure(), budgetPressure: this.budget.pressure(),
+        heapPressure: this.heapPressure(), budgetPressure: this.budget.residentPressure(),
       });
       this.lastSizing = decision;
       if (this.sizer.size !== before) this.reconcile(false);
       this.unloadIdleInstances(t);
+      this.maybeTrim(t);
       // Aging and motion both move scores; refresh them at most once per interval.
       if (this.queued > 0 && t - this.lastRescoreAt >= this.options.rescoreIntervalMs) this.rescore();
     }
 
     unloadIdleInstances(t) {
-      const tight = this.budget.pressure() > 0.75;
+      const tight = this.budget.residentPressure() > 0.75;
       const idleLimit = tight ? 5000 : this.options.idleUnloadMs;
       for (const slot of this.slots) {
         if (slot.dead) continue;
@@ -1222,6 +1362,7 @@
         } catch (_) { /* closed */ }
       }
       this.ports.clear();
+      this.portDetach.clear();
       if (this.ownsWorkerUrl) global.URL.revokeObjectURL(this.workerUrl);
     }
 
@@ -1245,38 +1386,86 @@
     }
 
     // Serves GaiusKernelRuntime.connect(port) clients (the integrated server Worker): their jobs
-    // join the same queue and budget; results go back over the port as transferables.
+    // join the same queue and budget; results go back over the port as transferables. Job keys
+    // are scoped to the port, so a new server Worker (whose job ids and versions restart) never
+    // shares or supersedes a job of an old one.
     attachPort(port) {
+      if (this.portDetach.has(port)) return;
+      const prefix = "p" + (++this.nextPortId) + ":";
+      const keys = new Map();   // scoped key -> submits not yet answered
+      const release = (key) => {
+        if (key === null) return;
+        const left = (keys.get(key) || 1) - 1;
+        if (left > 0) keys.set(key, left);
+        else keys.delete(key);
+      };
       this.ports.add(port);
+      const post = (message, transfer) => {
+        try {
+          port.postMessage(message, transfer || []);
+          return true;
+        } catch (_) {
+          return false;   // the client went away
+        }
+      };
       port.onmessage = (event) => {
         const message = event.data;
-        if (!message || this.terminated) return;
+        if (!message || this.terminated || !this.portDetach.has(port)) return;
         if (message.type === "submit") {
           const opts = Object.assign({}, message.opts || {}, {kernel: message.kernel});
-          this.submit(message.kind, message.payload, opts).then((result) => {
-            try {
-              port.postMessage({type: "result", id: message.id, result}, isArrayBuffer(result) ? [result] : []);
-            } catch (_) { /* the client went away */ }
+          const key = opts.key == null ? null : prefix + String(opts.key);
+          if (key !== null) {
+            opts.key = key;
+            keys.set(key, (keys.get(key) || 0) + 1);
+          }
+          const promise = this.submit(message.kind, message.payload, opts);
+          const share = this.portResultWaiters.get(promise) || {waiters: 0};
+          share.waiters++;
+          this.portResultWaiters.set(promise, share);
+          promise.then((result) => {
+            const last = --share.waiters === 0;
+            release(key);
+            const value = isArrayBuffer(result) && !last ? result.slice(0) : result;
+            if (!post({type: "result", id: message.id, result: value}, isArrayBuffer(value) ? [value] : [])) {
+              // Answer anyway, so the client fails over now instead of at its own timeout.
+              post({type: "error", id: message.id, code: "cancelled", message: "kernel result could not be posted"});
+            }
           }, (error) => {
-            try {
-              port.postMessage({type: "error", id: message.id, code: error && error.code || "kernel-error",
-                message: String(error && error.message || error)});
-            } catch (_) { /* the client went away */ }
+            share.waiters--;
+            release(key);
+            post({type: "error", id: message.id, code: error && error.code || "kernel-error",
+              message: String(error && error.message || error)});
           });
         } else if (message.type === "cancel") {
-          this.cancel(message.key, message.kernel);
+          this.cancel(prefix + String(message.key), message.kernel);
         } else if (message.type === "viewer") {
           this.setViewer(message.viewer);
         } else if (message.type === "pressure") {
           this.reportPressure(message.level);
         } else if (message.type === "status") {
-          port.postMessage({type: "status", status: this.status()});
+          post({type: "status", status: this.status()});
         } else if (message.type === "close") {
-          this.ports.delete(port);
+          this.detachPort(port);
         }
       };
+      this.portDetach.set(port, () => {
+        this.ports.delete(port);
+        // The client is gone: its keyed jobs would only occupy workers.
+        for (const key of Array.from(keys.keys())) this.cancel(key);
+        keys.clear();
+      });
       if (typeof port.start === "function") port.start();
-      port.postMessage({type: "status", status: this.status()});
+      post({type: "status", status: this.status()});
+    }
+
+    // Stops serving a port (its client closed, or a new server Worker replaced it) and cancels
+    // that client's queued and running keyed jobs.
+    detachPort(port) {
+      const detach = this.portDetach.get(port);
+      if (!detach) return false;
+      this.portDetach.delete(port);
+      detach();
+      return true;
     }
 
     // A pool-shaped view of one kernel, for code written against GaiusKernelPool.
@@ -1285,6 +1474,9 @@
       return {
         submit(kind, payload, opts) {
           return runtime.submit(kind, payload, Object.assign({}, opts || {}, {kernel: kernelName}));
+        },
+        setPrimer(primer) {
+          return runtime.setPrimer(kernelName, primer);
         },
         cancel(key) {
           return runtime.cancel(key, kernelName);
@@ -1306,6 +1498,7 @@
         kernels[name] = {
           variant: kernel.variant, disabled: kernel.disabled, compileMs: kernel.compileMs,
           compileError: kernel.compileError, parked: kernel.parked.length,
+          primer: kernel.primer ? {kind: kernel.primer.kind, bytes: kernel.primer.payload.byteLength} : null,
           completed: kernel.stats.completed, failed: kernel.stats.failed,
           meanExecMs: kernel.stats.completed ? kernel.stats.totalExecMs / kernel.stats.completed : 0,
           maxExecMs: kernel.stats.maxExecMs,
@@ -1328,6 +1521,7 @@
         inFlight,
         halted: this.halted ? this.halted.message : null,
         terminated: this.terminated,
+        heapPressure: this.heapPressure(),
         ports: this.ports.size,
         workers: this.slots.map((slot) => ({
           id: slot.id, draining: slot.draining, inFlight: slot.inflight.size, completed: slot.completed,

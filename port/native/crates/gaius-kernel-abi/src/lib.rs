@@ -43,10 +43,26 @@ pub const BUFFER_ALIGN: usize = 8;
 pub mod kind {
     /// `run_noise_points`: world-generation noise at explicit positions.
     pub const NOISE_POINTS: u16 = 0x0101;
-    /// Reserved: chunk section meshing.
+    /// Chunk section meshing.
     pub const MESH_FAMILY: u16 = 0x0200;
-    /// Reserved: light propagation.
+    /// `run_load_model_table`: replaces the mesher's resident model table.
+    pub const LOAD_MODEL_TABLE: u16 = MESH_FAMILY | 0x01;
+    /// `run_mesh_section`: meshes one chunk section.
+    pub const MESH_SECTION: u16 = MESH_FAMILY | 0x02;
+    /// Light propagation.
     pub const LIGHT_FAMILY: u16 = 0x0300;
+    /// `run_light_column`: first light / checkBlock of one chunk column.
+    pub const LIGHT_COLUMN: u16 = LIGHT_FAMILY | 0x01;
+    /// Chunk generation.
+    pub const WORLDGEN_FAMILY: u16 = 0x0400;
+    /// `run_load_generator`: installs a generator description.
+    pub const LOAD_GENERATOR: u16 = WORLDGEN_FAMILY | 0x01;
+    /// `run_biomes`: biome sampling of one chunk.
+    pub const BIOMES: u16 = WORLDGEN_FAMILY | 0x02;
+    /// `run_terrain`: noise terrain fill of one chunk.
+    pub const TERRAIN: u16 = WORLDGEN_FAMILY | 0x03;
+    /// `run_surface`: surface rules over a filled chunk.
+    pub const SURFACE: u16 = WORLDGEN_FAMILY | 0x04;
 }
 
 /// Run status, stored in [`RunDescriptor`] and [`ResultHeader`].

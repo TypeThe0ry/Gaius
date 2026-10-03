@@ -623,11 +623,39 @@ try {
   // the JVM reject the package before main() runs, so execute against a
   // job-local unsigned copy while retaining the signed jar for javap checks.
   const compileClasspath = [unsignedOverlayJar, minecraftClasspath].join(path.delimiter);
+  // 26.3's StrictMath263 rewrite makes Mth (sqrt and friends) call dev.gaius.browser
+  // BrowserStrictMath, which lives in port/src. Compile its JVM twin next to the harness: the
+  // two JSBody natives (Math.fround) become float casts, which round the same way on the JVM.
+  const strictMathSource = await readFile(
+    path.join(repositoryRoot, "port/src/main/java/dev/gaius/browser/BrowserStrictMath.java"), "utf8");
+  const strictMathTwin = strictMathSource
+    .replace(/^import org\.teavm\.jso\.JSBody;\r?\n/m, "")
+    .replace(/@JSBody\(.*\)\r?\n\s*public static native float (\w+)\((\w+) value\);/g,
+      "public static float $1($2 value) {\n        return (float) value;\n    }");
+  assert.ok(!/\bnative\b/.test(strictMathTwin.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "")),
+    "BrowserStrictMath gained a native the JVM twin does not cover");
+  const strictMathFile = path.join(temporaryRoot, "src/dev/gaius/browser/BrowserStrictMath.java");
+  await mkdir(path.dirname(strictMathFile), {recursive: true});
+  await writeFile(strictMathFile, strictMathTwin, "utf8");
+  // The mesh kernel patches make RenderSection and SectionCompiler implement the interfaces of
+  // dev.gaius.browser.kernel.mesh.MeshKernelAccess (port/src, per profile); compile them from
+  // the profile's sources (javac pulls in what they reference through -sourcepath).
+  const sourceRoots = [
+    path.join(repositoryRoot, `port/src/versions/${version}/java`),
+    path.join(repositoryRoot, "port/src/main/java"),
+  ];
+  const portSources = ["dev/gaius/browser/kernel/mesh/MeshKernelAccess.java"]
+    .map((relative) => sourceRoots.map((sourceRoot) => path.join(sourceRoot, relative)).find((file) => existsSync(file)))
+    .filter(Boolean);
   run(javaTools.javac, [
     "-proc:none",
+    "-implicit:class",
     "-classpath", compileClasspath,
+    "-sourcepath", sourceRoots.join(path.delimiter),
     "-d", classesDirectory,
     sourceFile,
+    strictMathFile,
+    ...portSources,
   ], {stdio: ["ignore", "pipe", "pipe"]});
   const output = run(javaTools.java, [
     "--sun-misc-unsafe-memory-access=allow",

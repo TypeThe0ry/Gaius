@@ -23,6 +23,7 @@ import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.chunk.GaiusKernelSections;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
@@ -48,11 +49,14 @@ import net.minecraft.world.level.levelgen.structure.pools.StructureTemplatePool;
  *
  * <p>The kernel takes the noise fill, aquifers and material (surface and ore vein) rules of
  * {@code buildTerrain}; the result is installed and the carvers run on the vanilla background
- * executor, like the rest of vanilla's {@code buildTerrain}. Blended, upgrading and
- * below-zero-retrogen chunks, generators the exporter does not model and any kernel failure stay
- * on (or fall back to) the vanilla path. A transient refusal (memory budget, cancelled job) only
- * sends that chunk to the vanilla path; anything else also stops using the kernel for the
- * generator.
+ * executor, like the rest of vanilla's {@code buildTerrain}. The surface rules read the biomes the
+ * neighbouring chunks store (sent with the job, see {@link #ringBiomes}) like vanilla's
+ * {@code BiomeManager} does. Blended, upgrading and below-zero-retrogen chunks, generators the
+ * exporter does not model and any kernel failure stay on (or fall back to) the vanilla path; a
+ * result is built off the chunk first, so one that cannot be installed leaves the chunk untouched
+ * for vanilla. A transient refusal (memory budget, cancelled job, a neighbour biome the kernel does
+ * not know) only sends that chunk to the vanilla path; anything else also stops using the kernel
+ * for the generator.
  */
 public final class WorldgenKernel263 {
     private static final Map<RandomState, Slot> SLOTS = new IdentityHashMap<>();
@@ -64,6 +68,7 @@ public final class WorldgenKernel263 {
     private static final class Slot {
         int key;
         boolean failed;
+        IdMap<Holder<Biome>> biomeIds;
     }
 
     /** The kernel generator slot of a RandomState, exporting it on first use. */
@@ -78,6 +83,7 @@ public final class WorldgenKernel263 {
             try {
                 net.minecraft.core.Registry<Biome> biomeRegistry =
                         structures.registryAccess().lookupOrThrow(Registries.BIOME);
+                slot.biomeIds = biomeRegistry.asHolderIdMap();
                 byte[] ir = WorldgenExport263.export(generator, randomState, structures.registryAccess(),
                         biomeRegistry::getId, chunk.getHeightAccessorForGeneration());
                 slot.key = BrowserWorldgenKernel.allocateKey();
@@ -134,7 +140,9 @@ public final class WorldgenKernel263 {
                 .gaius$buildTerrainVanilla(chunk, blender, randomState, structureManager, biomeManager,
                         carverBiomeRegion, possibleBiomes);
         try {
+            int[] ring = ringBiomes(biomeManager, slot.biomeIds, chunk);
             BrowserWorldgenKernel.submitTerrain(slot.key, pos.x(), pos.z(), BrowserWorldgenKernel.FLAG_SURFACE, beard,
+                    ring,
                     // The result object holds fresh typed arrays (worldgen-kernel.js flatten), so it can
                     // be read later on a Java thread instead of inside the JS callback.
                     result -> BrowserWorldgenKernel.runOnJavaThread(() -> guarded(future, vanilla, () -> {
@@ -148,11 +156,21 @@ public final class WorldgenKernel263 {
                             return;
                         }
                         forward(future, () -> CompletableFuture.supplyAsync(() -> {
-                            data.install(chunk);
+                            LevelChunkSection[] built;
+                            try {
+                                built = data.buildSections(chunk);
+                            } catch (RuntimeException e) {
+                                // Nothing of the chunk changed yet: vanilla builds it from scratch.
+                                slot.failed = true;
+                                BrowserWorldgenKernel.disable("terrain result install failed: " + e);
+                                return null;
+                            }
+                            data.commit(chunk, built);
                             carve(generator, chunk, blender, randomState, structureManager, biomeManager,
                                     carverBiomeRegion);
                             return chunk;
-                        }, Util.backgroundExecutor().forName("buildTerrain")));
+                        }, Util.backgroundExecutor().forName("buildTerrain"))
+                                .thenCompose(c -> c != null ? CompletableFuture.completedFuture(c) : vanilla.get()));
                     })),
                     message -> BrowserWorldgenKernel.runOnJavaThread(() -> guarded(future, vanilla, () -> {
                         failed(slot, "terrain", message);
@@ -231,7 +249,7 @@ public final class WorldgenKernel263 {
         if (slot == null) {
             return null;
         }
-        IdMap<Holder<Biome>> biomes = structureManager.registryAccess().lookupOrThrow(Registries.BIOME).asHolderIdMap();
+        IdMap<Holder<Biome>> biomes = slot.biomeIds;
         CompletableFuture<ChunkAccess> future = new CompletableFuture<>();
         ChunkPos pos = chunk.getPos();
         Supplier<CompletableFuture<ChunkAccess>> vanilla = () -> ((ChunkGeneratorKernelHooks263) (Object) generator)
@@ -267,6 +285,44 @@ public final class WorldgenKernel263 {
             return null;
         }
         return future;
+    }
+
+    /** Quart columns around a chunk outside its own 4 x 4. */
+    private static final int RING_COLUMNS = 20;
+
+    /**
+     * The biomes the neighbouring chunks store around {@code chunk}, as the kernel's ring:
+     * for each quart column of the 6 x 6 grid outside the chunk's own 4 x 4 (x outer, z inner,
+     * starting one quart before the chunk), every quart y from the bottom of the level, as biome
+     * registry ids ({@code -1} for a biome without one; the kernel then refuses the chunk). Read
+     * through {@code biomeManager} (the region's), like vanilla's surface rules.
+     */
+    static int[] ringBiomes(BiomeManager biomeManager, IdMap<Holder<Biome>> biomeIds, ChunkAccess chunk) {
+        ChunkPos pos = chunk.getPos();
+        int minQx = (pos.x() << 2) - 1;
+        int minQz = (pos.z() << 2) - 1;
+        int minQy = QuartPos.fromBlock(chunk.getMinY());
+        int quartsY = chunk.getSectionsCount() * 4;
+        int[] ring = new int[RING_COLUMNS * quartsY];
+        Holder<Biome> last = null;
+        int lastId = -1;
+        int k = 0;
+        for (int x = 0; x < 6; x++) {
+            for (int z = 0; z < 6; z++) {
+                if (x >= 1 && x <= 4 && z >= 1 && z <= 4) {
+                    continue;
+                }
+                for (int y = 0; y < quartsY; y++) {
+                    Holder<Biome> holder = biomeManager.getNoiseBiomeAtQuart(minQx + x, minQy + y, minQz + z);
+                    if (holder != last) {
+                        last = holder;
+                        lastId = biomeIds.getId(holder);
+                    }
+                    ring[k++] = lastId;
+                }
+            }
+        }
+        return ring;
     }
 
     @SuppressWarnings("unchecked")
@@ -445,11 +501,14 @@ public final class WorldgenKernel263 {
         }
 
         /**
-         * Sections (bulk: {@code GaiusKernelSections} builds each block state container in one
-         * step, like a loaded section; block by block like {@code doFill} only for a palette the
-         * bulk path refuses), then heightmaps and post-processing marks.
+         * Every section the result changes, built off the chunk (bulk: {@code GaiusKernelSections}
+         * builds each block state container in one step, like a loaded section; block by block
+         * like {@code doFill}, on a copy of the old section, only for a palette the bulk path
+         * refuses); {@code null} entries keep the old section. Throws without touching the chunk,
+         * so a result that cannot be installed leaves it to vanilla.
          */
-        void install(ChunkAccess chunk) {
+        LevelChunkSection[] buildSections(ChunkAccess chunk) {
+            LevelChunkSection[] built = new LevelChunkSection[sectionCount];
             for (int s = 0; s < sectionCount; s++) {
                 int base = paletteOffsets[s];
                 int size = paletteOffsets[s + 1] - base;
@@ -457,10 +516,14 @@ public final class WorldgenKernel263 {
                 if (isUniform && palette[base].isAir()) {
                     continue;
                 }
-                if (GaiusKernelSections.install(chunk, s, palette, base, size, indices, s * 4096, isUniform)) {
+                LevelChunkSection old = chunk.getSection(s);
+                PalettedContainer<BlockState> states =
+                        GaiusKernelSections.container(palette, base, size, indices, s * 4096, isUniform);
+                if (states != null) {
+                    built[s] = new LevelChunkSection(states, old.getBiomes());
                     continue;
                 }
-                LevelChunkSection section = chunk.getSection(s);
+                LevelChunkSection section = old.copy();
                 if (isUniform) {
                     BlockState state = palette[base];
                     for (int y = 0; y < 16; y++) {
@@ -478,6 +541,21 @@ public final class WorldgenKernel263 {
                             section.setBlockState(i & 15, i >>> 8, (i >>> 4) & 15, state, false);
                         }
                     }
+                }
+                built[s] = section;
+            }
+            return built;
+        }
+
+        /**
+         * Installs {@link #buildSections}'s sections (plain assignments), then the heightmaps and
+         * post-processing marks (vanilla bounds-checks both).
+         */
+        void commit(ChunkAccess chunk, LevelChunkSection[] built) {
+            LevelChunkSection[] sections = chunk.getSections();
+            for (int s = 0; s < sectionCount; s++) {
+                if (built[s] != null) {
+                    sections[s] = built[s];
                 }
             }
             ChunkPos pos = chunk.getPos();

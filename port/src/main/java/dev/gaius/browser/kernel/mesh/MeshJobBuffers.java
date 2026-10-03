@@ -19,6 +19,8 @@ public final class MeshJobBuffers {
     public static final int GRASS_MODIFIER_NONE = 0;
     public static final int GRASS_MODIFIER_DARK_FOREST = 1;
     public static final int GRASS_MODIFIER_SWAMP = 2;
+    /** Swamp mask columns per axis: the section plus the two columns a blend radius reaches. */
+    public static final int SWAMP_SPAN = 20;
 
     public final int[] header = new int[MeshKernelBridge.HEADER_LENGTH];
     public final short[] ids16 = new short[VOLUME];
@@ -26,7 +28,8 @@ public final class MeshJobBuffers {
     public final byte[] light = new byte[VOLUME];
     public final byte[] quarts = new byte[QUART_VOLUME];
     public final int[] palette = new int[MAX_BIOMES * PALETTE_INTS];
-    public final byte[] swamp = new byte[32];
+    /** Bit (z + 2) * 20 + (x + 2) for the columns x, z in -2..17 (the BIOME_BLEND layout). */
+    public final byte[] swamp = new byte[SWAMP_SPAN * SWAMP_SPAN / 8];
     /** cardinal down, up, north, south, west, east, then camera x, y, z (section relative). */
     public final float[] floats = new float[9];
     /** Biome holders of the palette, compared by identity. */
@@ -96,9 +99,12 @@ public final class MeshJobBuffers {
         return slot;
     }
 
-    /** Marks column (x, z) of the section as the swamp modifier's "below -0.1" color. */
+    /**
+     * Marks section-relative column (x, z), each in -2..17, as the swamp modifier's "below -0.1"
+     * color.
+     */
     public void setSwamp(int x, int z) {
-        int bit = (z << 4) | x;
+        int bit = (z + MARGIN) * SWAMP_SPAN + (x + MARGIN);
         swamp[bit >> 3] |= (byte) (1 << (bit & 7));
     }
 

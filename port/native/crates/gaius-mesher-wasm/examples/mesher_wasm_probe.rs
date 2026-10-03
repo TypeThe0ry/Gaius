@@ -3,7 +3,7 @@
 //! `wasm-check.mjs` can prove the simd128 and the baseline modules mesh byte
 //! for byte like the native build.
 //!
-//! Usage: `cargo run -p gaius-mesher-wasm --example wasm_probe -- <out-dir>`
+//! Usage: `cargo run -p gaius-mesher-wasm --example mesher_wasm_probe -- <out-dir>`
 
 use gaius_kernel_abi::{release_descriptor, run_kernel, JobHeader, RunDescriptor};
 use gaius_mesher::job::flags;

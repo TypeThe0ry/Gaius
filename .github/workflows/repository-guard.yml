@@ -77,6 +77,9 @@ jobs:
           foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate', 'GAIUS_PAGES_EXPECTED_SHA256', 'GAIUS_PAGES_EXPECTED_SHA256_12111', 'GAIUS_PAGES_EXPECTED_SHA256_262', 'GAIUS_PAGES_EXPECTED_SHA256_263')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP gate missing: $required" }
           }
+          foreach ($required in @('checkSite', 'isSiteRedirect', 'readTarEntries', 'GAIUS_PAGES_SITE_ARCHIVES', 'GAIUS_PAGES_EXPECTED_SITE_SHA256_12111', 'GAIUS_PAGES_EXPECTED_SITE_SHA256_262', 'GAIUS_PAGES_EXPECTED_SITE_SHA256_263', 'window.__gaiusSite = ', 'script[data-gaius-site]')) {
+            if (-not $pages.Contains($required)) { throw "Pages site-layout gate missing: $required" }
+          }
           foreach ($required in @(
             'GAIUS_TARGET_12111',
             'GAIUS_TARGET_262',
@@ -109,6 +112,9 @@ jobs:
           foreach ($required in @('run-name:', 'release_token:', 'required: true', "--pattern 'Gaius-1.21.11.html'", "--pattern 'Gaius-26.2.html'", "--pattern 'Gaius-26.3.html'", 'test -f pages-publish/Gaius-1.21.11.html')) {
             if (-not $pagesWorkflow.Contains($required)) { throw "Pages workflow release token gate missing: $required" }
           }
+          foreach ($required in @("--pattern 'Gaius-site-1.21.11.tar.gz'", "--pattern 'Gaius-site-26.2.tar.gz'", "--pattern 'Gaius-site-26.3.tar.gz'", 'sha256sum --check --strict "$sums_dir/Gaius-site-26.3.tar.gz.sha256"', '--no-same-owner --no-same-permissions')) {
+            if (-not $pagesWorkflow.Contains($required)) { throw "Pages workflow site-layout gate missing: $required" }
+          }
 
       - name: Validate launcher version and artifact identity
         run: |
@@ -117,6 +123,64 @@ jobs:
           python3 port/scripts/test-postprocess-index-shell.py
           python3 port/scripts/test-portable-artifact-identity.py
           python3 port/scripts/test-vanilla-resource-order.py
+          python3 port/scripts/test-build-portable-html.py
+          python3 port/scripts/test-build-pages-site.py
+          python3 port/scripts/test-stage-web-runtime.py
+
+      - name: Validate the boot loader, Service Worker and kernel runtime
+        run: |
+          set -euo pipefail
+          for script in port/web/boot/gaius-boot.js port/web/sw/gaius-sw.js port/web/kernels/*.js \
+              port/web/runtime/quality/*.js port/web/singleplayer/server-worker-bootstrap.js; do
+            node --check "$script"
+          done
+          node port/scripts/gaius-boot-smoke.mjs
+          node port/scripts/launcher-quality-smoke.mjs
+          node port/scripts/service-worker-headers-smoke.mjs
+          node port/scripts/kernel-scheduler-policy-smoke.mjs
+          node port/scripts/kernel-runtime-smoke.mjs
+
+  native-kernels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Rust with the wasm32 target
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Rust unit, framing and golden parity tests
+        working-directory: port/native
+        run: cargo test --workspace --locked
+
+      - name: Wasm kernels in both builds, checked against the native code
+        working-directory: port/native
+        run: |
+          set -euo pipefail
+          ./build-wasm.sh --check
+          ./build-light-wasm.sh --check
+          ./build-worldgen-wasm.sh --check
+          cargo run --locked -p gaius-worldgen-wasm --example example_ir -- target/wasm-worldgen
+          ./build-wasm-variants.sh --out target/kernels
+          test -s target/kernels/kernels.json
+
+      - name: Worldgen kernel pool and facade smokes
+        run: |
+          set -euo pipefail
+          node port/scripts/worldgen-kernel-pool-smoke.mjs
+          node port/scripts/worldgen-kernel-facade-smoke.mjs
 
   bridge-smoke:
     runs-on: ubuntu-latest

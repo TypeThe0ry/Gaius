@@ -35,8 +35,9 @@ import net.minecraft.world.phys.Vec3;
  *       once per section, the center section is bulk-unpacked);</li>
  *   <li>light: the 18^3 box from the light engine's data layers, one layer lookup per section;
  *       a missing sky layer resolves per column through the sky listener, as vanilla does;</li>
- *   <li>biomes: the 6^3 quarts BiomeManager's zoom can reach, as palette indices, plus the
- *       swamp grass noise per column;</li>
+ *   <li>biomes: the 6^3 quarts BiomeManager's zoom can reach, as palette indices (they cover
+ *       the blocks two columns past the section, which a biome blend radius of 2 samples),
+ *       plus the swamp grass noise per column the blend reaches;</li>
  *   <li>block entities of the section in vanilla order (x, then y, then z).</li>
  * </ul>
  * Nothing is allocated per block; the only allocations are the block entity list and the light
@@ -58,7 +59,7 @@ final class SectionSnapshot {
      * expressed (debug world, unexpected layout), so the caller keeps the vanilla compiler.
      */
     static boolean capture(MeshJobBuffers b, RenderSectionRegion region, long node, MeshModelTable table,
-            Vec3 camera, List<BlockEntity> blockEntities) {
+            Vec3 camera, List<BlockEntity> blockEntities, int blend) {
         MeshKernelAccess.Region access = (MeshKernelAccess.Region) (Object) region;
         SectionCopy[] copies = access.gaius$sections();
         ClientLevel level = access.gaius$level();
@@ -77,7 +78,7 @@ final class SectionSnapshot {
             return false;
         }
         captureLight(b, level.getLightEngine(), sx, sy, sz);
-        if (!captureBiomes(b, level, sx, sy, sz)) {
+        if (!captureBiomes(b, level, sx, sy, sz, blend)) {
             return false;
         }
         CardinalLighting cardinal = region.cardinalLighting();
@@ -245,7 +246,8 @@ final class SectionSnapshot {
 
     // --- biomes ---------------------------------------------------------------------------------
 
-    private static boolean captureBiomes(MeshJobBuffers b, ClientLevel level, int sx, int sy, int sz) {
+    private static boolean captureBiomes(MeshJobBuffers b, ClientLevel level, int sx, int sy, int sz,
+            int blend) {
         BiomeManager manager = level.getBiomeManager();
         long seed = ((MeshBiomeAccess) (Object) manager).gaius$biomeZoomSeed();
         b.header[MeshKernelBridge.H_SEED_HI] = (int) (seed >>> 32);
@@ -281,8 +283,8 @@ final class SectionSnapshot {
         if (swamp != null) {
             int baseX = sx << 4;
             int baseZ = sz << 4;
-            for (int z = 0; z < 16; z++) {
-                for (int x = 0; x < 16; x++) {
+            for (int z = -blend; z < 16 + blend; z++) {
+                for (int x = -blend; x < 16 + blend; x++) {
                     if ((swamp.getGrassColor(baseX + x, baseZ + z) & 0xFFFFFF) == SWAMP_BELOW_COLOR) {
                         b.setSwamp(x, z);
                     }

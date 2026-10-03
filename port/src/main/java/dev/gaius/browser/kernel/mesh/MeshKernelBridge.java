@@ -1,5 +1,7 @@
 package dev.gaius.browser.kernel.mesh;
 
+import dev.gaius.browser.BrowserRenderScheduler;
+import dev.gaius.browser.render.BrowserMeshInstallQueue;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSByRef;
 import org.teavm.jso.JSFunctor;
@@ -20,9 +22,11 @@ import org.teavm.platform.Platform;
  *
  * <p>Results are pulled, never pushed into Java from a JS callback: the facade wakes Java once
  * when a result lands in an empty queue, and the wake starts a TeaVM thread that runs the
- * registered {@link #setDrainer drainer}. {@link #pumpResults()} runs the drainer directly from
- * a Java frame (BrowserRenderScheduler.beginFrame) so results reach the install queue in the
- * same frame.</p>
+ * registered {@link #setDrainer drainer} and then installs within the frame's remaining
+ * install budget (BrowserRenderScheduler.installReadyMeshes), so a result that lands while
+ * the compile pipeline is idle is installed without waiting for an unrelated frame.
+ * {@link #pumpResults()} also runs from every frame (BrowserRenderScheduler.beginFrame), which
+ * is where the drainer times out jobs the kernel never answered.</p>
  */
 public final class MeshKernelBridge {
     /** Header ints of a submitted job (mirrors HEADER in mesh-kernel-job.js). */
@@ -39,7 +43,12 @@ public final class MeshKernelBridge {
     public static final int H_REQUEST_SEQ = 10;
     public static final int H_NON_AIR = 11;
     public static final int H_DISTANCE = 12;
-    public static final int HEADER_LENGTH = 13;
+    /** Options.biomeBlendRadius, 0..{@value #MAX_BIOME_BLEND}. */
+    public static final int H_BLEND = 13;
+    public static final int HEADER_LENGTH = 14;
+
+    /** Largest biome blend radius the kernel reproduces; a larger one keeps the vanilla compiler. */
+    public static final int MAX_BIOME_BLEND = 2;
 
     public static final int FLAG_AO = 1;
     public static final int FLAG_CUTOUT_LEAVES = 2;
@@ -67,6 +76,7 @@ public final class MeshKernelBridge {
     private static long meshed;
     private static long vanillaFallbacks;
     private static long failures;
+    private static long blendSkips;
     private static long snapshotNanos;
     private static long installNanos;
     private static int sinceLastPublish;
@@ -100,6 +110,11 @@ public final class MeshKernelBridge {
             installWake(MeshKernelBridge::onWake);
         }
         return ready;
+    }
+
+    /** True once {@link #disable} turned the kernel off for this page (repeated failures). */
+    public static boolean disabled() {
+        return disabled;
     }
 
     /** Disables the kernel for this page; sections use the vanilla compiler from now on. */
@@ -137,6 +152,12 @@ public final class MeshKernelBridge {
         maybePublish();
     }
 
+    /** A section kept the vanilla compiler because the biome blend radius is out of range. */
+    public static void noteBlendSkip() {
+        blendSkips++;
+        maybePublish();
+    }
+
     public static void noteSnapshotNanos(long nanos) {
         snapshotNanos += nanos;
     }
@@ -145,9 +166,26 @@ public final class MeshKernelBridge {
         installNanos += nanos;
     }
 
-    /** Registers the version-specific result drainer (MeshKernelHooks.drainResults). */
+    /**
+     * Registers the version-specific result drainer (MeshKernelHooks.drainResults) and hooks
+     * {@link #pumpResults()} into every frame of BrowserRenderScheduler.
+     */
     public static void setDrainer(Runnable runnable) {
         drainer = runnable;
+        BrowserRenderScheduler.setMeshResultPump(runnable == null ? null : MeshKernelBridge::pumpResults);
+        BrowserMeshInstallQueue.setEpochBumpHook(runnable == null ? null : MeshKernelBridge::cancelAll);
+    }
+
+    /**
+     * Cancels every section job still out (level reset or left, resources reloaded). Each one
+     * still comes back as a "cancelled" record, so the drainer settles its bookkeeping.
+     */
+    public static void cancelAll() {
+        try {
+            facadeCancelAll();
+        } catch (RuntimeException ignored) {
+            // The facade is gone; the answer timeout covers the jobs.
+        }
     }
 
     /** Moves finished kernel results into the install queue; cheap when nothing finished. */
@@ -165,7 +203,13 @@ public final class MeshKernelBridge {
     }
 
     private static void onWake() {
-        Platform.startThread(MeshKernelBridge::pumpResults);
+        Platform.startThread(MeshKernelBridge::deliverResults);
+    }
+
+    /** Wake path: results into the install queue, then install what this frame's budget allows. */
+    private static void deliverResults() {
+        pumpResults();
+        BrowserRenderScheduler.installReadyMeshes();
     }
 
     public static boolean hasTable(int epoch) {
@@ -246,6 +290,14 @@ public final class MeshKernelBridge {
             + "return v.byteLength;")
     public static native int copyVertices(JSObject record, int layer, @JSByRef byte[] target, int offset);
 
+    /** Bytes of vanilla BLOCK vertices the record holds for {@code layer}; -1 when absent. */
+    @JSBody(params = {"record", "layer"}, script = ""
+            + "var names = ['solid', 'cutout', 'translucent'];"
+            + "if (!record.result) return -1;"
+            + "var l = record.result.layers[names[layer]];"
+            + "return l && l.vertices ? l.vertices.byteLength : -1;")
+    public static native int vertexBytes(JSObject record, int layer);
+
     /** Copies the translucent quad order (farthest first) into {@code target}; -1 when absent. */
     @JSBody(params = {"record", "target"}, script = ""
             + "if (!record.result) return -1;"
@@ -299,6 +351,11 @@ public final class MeshKernelBridge {
 
     @JSBody(script = "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
             + "var k = g.__gaiusMeshKernel;"
+            + "if (k && typeof k.cancelAll === 'function') k.cancelAll();")
+    private static native void facadeCancelAll();
+
+    @JSBody(script = "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
+            + "var k = g.__gaiusMeshKernel;"
             + "if (!k) return null;"
             + "var r = k.poll();"
             + "return r ? r : null;")
@@ -313,22 +370,24 @@ public final class MeshKernelBridge {
         sinceLastPublish = 0;
         try {
             publish((double) submitted, (double) meshed, (double) vanillaFallbacks, (double) failures,
-                    snapshotNanos / 1.0e6, installNanos / 1.0e6, disabled);
+                    (double) blendSkips, snapshotNanos / 1.0e6, installNanos / 1.0e6, disabled);
         } catch (RuntimeException ignored) {
             // Telemetry is optional.
         }
     }
 
-    @JSBody(params = {"submitted", "meshed", "fallbacks", "failures", "snapshotMs", "installMs", "disabled"},
+    @JSBody(params = {"submitted", "meshed", "fallbacks", "failures", "blendSkips", "snapshotMs", "installMs",
+            "disabled"},
             script = "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
                     + "var state = g.__gaiusChunkPipelineTelemetry || (g.__gaiusChunkPipelineTelemetry = {});"
                     + "state.meshKernelSubmitted = submitted;"
                     + "state.meshKernelMeshed = meshed;"
                     + "state.meshKernelVanillaFallbacks = fallbacks;"
                     + "state.meshKernelFailures = failures;"
+                    + "state.meshKernelBlendSkips = blendSkips;"
                     + "state.meshKernelSnapshotMs = snapshotMs;"
                     + "state.meshKernelInstallMs = installMs;"
                     + "state.meshKernelDisabled = disabled;")
     private static native void publish(double submitted, double meshed, double fallbacks, double failures,
-            double snapshotMs, double installMs, boolean disabled);
+            double blendSkips, double snapshotMs, double installMs, boolean disabled);
 }

@@ -9,7 +9,7 @@
 use crate::aquifer::{disabled_substance, Aquifer, AquiferNoises, Picker};
 use crate::arena::Arena;
 use crate::beard::Beard;
-use crate::biome::{zoom, BiomeGrid};
+use crate::biome::{zoom, BiomeGrid, RING_COLUMNS};
 use crate::chunk::{ChunkData, HeightmapKind};
 use crate::climate::{quantize, RTree, Searcher};
 use crate::df32::{Ctx32, Program32, Sid};
@@ -78,6 +78,19 @@ pub struct TerrainRequest {
     pub surface: bool,
     /// Also return the chunk's biomes.
     pub biomes: bool,
+    /// The biomes the neighbouring chunks store in the grid's border quarts (local biome
+    /// indices from [`Generator::ring_biomes`]); `None` computes them like the chunk's own.
+    pub ring_biomes: Option<Vec<u16>>,
+}
+
+/// Why a ring of neighbour biomes was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RingError {
+    /// The ring does not have [`Generator::ring_len`] entries.
+    Length(usize),
+    /// A neighbour stores a biome outside the generator's biome table (another dimension's
+    /// biome set with `/fillbiome`, say); the chunk takes the Java path.
+    UnknownBiome(u32),
 }
 
 pub struct TerrainResult {
@@ -102,6 +115,7 @@ pub struct Generator {
     pub states: ir::States,
     pub biomes: Vec<BiomeInfo>,
     state_lookup: HashMap<u32, u16>,
+    biome_lookup: HashMap<u32, u16>,
     source: Source,
     aquifer_random: PositionalRandomFactory,
     ore_random: PositionalRandomFactory,
@@ -259,6 +273,10 @@ impl Generator {
             .enumerate()
             .map(|(i, &g)| (g, i as u16))
             .collect();
+        let mut biome_lookup = HashMap::new();
+        for (i, b) in ir.biomes.biomes.iter().enumerate() {
+            biome_lookup.entry(b.global_id).or_insert(i as u16);
+        }
         let surface = ir
             .surface
             .as_ref()
@@ -269,6 +287,7 @@ impl Generator {
             states: ir.states.clone(),
             biomes: ir.biomes.biomes.clone(),
             state_lookup,
+            biome_lookup,
             source,
             aquifer_random: factory.from_hash_of("minecraft:aquifer").fork_positional(),
             ore_random: factory.from_hash_of("minecraft:ore").fork_positional(),
@@ -286,6 +305,38 @@ impl Generator {
     /// Local state index of a global block state id.
     pub fn local_state(&self, global: u32) -> Option<u16> {
         self.state_lookup.get(&global).copied()
+    }
+
+    /// Entries of a ring of neighbour biomes: the 20 quart columns around the chunk, each
+    /// over the level height.
+    pub fn ring_len(&self) -> usize {
+        RING_COLUMNS * (self.settings.level_height >> 2) as usize
+    }
+
+    /// Maps a ring of global biome ids (see [`BiomeGrid::seed_ring`] for the order) to local
+    /// biome indices.
+    pub fn ring_biomes(&self, ring: &[u32]) -> Result<Vec<u16>, RingError> {
+        if ring.len() != self.ring_len() {
+            return Err(RingError::Length(ring.len()));
+        }
+        let mut out = Vec::with_capacity(ring.len());
+        let mut last = (u32::MAX, 0u16);
+        for &global in ring {
+            if global != last.0 {
+                let local = *self.biome_lookup.get(&global).ok_or(RingError::UnknownBiome(global))?;
+                last = (global, local);
+            }
+            out.push(last.1);
+        }
+        Ok(out)
+    }
+
+    fn seed_ring(&self, grid: &mut BiomeGrid, ring: Option<&[u16]>) {
+        if let Some(ring) = ring {
+            if ring.len() == self.ring_len() {
+                grid.seed_ring(ring);
+            }
+        }
     }
 
     pub fn footprint(&self) -> Footprint {
@@ -368,6 +419,7 @@ impl Generator {
         let s = &self.settings;
         let mut chunk = ChunkData::new(request.chunk_x, request.chunk_z, s.level_min_y, s.level_height);
         let mut grid = BiomeGrid::new(request.chunk_x, request.chunk_z, s.level_min_y, s.level_height);
+        self.seed_ring(&mut grid, request.ring_biomes.as_deref());
         let want_biomes = request.biomes;
         match &self.kernel {
             Kernel::V32 { program, roots } => {
@@ -460,11 +512,26 @@ impl Generator {
 
     /// `buildSurface` alone over a chunk the terrain job produced earlier.
     pub fn run_surface(&mut self, chunk: &mut ChunkData, beard: Beard) {
+        self.run_surface_with(chunk, beard, None);
+    }
+
+    /// [`Generator::run_surface`] with the biomes the neighbouring chunks store (see
+    /// [`TerrainRequest::ring_biomes`]).
+    pub fn run_surface_with(&mut self, chunk: &mut ChunkData, beard: Beard, ring_biomes: Option<&[u16]>) {
+        if self.surface.is_none() {
+            return;
+        }
+        let mut grid = BiomeGrid::new(
+            chunk.chunk_x,
+            chunk.chunk_z,
+            self.settings.level_min_y,
+            self.settings.level_height,
+        );
+        self.seed_ring(&mut grid, ring_biomes);
         let Some(surface) = &self.surface else {
             return;
         };
         let s = &self.settings;
-        let mut grid = BiomeGrid::new(chunk.chunk_x, chunk.chunk_z, s.level_min_y, s.level_height);
         let env = surface_env(self.profile, &self.settings, &self.states, &self.biomes);
         match &self.kernel {
             Kernel::V32 { program, roots } => {

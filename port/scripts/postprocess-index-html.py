@@ -1048,7 +1048,38 @@ def patch_storage_persistence(text: str, profile: dict) -> str:
     if insertion < 0:
         raise RuntimeError("index.html persistence bootstrap script was not found")
     text = text[:insertion] + globals_block + text[insertion:]
-    return text
+    return patch_early_profile_id(text, profile)
+
+
+EARLY_PROFILE_MARKER = 'data-gaius-profile-early="v1"'
+EARLY_PROFILE_PATTERN = re.compile(
+    r'  <script data-gaius-profile-early="v1">\n.*?  </script>\n',
+    flags=re.DOTALL,
+)
+BOOT_SCRIPT_PREFIX = '  <script data-gaius-boot="v1"'
+
+
+def patch_early_profile_id(text: str, profile: dict) -> str:
+    """Sets window.__gaiusProfileId in <head>, before the boot script tag.
+
+    The graphics quality layer that gaius-boot.js loads (or a portable page inlines in place of
+    that tag) caps the canvas ratio by profile, and on a portable page it runs before the
+    storage globals in <body> exist. A page from an older template gets the block inserted.
+    """
+    block = (
+        f'  <script {EARLY_PROFILE_MARKER}>\n'
+        "    // The graphics quality layer the boot script loads caps the canvas ratio per profile, so the\n"
+        "    // profile id must exist before any of it runs (postprocess-index-html.py fills it in).\n"
+        f'    window.__gaiusProfileId = {json.dumps(profile["id"], ensure_ascii=True)};\n'
+        "  </script>\n"
+    )
+    text = EARLY_PROFILE_PATTERN.sub("", text)
+    head_end = text.find("</head>")
+    if head_end < 0:
+        raise RuntimeError("index.html has no </head> for the early profile id")
+    boot = text.find(BOOT_SCRIPT_PREFIX, 0, head_end)
+    insertion = boot if boot >= 0 else head_end
+    return text[:insertion] + block + text[insertion:]
 
 
 
@@ -3181,8 +3212,10 @@ def patch_index(
     text = patch_release_version(text)
     text = patch_shader_toolchain_loader(text, classes_js, index, minecraft_version)
 
-    if text != original:
-        index.write_text(text, encoding="utf-8")
+    # A page an earlier run wrote with CRLF (Windows newline translation) is rewritten as LF:
+    # the Pages and portable builders match its tags byte-for-byte.
+    if text != original or b"\r\n" in index.read_bytes():
+        index.write_text(text, encoding="utf-8", newline="\n")
         return True
     return False
 

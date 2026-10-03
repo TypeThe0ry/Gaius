@@ -39,6 +39,8 @@ public final class BrowserMeshInstallQueue {
     private static long discardedStale;
     private static long retries;
     private static long failures;
+    /** Producer hook run on every epoch bump (MeshKernelBridge cancels the jobs still out). */
+    private static Runnable epochBumpHook;
 
     static {
         LATEST_REQUEST.defaultReturnValue(0);
@@ -73,6 +75,11 @@ public final class BrowserMeshInstallQueue {
         return PENDING_REQUEST.containsKey(sectionNode);
     }
 
+    /** True while {@code requestSeq} is the newest request for the section in this level. */
+    public static boolean isLatest(long sectionNode, int requestSeq) {
+        return LATEST_REQUEST.get(sectionNode) == requestSeq;
+    }
+
     /** Requests out plus results waiting for installation. */
     public static int inFlight() {
         return PENDING_REQUEST.size();
@@ -90,13 +97,25 @@ public final class BrowserMeshInstallQueue {
         return resourceEpoch;
     }
 
-    /** The level was left or its render data reset: every outstanding result is stale. */
+    /**
+     * Registers the producer's hook for epoch bumps: the jobs it still has out can only produce
+     * stale results, so it should cancel them instead of keeping workers busy.
+     */
+    public static void setEpochBumpHook(Runnable hook) {
+        epochBumpHook = hook;
+    }
+
+    /**
+     * The level was left or its render data reset: every outstanding result is stale. Request
+     * sequences restart per level, so a producer must not use them to order jobs across levels.
+     */
     public static void bumpLevelEpoch() {
         levelEpoch = levelEpoch == Integer.MAX_VALUE ? 1 : levelEpoch + 1;
         discardReady(DISCARD_LEVEL);
         LATEST_REQUEST.clear();
         PENDING_REQUEST.clear();
         BrowserNeighborReadiness.clear();
+        runEpochBumpHook();
     }
 
     /** Models, tints or atlases changed: every outstanding result is stale. */
@@ -104,6 +123,20 @@ public final class BrowserMeshInstallQueue {
         resourceEpoch = resourceEpoch == Integer.MAX_VALUE ? 1 : resourceEpoch + 1;
         discardReady(DISCARD_RESOURCES);
         PENDING_REQUEST.clear();
+        runEpochBumpHook();
+    }
+
+    private static void runEpochBumpHook() {
+        Runnable hook = epochBumpHook;
+        if (hook == null) {
+            return;
+        }
+        try {
+            hook.run();
+        } catch (RuntimeException error) {
+            // Cancelling is an optimisation: stale results are dropped by their epochs anyway.
+            failures++;
+        }
     }
 
     /** Accepts a finished result; a stale one is discarded at once. */

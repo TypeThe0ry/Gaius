@@ -68,6 +68,8 @@ def write_text_atomically(target: Path, text: str) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            # LF on every host: release gates and the Pages builder match this text exactly.
+            newline="\n",
             dir=target.parent,
             prefix=f".{target.name}.",
             suffix=".tmp",
@@ -100,6 +102,8 @@ def _prepare_text(target: Path, text: str) -> str:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            # LF on every host: release gates and the Pages builder match this text exactly.
+            newline="\n",
             dir=target.parent,
             prefix=f".{target.name}.",
             suffix=".tmp",
@@ -343,7 +347,8 @@ def parse_portable_payload(html: str) -> dict[str, bytes]:
         parts.append(match.group(3))
     index_marker = "const portablePayload = "
     start = html.index(index_marker) + len(index_marker)
-    end = html.index(";\n", start)
+    # The index holds names, numbers and hashes only, so ';' ends it whatever the line endings.
+    end = html.index(";", start)
     index = json.loads(html[start:end])
     decoded: dict[str, bytes] = {}
     for name, text_parts in texts.items():
@@ -767,6 +772,14 @@ QUALITY_MODULES = (
     "runtime/quality/post-chain.js",
     "runtime/quality/quality-runtime.js",
 )
+# Scripts the integrated server Worker imports: the worldgen job codec and facade, and the kernel
+# policy and runtime for ?worldgenKernelHost=worker. Inert text on the page, never executed there.
+SERVER_WORKER_MODULES = (
+    "kernels/kernel-policy.js",
+    "kernels/kernel-runtime.js",
+    "kernels/worldgen-job.js",
+    "kernels/worldgen-kernel.js",
+)
 
 
 def kernel_job_modules(web: Path) -> list[str]:
@@ -805,6 +818,18 @@ def runtime_bootstrap(root: Path) -> tuple[str, dict[str, str]]:
     ]
     for name, source in modules:
         parts.append(f'  <script data-gaius-boot-module="{name}">\n{source}  </script>\n')
+    # The integrated server Worker imports these from the page's gaius-kernel-port message
+    # (gaius-boot.js serverWorkerKernelScripts): a Worker started from a Blob has no sibling
+    # files, so the page carries them as inert text the boot script hands over as sources.
+    for name in SERVER_WORKER_MODULES:
+        path = web / name
+        if not path.is_file():
+            continue
+        source = inline_safe(path.read_text(encoding="utf-8"), name)
+        hashes[f"server-worker/{name}"] = sha256_bytes(source.encode("utf-8"))
+        parts.append(
+            f'  <script type="text/plain" data-gaius-worker-script="{name}">\n{source}  </script>\n'
+        )
     worker = root / KERNEL_WORKER_SOURCE
     if worker.is_file():
         worker_text = inline_safe(worker.read_text(encoding="utf-8"), "kernel-worker.js")

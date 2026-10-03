@@ -29,12 +29,12 @@ import org.objectweb.asm.tree.VarInsnNode;
  * call must be present or the build fails.
  *
  * <ul>
- *   <li>{@code SectionRenderDispatcher$RenderSection$CompileTask}: vanilla {@code doTask} becomes
- *       {@code gaius$doTaskVanilla}, with its single {@code SectionCompiler.compile} call routed
- *       through {@code MeshKernelHooks.compile(compiler, pos, region, sorting, pack, this)}. The
- *       new {@code doTask} returns {@code SectionTaskResult.SUCCESSFUL} when
- *       {@code MeshKernelHooks.beforeCompile(this, dispatcher.sectionCompiler,
- *       dispatcher.cameraPosition.get())} took the section, and runs the vanilla method otherwise.
+ *   <li>{@code SectionRenderDispatcher$RenderSection$CompileTask}: {@code doTask} starts with
+ *       {@code if (MeshKernelHooks.beforeCompile(this, dispatcher.sectionCompiler,
+ *       dispatcher.cameraPosition.get())) return SectionTaskResult.SUCCESSFUL;} (the kernel took
+ *       the section), and its single {@code SectionCompiler.compile} call is routed through
+ *       {@code MeshKernelHooks.compile(compiler, pos, region, sorting, pack, this)}; the rest of
+ *       the method is left as the earlier patches made it.
  *       The task implements {@code MeshKernelAccess$Task}: a {@code gaius$meshKernel} state field,
  *       {@code isCancelled.get()}, {@code isCompleted.set(false)} plus
  *       {@code SectionRenderDispatcher.schedule(this)} (the second run that installs a kernel
@@ -49,9 +49,10 @@ import org.objectweb.asm.tree.VarInsnNode;
  *
  * <p>Classes are read from {@code root} when an earlier patch step wrote them there (the 26.2
  * chain patches CompileTask.doTask for upload retries and RenderSection for the latest-mesh
- * guard), otherwise from the jar, so this must run after those patches. It adds no branch to
- * an existing method, so existing stack map frames stay valid; the new methods carry their own
- * frames.</p>
+ * guard), otherwise from the jar, so this must run after those patches. Existing stack map
+ * frames stay valid: the only branch added to an existing method is the doTask prologue, whose
+ * target is the method's original entry state ({@code F_SAME} relative to the parameters, or
+ * the frame already recorded there); the new methods carry their own frames.</p>
  *
  * <p>Runtime switch: {@code ?meshKernel=0} (and the kernel runtime's own switches) keep every
  * section on the vanilla path; see {@code MeshKernelBridge}.</p>
@@ -91,7 +92,6 @@ public final class MeshKernelPatches {
 
     static final String DO_TASK = "doTask";
     static final String DO_TASK_DESCRIPTOR = "(L" + PACK + ";)L" + TASK_RESULT + ";";
-    static final String VANILLA_DO_TASK = "gaius$doTaskVanilla";
     static final String STATE_FIELD = "gaius$meshKernel";
     static final String COMPILE_DESCRIPTOR = "(L" + SECTION_POS + ";L" + REGION + ";L" + VERTEX_SORTING + ";L"
             + PACK + ";)L" + RESULTS + ";";
@@ -124,7 +124,7 @@ public final class MeshKernelPatches {
         patchPalettedContainer(jar, root);
         patchBiomeManager(jar, root);
         System.out.println("MeshKernelPatches: routed " + profile
-                + " section compiles through the mesh kernel (vanilla doTask kept as " + VANILLA_DO_TASK + ")");
+                + " section compiles through the mesh kernel (vanilla compile kept as its fallback)");
         return true;
     }
 
@@ -139,7 +139,7 @@ public final class MeshKernelPatches {
         if (!SECTION_TASK.equals(task.superName)) {
             throw new IllegalStateException(COMPILE_TASK + " no longer extends " + SECTION_TASK);
         }
-        if (task.interfaces.contains(TASK_ACCESS) || hasMethod(task, VANILLA_DO_TASK)) {
+        if (task.interfaces.contains(TASK_ACCESS) || hasField(task, STATE_FIELD)) {
             throw new IllegalStateException(COMPILE_TASK + " is already patched for the mesh kernel");
         }
         requireField(task, "region", "L" + REGION + ";");
@@ -152,15 +152,15 @@ public final class MeshKernelPatches {
         find(dispatcher, "schedule", "(L" + SECTION_TASK + ";)V");
         requireField(results, "SUCCESSFUL", "L" + TASK_RESULT + ";");
 
-        MethodNode vanilla = find(task, DO_TASK, DO_TASK_DESCRIPTOR);
+        MethodNode doTask = find(task, DO_TASK, DO_TASK_DESCRIPTOR);
         int routed = 0;
-        for (AbstractInsnNode instruction : vanilla.instructions.toArray()) {
+        for (AbstractInsnNode instruction : doTask.instructions.toArray()) {
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKEVIRTUAL
                     && call.owner.equals(COMPILER)
                     && call.name.equals("compile")
                     && call.desc.equals(COMPILE_DESCRIPTOR)) {
-                vanilla.instructions.insertBefore(call, new VarInsnNode(Opcodes.ALOAD, 0));
+                doTask.instructions.insertBefore(call, new VarInsnNode(Opcodes.ALOAD, 0));
                 call.setOpcode(Opcodes.INVOKESTATIC);
                 call.owner = HOOKS;
                 call.desc = HOOK_COMPILE_DESCRIPTOR;
@@ -172,11 +172,10 @@ public final class MeshKernelPatches {
             throw new IllegalStateException(COMPILE_TASK + ".doTask expected one SectionCompiler.compile call, found "
                     + routed);
         }
-        vanilla.name = VANILLA_DO_TASK;
-        vanilla.maxStack += 1;
+        insertBeforeCompilePrologue(doTask);
+        doTask.maxStack = Math.max(doTask.maxStack + 1, 3);
 
         task.fields.add(new FieldNode(Opcodes.ACC_PUBLIC, STATE_FIELD, "Ljava/lang/Object;", null, null));
-        task.methods.add(doTaskWrapper(vanilla));
         task.methods.add(getter(COMPILE_TASK, "gaius$meshKernelState", STATE_FIELD, "Ljava/lang/Object;"));
         task.methods.add(stateSetter());
         task.methods.add(cancelledAccessor());
@@ -190,13 +189,24 @@ public final class MeshKernelPatches {
     }
 
     /**
-     * {@code if (MeshKernelHooks.beforeCompile(this, this$1.this$0.sectionCompiler,
-     * (Vec3) this$1.this$0.cameraPosition.get())) return SUCCESSFUL; return gaius$doTaskVanilla(pack);}
+     * Prepends {@code if (MeshKernelHooks.beforeCompile(this, this$1.this$0.sectionCompiler,
+     * (Vec3) this$1.this$0.cameraPosition.get())) return SUCCESSFUL;} to doTask. Keeping the
+     * method (rather than renaming it behind a wrapper) leaves every earlier rewrite and every
+     * check that reads doTask where it was. The branch target is the original entry: its state is
+     * the parameters only, so it gets an {@code F_SAME} frame unless the method already records a
+     * frame there; the original frames that follow keep their deltas (same base state).
      */
-    private static MethodNode doTaskWrapper(MethodNode vanilla) {
-        MethodNode method = new MethodNode(Opcodes.ACC_PUBLIC, DO_TASK, DO_TASK_DESCRIPTOR, null, null);
-        InsnList code = method.instructions;
-        LabelNode useVanilla = new LabelNode();
+    private static void insertBeforeCompilePrologue(MethodNode doTask) {
+        boolean entryFramed = false;
+        for (AbstractInsnNode at = doTask.instructions.getFirst(); at != null && at.getOpcode() < 0;
+                at = at.getNext()) {
+            if (at instanceof FrameNode) {
+                entryFramed = true;
+                break;
+            }
+        }
+        InsnList code = new InsnList();
+        LabelNode entry = new LabelNode();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         dispatcher(code);
         code.add(new FieldInsnNode(Opcodes.GETFIELD, DISPATCHER, "sectionCompiler", "L" + COMPILER + ";"));
@@ -205,19 +215,14 @@ public final class MeshKernelPatches {
         code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, ATOMIC_REFERENCE, "get", "()Ljava/lang/Object;", false));
         code.add(new TypeInsnNode(Opcodes.CHECKCAST, VEC3));
         code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS, "beforeCompile", HOOK_BEFORE_DESCRIPTOR, false));
-        code.add(new JumpInsnNode(Opcodes.IFEQ, useVanilla));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, entry));
         code.add(new FieldInsnNode(Opcodes.GETSTATIC, TASK_RESULT, "SUCCESSFUL", "L" + TASK_RESULT + ";"));
         code.add(new InsnNode(Opcodes.ARETURN));
-        code.add(useVanilla);
-        code.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, COMPILE_TASK, VANILLA_DO_TASK, DO_TASK_DESCRIPTOR, false));
-        code.add(new InsnNode(Opcodes.ARETURN));
-        method.maxStack = 3;
-        method.maxLocals = 2;
-        method.exceptions = vanilla.exceptions;
-        return method;
+        code.add(entry);
+        if (!entryFramed) {
+            code.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        }
+        doTask.instructions.insert(code);
     }
 
     /** Pushes {@code this.this$1.this$0}. */
@@ -393,9 +398,9 @@ public final class MeshKernelPatches {
         throw new IllegalStateException(node.name + "." + name + " " + descriptor + " was not found");
     }
 
-    private static boolean hasMethod(ClassNode node, String name) {
-        for (MethodNode method : node.methods) {
-            if (method.name.equals(name)) {
+    private static boolean hasField(ClassNode node, String name) {
+        for (FieldNode field : node.fields) {
+            if (field.name.equals(name)) {
                 return true;
             }
         }

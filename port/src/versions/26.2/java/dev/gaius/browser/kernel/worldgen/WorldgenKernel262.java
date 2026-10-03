@@ -1,7 +1,7 @@
 package dev.gaius.browser.kernel.worldgen;
 
+import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
 import java.util.IdentityHashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -19,11 +19,13 @@ import net.minecraft.util.Util;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.biome.BiomeManager;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.GaiusKernelSections;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.chunk.status.ChunkStep;
 import net.minecraft.world.level.chunk.status.WorldGenContext;
@@ -51,11 +53,15 @@ import net.minecraft.world.level.levelgen.structure.pools.StructureTemplatePool;
  * <p>The kernel takes the BIOMES step, the NOISE step (density fill, aquifers, ore veins, the
  * worldgen heightmaps and fluid post-processing marks) and the SURFACE step: NOISE keeps its
  * decoded chunk in the facade (bounded byte budget) and {@code ChunkStatusTasks.generateSurface}
- * runs the kernel surface rules on it, applying only the changed blocks. The surface rules never
- * run during NOISE, so a chunk saved between NOISE and SURFACE (a new proto chunk object, with
- * nothing kept) simply takes the vanilla surface step. CARVERS stays vanilla. Blended, upgrading and below-zero-retrogen chunks,
+ * runs the kernel surface rules on it, applying only the changed blocks. The surface rules read
+ * the biomes the neighbouring chunks store (sent with the job, see {@link #ringBiomes}) like
+ * vanilla's {@code BiomeManager} does. The surface rules never run during NOISE, so a chunk saved
+ * between NOISE and SURFACE (a new proto chunk object, with nothing kept) simply takes the vanilla
+ * surface step. CARVERS stays vanilla. Blended, upgrading and below-zero-retrogen chunks,
  * generators the exporter does not model and any kernel failure stay on (or fall back to) the
- * vanilla path; a transient refusal only sends that chunk there.
+ * vanilla path; a NOISE result is built off the chunk first, so one that cannot be installed
+ * leaves the chunk untouched for vanilla. A transient refusal (also a neighbour biome the kernel
+ * does not know) only sends that chunk there.
  */
 public final class WorldgenKernel262 {
     private static final Map<RandomState, Slot> SLOTS = new IdentityHashMap<>();
@@ -69,6 +75,14 @@ public final class WorldgenKernel262 {
     private static final class Slot {
         int key;
         boolean failed;
+        IdMap<Holder<Biome>> biomeIds;
+        /**
+         * Kept noise chunks of this generator by {@code ChunkPos.pack}, oldest first. Only the
+         * position and the proto chunk's identity hash are held, never the chunk: a chunk whose
+         * generation stopped after NOISE (cancelled, then saved and unloaded) leaves a few ints
+         * behind until {@link #MAX_KEPT} pushes them out.
+         */
+        final Long2ObjectLinkedOpenHashMap<KeptNoise> kept = new Long2ObjectLinkedOpenHashMap<>();
     }
 
     /** The kernel generator slot of a RandomState, exporting it on first use. */
@@ -83,6 +97,7 @@ public final class WorldgenKernel262 {
             try {
                 net.minecraft.core.Registry<Biome> biomeRegistry =
                         structures.registryAccess().lookupOrThrow(Registries.BIOME);
+                slot.biomeIds = biomeRegistry.asHolderIdMap();
                 long seed = ((WorldgenSeedSource262) (Object) structures).gaius$worldSeed();
                 byte[] ir = GaiusWorldgenExport262.export(generator, randomState, structures.registryAccess(),
                         biomeRegistry::getId, chunk.getHeightAccessorForGeneration(), seed, PROFILE_26_2);
@@ -138,7 +153,7 @@ public final class WorldgenKernel262 {
         boolean keep = BrowserWorldgenKernel.surfaceSupported();
         try {
             BrowserWorldgenKernel.submitTerrain(slot.key, pos.x(), pos.z(),
-                    keep ? BrowserWorldgenKernel.FLAG_KEEP_NOISE : 0, beard,
+                    keep ? BrowserWorldgenKernel.FLAG_KEEP_NOISE : 0, beard, null,
                     // The result object holds fresh typed arrays (worldgen-kernel.js flatten), so it can
                     // be read later on a Java thread instead of inside the JS callback.
                     result -> BrowserWorldgenKernel.runOnJavaThread(() -> guarded(future, vanilla, () -> {
@@ -154,10 +169,21 @@ public final class WorldgenKernel262 {
                             return;
                         }
                         forward(future, () -> CompletableFuture.supplyAsync(() -> {
-                            data.install(chunk);
-                            keepNoise(chunk, randomState, slot, token, beard);
+                            LevelChunkSection[] built;
+                            try {
+                                built = data.buildSections(chunk);
+                            } catch (RuntimeException e) {
+                                // Nothing of the chunk changed yet: vanilla fills it from scratch.
+                                BrowserWorldgenKernel.dropKeptNoise(token);
+                                slot.failed = true;
+                                BrowserWorldgenKernel.disable("terrain result install failed: " + e);
+                                return null;
+                            }
+                            data.commit(chunk, built);
+                            keepNoise(chunk, slot, token, beard);
                             return chunk;
-                        }, Util.backgroundExecutor().forName("wgen_fill_noise")));
+                        }, Util.backgroundExecutor().forName("wgen_fill_noise"))
+                                .thenCompose(c -> c != null ? CompletableFuture.completedFuture(c) : vanilla.get()));
                     })),
                     message -> BrowserWorldgenKernel.runOnJavaThread(() -> guarded(future, vanilla, () -> {
                         failed(slot, "terrain", message);
@@ -173,47 +199,41 @@ public final class WorldgenKernel262 {
 
     // ---- SURFACE (kernel surface rules on the kept noise chunk) ----
 
-    /** A noise chunk the kernel kept for the SURFACE step of the same proto chunk object. */
+    /**
+     * A noise chunk the kernel kept for the SURFACE step of the same proto chunk object, told
+     * apart by {@code System.identityHashCode}. A chunk saved and loaded again between NOISE and
+     * SURFACE is a new object and takes the vanilla surface step; should its identity hash match
+     * by chance, its blocks are still the kept NOISE output (saved as is), so the diff still fits.
+     */
     private static final class KeptNoise {
-        final RandomState randomState;
-        final Slot slot;
+        final int identity;
         final int token;
         final int[] beard;
 
-        KeptNoise(RandomState randomState, Slot slot, int token, int[] beard) {
-            this.randomState = randomState;
-            this.slot = slot;
+        KeptNoise(int identity, int token, int[] beard) {
+            this.identity = identity;
             this.token = token;
             this.beard = beard;
         }
     }
 
-    /** Most kept noise chunks remembered at once; the facade's byte budget usually binds first. */
-    private static final int MAX_KEPT = 1024;
-
     /**
-     * Proto chunk (by identity: ProtoChunk keeps Object equality) to its kept noise chunk. A chunk
-     * saved and loaded again between NOISE and SURFACE is a new object and takes the vanilla
-     * surface step.
+     * Most kept noise chunks remembered per generator: the facade keeps at most 32 MB of them
+     * (about 300 chunks), and a chunk on the normal path takes its entry at SURFACE right away.
      */
-    private static final Map<ChunkAccess, KeptNoise> KEPT = new LinkedHashMap<>(64, 0.75f, false) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<ChunkAccess, KeptNoise> eldest) {
-            if (size() > MAX_KEPT) {
-                BrowserWorldgenKernel.dropKeptNoise(eldest.getValue().token);
-                return true;
-            }
-            return false;
-        }
-    };
+    private static final int MAX_KEPT = 256;
 
-    private static void keepNoise(ChunkAccess chunk, RandomState randomState, Slot slot, int token, int[] beard) {
+    private static void keepNoise(ChunkAccess chunk, Slot slot, int token, int[] beard) {
         if (token == 0) {
             return;
         }
-        KeptNoise previous = KEPT.put(chunk, new KeptNoise(randomState, slot, token, beard));
+        KeptNoise previous = slot.kept.put(ChunkPos.pack(chunk.getPos().x(), chunk.getPos().z()),
+                new KeptNoise(System.identityHashCode(chunk), token, beard));
         if (previous != null) {
             BrowserWorldgenKernel.dropKeptNoise(previous.token);
+        }
+        while (slot.kept.size() > MAX_KEPT) {
+            BrowserWorldgenKernel.dropKeptNoise(slot.kept.removeFirst().token);
         }
     }
 
@@ -228,15 +248,16 @@ public final class WorldgenKernel262 {
             ChunkStep step,
             StaticCache2D<GenerationChunkHolder> cache,
             ChunkAccess chunk) {
-        KeptNoise kept = KEPT.remove(chunk);
+        ServerLevel level = context.level();
+        RandomState randomState = level.getChunkSource().randomState();
+        Slot slot = SLOTS.get(randomState);
+        KeptNoise kept = slot == null ? null : slot.kept.remove(ChunkPos.pack(chunk.getPos().x(), chunk.getPos().z()));
         if (kept == null) {
             return null;
         }
-        ServerLevel level = context.level();
-        if (!BrowserWorldgenKernel.available() || kept.slot.failed
+        if (kept.identity != System.identityHashCode(chunk) || !BrowserWorldgenKernel.available() || slot.failed
                 || !(context.generator() instanceof NoiseBasedChunkGenerator generator)
-                || level.getChunkSource().randomState() != kept.randomState
-                || !BrowserWorldgenKernel.generatorUsable(kept.slot.key)) {
+                || !BrowserWorldgenKernel.generatorUsable(slot.key)) {
             BrowserWorldgenKernel.dropKeptNoise(kept.token);
             return null;
         }
@@ -246,21 +267,28 @@ public final class WorldgenKernel262 {
             return null;
         }
         StructureManager structures = level.structureManager().forWorldGenRegion(region);
-        RandomState randomState = kept.randomState;
         CompletableFuture<ChunkAccess> future = new CompletableFuture<>();
         ChunkPos pos = chunk.getPos();
         Supplier<CompletableFuture<ChunkAccess>> vanilla = () -> {
             generator.buildSurface(region, structures, randomState, chunk);
             return CompletableFuture.completedFuture(chunk);
         };
+        int[] ring;
         try {
-            BrowserWorldgenKernel.submitSurface(kept.slot.key, kept.token, pos.x(), pos.z(), kept.beard,
+            ring = ringBiomes(region.getBiomeManager(), slot.biomeIds, chunk);
+        } catch (RuntimeException e) {
+            BrowserWorldgenKernel.dropKeptNoise(kept.token);
+            failed(slot, "surface ring", String.valueOf(e));
+            return null;
+        }
+        try {
+            BrowserWorldgenKernel.submitSurface(slot.key, kept.token, pos.x(), pos.z(), kept.beard, ring,
                     diff -> BrowserWorldgenKernel.runOnJavaThread(() -> guarded(future, vanilla, () -> {
                         int[] positions = BrowserWorldgenKernel.chunkInts(diff, "positions");
                         int[] states = BrowserWorldgenKernel.chunkInts(diff, "states");
                         BlockState[] resolved = surfaceStates(chunk, diff, positions, states);
                         if (resolved == null) {
-                            kept.slot.failed = true;
+                            slot.failed = true;
                             BrowserWorldgenKernel.disable("surface result rejected");
                             forward(future, vanilla);
                             return;
@@ -269,11 +297,11 @@ public final class WorldgenKernel262 {
                         future.complete(chunk);
                     })),
                     message -> BrowserWorldgenKernel.runOnJavaThread(() -> guarded(future, vanilla, () -> {
-                        failed(kept.slot, "surface", message);
+                        failed(slot, "surface", message);
                         forward(future, vanilla);
                     })));
         } catch (RuntimeException e) {
-            failed(kept.slot, "surface submit", String.valueOf(e));
+            failed(slot, "surface submit", String.valueOf(e));
             return null;
         }
         return future;
@@ -368,7 +396,7 @@ public final class WorldgenKernel262 {
         if (slot == null) {
             return null;
         }
-        IdMap<Holder<Biome>> biomes = structureManager.registryAccess().lookupOrThrow(Registries.BIOME).asHolderIdMap();
+        IdMap<Holder<Biome>> biomes = slot.biomeIds;
         CompletableFuture<ChunkAccess> future = new CompletableFuture<>();
         ChunkPos pos = chunk.getPos();
         Supplier<CompletableFuture<ChunkAccess>> vanilla = () -> ((WorldgenKernelHooks262) (Object) noiseGenerator)
@@ -404,6 +432,44 @@ public final class WorldgenKernel262 {
             return null;
         }
         return future;
+    }
+
+    /** Quart columns around a chunk outside its own 4 x 4. */
+    private static final int RING_COLUMNS = 20;
+
+    /**
+     * The biomes the neighbouring chunks store around {@code chunk}, as the kernel's ring:
+     * for each quart column of the 6 x 6 grid outside the chunk's own 4 x 4 (x outer, z inner,
+     * starting one quart before the chunk), every quart y from the bottom of the level, as biome
+     * registry ids ({@code -1} for a biome without one; the kernel then refuses the chunk). Read
+     * through {@code biomeManager} (the region's), like vanilla's surface rules.
+     */
+    static int[] ringBiomes(BiomeManager biomeManager, IdMap<Holder<Biome>> biomeIds, ChunkAccess chunk) {
+        ChunkPos pos = chunk.getPos();
+        int minQx = (pos.x() << 2) - 1;
+        int minQz = (pos.z() << 2) - 1;
+        int minQy = QuartPos.fromBlock(chunk.getMinY());
+        int quartsY = chunk.getSectionsCount() * 4;
+        int[] ring = new int[RING_COLUMNS * quartsY];
+        Holder<Biome> last = null;
+        int lastId = -1;
+        int k = 0;
+        for (int x = 0; x < 6; x++) {
+            for (int z = 0; z < 6; z++) {
+                if (x >= 1 && x <= 4 && z >= 1 && z <= 4) {
+                    continue;
+                }
+                for (int y = 0; y < quartsY; y++) {
+                    Holder<Biome> holder = biomeManager.getNoiseBiomeAtQuart(minQx + x, minQy + y, minQz + z);
+                    if (holder != last) {
+                        last = holder;
+                        lastId = biomeIds.getId(holder);
+                    }
+                    ring[k++] = lastId;
+                }
+            }
+        }
+        return ring;
     }
 
     @SuppressWarnings("unchecked")
@@ -582,11 +648,14 @@ public final class WorldgenKernel262 {
         }
 
         /**
-         * Sections (bulk: {@code GaiusKernelSections} builds each block state container in one
-         * step, like a loaded section; block by block like {@code doFill} only for a palette the
-         * bulk path refuses), then heightmaps and post-processing marks.
+         * Every section the result changes, built off the chunk (bulk: {@code GaiusKernelSections}
+         * builds each block state container in one step, like a loaded section; block by block
+         * like {@code doFill}, on a copy of the old section, only for a palette the bulk path
+         * refuses); {@code null} entries keep the old section. Throws without touching the chunk,
+         * so a result that cannot be installed leaves it to vanilla.
          */
-        void install(ChunkAccess chunk) {
+        LevelChunkSection[] buildSections(ChunkAccess chunk) {
+            LevelChunkSection[] built = new LevelChunkSection[sectionCount];
             for (int s = 0; s < sectionCount; s++) {
                 int base = paletteOffsets[s];
                 int size = paletteOffsets[s + 1] - base;
@@ -594,10 +663,14 @@ public final class WorldgenKernel262 {
                 if (isUniform && palette[base].isAir()) {
                     continue;
                 }
-                if (GaiusKernelSections.install(chunk, s, palette, base, size, indices, s * 4096, isUniform)) {
+                LevelChunkSection old = chunk.getSection(s);
+                PalettedContainer<BlockState> states =
+                        GaiusKernelSections.container(palette, base, size, indices, s * 4096, isUniform);
+                if (states != null) {
+                    built[s] = new LevelChunkSection(states, old.getBiomes());
                     continue;
                 }
-                LevelChunkSection section = chunk.getSection(s);
+                LevelChunkSection section = old.copy();
                 if (isUniform) {
                     BlockState state = palette[base];
                     for (int y = 0; y < 16; y++) {
@@ -615,6 +688,21 @@ public final class WorldgenKernel262 {
                             section.setBlockState(i & 15, i >>> 8, (i >>> 4) & 15, state, false);
                         }
                     }
+                }
+                built[s] = section;
+            }
+            return built;
+        }
+
+        /**
+         * Installs {@link #buildSections}'s sections (plain assignments), then the heightmaps and
+         * post-processing marks (vanilla bounds-checks both).
+         */
+        void commit(ChunkAccess chunk, LevelChunkSection[] built) {
+            LevelChunkSection[] sections = chunk.getSections();
+            for (int s = 0; s < sectionCount; s++) {
+                if (built[s] != null) {
+                    sections[s] = built[s];
                 }
             }
             ChunkPos pos = chunk.getPos();

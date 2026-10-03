@@ -18,6 +18,8 @@
 //   submitJob(header, ids, light, quarts, palette, swamp, floats)
 //                                copies one section snapshot (typed views of Java arrays) and
 //                                submits it; header is an Int32Array, see HEADER below
+//   cancelAll()                  cancels every section job still out (the level was reset or
+//                                left); their records come back with code "cancelled"
 //   poll()                       next finished record or null: {ticket, ok, code, message,
 //                                status (0 meshed, 2 needs vanilla, -1 failed), quads[3],
 //                                visLo, visHi, detail, result}
@@ -36,12 +38,15 @@
   // Header ints written by MeshKernelBridge.
   const HEADER = Object.freeze({
     TICKET: 0, EPOCH: 1, WIDE: 2, PALETTE_COUNT: 3, FLAGS: 4, SX: 5, SY: 6, SZ: 7,
-    SEED_HI: 8, SEED_LO: 9, REQUEST_SEQ: 10, NON_AIR: 11, DISTANCE: 12, LENGTH: 13,
+    SEED_HI: 8, SEED_LO: 9, REQUEST_SEQ: 10, NON_AIR: 11, DISTANCE: 12, BLEND: 13, LENGTH: 14,
   });
   const FLAG_AO = 1;
   const FLAG_CUTOUT_LEAVES = 2;
   const FLAG_NEARBY = 4;
   const NEARBY_PRIORITY_CHUNKS = 8;
+  // Swamp column mask of a job with a biome blend radius: 20 x 20 columns (x, z in -2..17).
+  const SWAMP_BLEND_BYTES = 50;
+  const MAX_BIOME_BLEND = 2;
 
   let runtime = null;
   let runtimeState = "none"; // none | pending | ready | failed
@@ -54,8 +59,10 @@
   let done = [];
   let head = 0;
   let inFlight = 0;
+  // Runtime key of every section job still out -> its ticket, for cancelAll.
+  const outstanding = new Map();
   const stats = {
-    submitted: 0, meshed: 0, needsVanilla: 0, failed: 0, superseded: 0, tables: 0,
+    submitted: 0, meshed: 0, needsVanilla: 0, failed: 0, superseded: 0, cancelledAll: 0, tables: 0,
     tableBytes: 0, tableEpoch: -1, preloadErrors: 0, lastError: null,
   };
 
@@ -129,7 +136,11 @@
     const count = length >>> 0;
     const copy = new Uint8Array(count);
     copy.set(new Uint8Array(bytes.buffer, bytes.byteOffset, count));
-    session = codec.session(copy, epoch >>> 0);
+    const next = codec.session(copy, epoch >>> 0);
+    // Jobs of another table would come back with its UVs and model choices: drop them, the Java
+    // side then compiles those sections with the vanilla compiler.
+    if (session !== null && sessionEpoch !== (epoch >>> 0)) cancelAll();
+    session = next;
     sessionEpoch = epoch >>> 0;
     stats.tables++;
     stats.tableBytes = count;
@@ -148,8 +159,9 @@
     return out;
   }
 
-  function finish(record) {
+  function finish(record, key) {
     inFlight--;
+    if (key !== undefined && outstanding.get(key) === record.ticket) outstanding.delete(key);
     if (record.ok) {
       const result = record.result;
       record.status = result.statusCode;
@@ -201,6 +213,8 @@
     const requestSeq = header[HEADER.REQUEST_SEQ] >>> 0;
     const paletteCount = header[HEADER.PALETTE_COUNT] | 0;
     if (paletteCount < 1 || paletteCount > 256) return false;
+    const blend = header[HEADER.BLEND] | 0;
+    if (blend < 0 || blend > MAX_BIOME_BLEND) return false;
     const seed = BigInt.asIntN(64, (BigInt(header[HEADER.SEED_HI] | 0) << BigInt(32))
       | BigInt(header[HEADER.SEED_LO] >>> 0));
     const input = {
@@ -220,11 +234,17 @@
       light: copyOf(light, Uint8Array, VOLUME),
       biomeQuarts: copyOf(quarts, Uint8Array, QUART_VOLUME),
       biomePalette: copyOf(palette, Int32Array, paletteCount * 5),
-      swampMask: copyOf(swamp, Uint8Array, 32),
+      biomeBlend: blend,
+      swampMask: copyOf(swamp, Uint8Array, SWAMP_BLEND_BYTES),
     };
+    const key = "s" + sx + "," + sy + "," + sz;
+    const epochAtSubmit = sessionEpoch;
     const opts = {
-      key: "s" + sx + "," + sy + "," + sz,
-      version: requestSeq,
+      key,
+      // The runtime dedupes a key's queued job of the same version and rejects older versions as
+      // stale. Java's request sequence restarts at 1 after a level reset, so the version is the
+      // ticket, which only grows for the whole page.
+      version: ticket,
       visible: true,
       cx: sx,
       cz: sz,
@@ -245,12 +265,40 @@
       stats.lastError = "submit: " + message(error);
       return false;
     }
+    outstanding.set(key, ticket);
     pending.then(
-      (result) => finish({ticket, ok: true, code: null, message: null, result}),
+      (result) => {
+        // Last line of defence against a result that answers another request (a different
+        // table, section or request): it never installs, the section goes to vanilla.
+        if (sessionEpoch !== epochAtSubmit || (result.tableEpoch >>> 0) !== epochAtSubmit
+            || (result.requestSeq >>> 0) !== requestSeq || result.section[0] !== sx
+            || result.section[1] !== sy || result.section[2] !== sz) {
+          finish({ticket, ok: false, code: "stale", message: "result does not match the request", result: null}, key);
+          return;
+        }
+        finish({ticket, ok: true, code: null, message: null, result}, key);
+      },
       (error) => finish({
         ticket, ok: false, code: (error && error.code) || "error", message: message(error), result: null,
-      }));
+      }, key));
     return true;
+  }
+
+  // Cancels every section job still out. Their promises reject with "cancelled", so the Java side
+  // still gets one record per ticket and settles its in-flight bookkeeping.
+  function cancelAll() {
+    if (outstanding.size === 0) return 0;
+    const keys = Array.from(outstanding.keys());
+    outstanding.clear();
+    if (!runtime || typeof runtime.cancel !== "function") return 0;
+    let cancelled = 0;
+    keys.forEach((key) => {
+      try {
+        if (runtime.cancel(key, KERNEL) !== false) cancelled++;
+      } catch (_) { /* the runtime is going away; the Java answer timeout covers the job */ }
+    });
+    stats.cancelledAll += cancelled;
+    return cancelled;
   }
 
   function poll() {
@@ -289,6 +337,6 @@
   }
 
   global.__gaiusMeshKernel = Object.freeze({
-    version: 1, HEADER, ready, setTable, hasTable, submitJob, poll, setWake, disable, status,
+    version: 1, HEADER, ready, setTable, hasTable, submitJob, cancelAll, poll, setWake, disable, status,
   });
 })(typeof globalThis !== "undefined" ? globalThis : self);

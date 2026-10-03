@@ -118,6 +118,9 @@ rm -rf "$dist_directory/kernels"
 stage_arguments=("$dist_directory")
 [[ -f "$kernel_directory/kernels.json" ]] && stage_arguments+=(--kernels "$kernel_directory")
 "$root/port/scripts/run-python.sh" "$root/port/scripts/stage-web-runtime.py" "${stage_arguments[@]}"
+# build-teavm.sh restages the same runtime after publishing the client; it must neither rebuild
+# nor drop the kernels decided here.
+export GAIUS_KERNELS_PREPARED=1
 
 # Keep the success marker in the release log itself instead of relying on a
 # caller to append its captured status after the build pipeline has finished.

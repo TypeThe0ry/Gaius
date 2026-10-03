@@ -66,6 +66,11 @@ const browserOpenGlSource = path.join(
   repositoryRoot,
   "port/overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java",
 );
+// BrowserOpenGL hands terrain shaders to BrowserTerrainShaders, so both compile together.
+const browserTerrainShadersSource = path.join(
+  repositoryRoot,
+  "port/overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserTerrainShaders.java",
+);
 const lwjglOpenGl = path.join(
   overlayRoot,
   `libraries/org/lwjgl/lwjgl-opengl/${shape.lwjglVersion}/lwjgl-opengl-${shape.lwjglVersion}.jar`,
@@ -324,6 +329,7 @@ try {
     "-classpath", browserCompileClasspath,
     "-d", browserClasses,
     browserOpenGlSource,
+    browserTerrainShadersSource,
     ...(shape.lwjglVersion === "3.4.3" ? [browserOpenGlIndexedSource] : []),
   ], {stdio: ["ignore", "pipe", "pipe"]});
 

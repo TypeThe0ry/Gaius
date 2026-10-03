@@ -586,6 +586,12 @@ BUILD_IDENTITY_SOURCE_DIRECTORIES = (
     "port/overrides",
     "port/tools/src/main",
     "port/wasm/hotpath",
+    # The v0.4 page runtime every distribution ships next to (or inlined into) the launcher:
+    # boot script, Service Worker, kernel runtime/worker/job codecs and the quality layer.
+    "port/web/boot",
+    "port/web/sw",
+    "port/web/kernels",
+    "port/web/runtime",
 )
 BUILD_IDENTITY_SOURCE_FILES = (
     "VERSION",
@@ -1774,19 +1780,65 @@ def teavm_release_profile_matches(
     return result.returncode == 0
 
 
+def source_text(relative: str) -> str:
+    path = ROOT / relative
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def appears_in_order(text: str, *markers: str) -> bool:
+    """Whether every marker occurs in text, each first occurrence after the previous one."""
+    position = -1
+    for marker in markers:
+        position = text.find(marker, position + 1)
+        if position < 0:
+            return False
+    return True
+
+
+_PORTABLE_BUILDER = None
+
+
+def portable_builder():
+    """port/scripts/build-portable-html.py as a module (its gaius-b7 payload encoder)."""
+    global _PORTABLE_BUILDER
+    if _PORTABLE_BUILDER is None:
+        path = ROOT / "port" / "scripts" / "build-portable-html.py"
+        spec = importlib.util.spec_from_file_location("gaius_quickcheck_build_portable_html", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PORTABLE_BUILDER = module
+    return _PORTABLE_BUILDER
+
+
 def portable_embeds_gzip(portable: Path, key: str, compressed: Path) -> bool:
+    """Whether the portable page carries exactly these gzip bytes as payload asset ``key``.
+
+    The page embeds each asset as gaius-b7 text split over numbered
+    <script type="text/x-gaius-b7" data-gaius-asset=KEY data-part=N> elements.
+    """
     if not portable.is_file() or not compressed.is_file():
         return False
-    encoded = base64.b64encode(compressed.read_bytes()).decode("ascii")
-    chunks = [encoded[index:index + 1_000_000] for index in range(0, len(encoded), 1_000_000)]
-    expected = (f'"{key}":' + json.dumps(chunks, separators=(",", ":"))).encode("ascii")
     try:
+        module = portable_builder()
+        expected = module.encode_b7(compressed.read_bytes()).encode("utf-8")
+        pattern = re.compile(
+            rb'<script type="' + re.escape(module.PAYLOAD_TYPE.encode("ascii"))
+            + rb'" data-gaius-asset="' + re.escape(key.encode("ascii"))
+            + rb'" data-part="(\d+)">([^<]*)</script>'
+        )
         with portable.open("rb") as stream, mmap.mmap(
             stream.fileno(), 0, access=mmap.ACCESS_READ
         ) as data:
-            return data.find(expected) >= 0
-    except OSError:
+            parts = [(int(match.group(1)), match.group(2)) for match in pattern.finditer(data)]
+    except (OSError, ImportError, RuntimeError, ValueError):
         return False
+    return (
+        bool(parts)
+        and [index for index, _ in parts] == list(range(len(parts)))
+        and b"".join(body for _, body in parts) == expected
+    )
 
 
 def portable_embeds_assignment(portable: Path, name: str, value: object) -> bool:
@@ -3381,6 +3433,15 @@ def check_source_patches() -> None:
             and "window.__gaiusGL.executeDraw(0,mode,first,count,0,0,0);" in text
             and "window.__gaiusGL.executeDraw(5,mode,count,type,offset,instances,baseVertex);" in text
             and "window.__gaiusGL.withGuiItemOffscreenScissorRepair(function()" not in text,
+        ),
+        (
+            "Rewritten terrain shaders fall back on compile and batches prove their lead draw",
+            "terrainShaderCompileFallbacks" in text
+            and "terrainShaderReverted" in text
+            and "terrainShaderAlternates" in text
+            and "this.drawSerial=((this.drawSerial|0)+1)|0;" in text
+            and "terrainBatchReject('no-lead-draw')" in text
+            and "terrainBatchReject('lead-draw')" in text,
         ),
         (
             "BrowserOpenGL bypasses draw cleanup machinery for stable world draws",
@@ -7694,6 +7755,63 @@ def check_source_patches() -> None:
             and "launcher template regression passed" in index_template_test
             and '"26.2.json"' in index_template_test
             and '"1.21.11.json"' in index_template_test
+        ),
+        (
+            "Every distribution ships the page runtime, the server Worker kernel scripts and the quality wiring",
+            # The profile id the quality layer reads is set in <head> before the boot tag, the
+            # tier is picked before main, and its ratio cap feeds the frame-rate governor.
+            appears_in_order(
+                index_template,
+                '<script data-gaius-profile-early="v1">',
+                '<script data-gaius-boot="v1" src="gaius-boot.js"></script>',
+                "</head>",
+            )
+            and "def patch_early_profile_id(" in postprocess_index_html
+            and "window.__gaiusApplyQualityPixelRatio = function applyGaiusQualityPixelRatio()" in index_template
+            and appears_in_order(
+                index_template,
+                "await window.__gaiusFsReady;",
+                "await window.__gaiusBoot.beforeMain();",
+                "try { GaiusQuality.caps.ensureTier(); } catch (e) {}",
+                "window.__gaiusApplyQualityPixelRatio();",
+                "main(window.__gaiusDefaultArgs);",
+            )
+            and "if (gaiusRenderScaleGovernsFps()) {" in index_template
+            and 'urlParams.get("gaiusPixelated") === "0"' in index_template
+            # Local dist and release stage the runtime next to index.html; the portable page
+            # inlines it with inert copies of the server Worker's scripts; the boot script hands
+            # those scripts and the worldgen and light switches to the server Worker.
+            and appears_in_order(build_teavm, "gaius_teavm_publish_bundle", "build-wasm-variants.sh", "stage-web-runtime.py")
+            and appears_in_order(
+                build_version_release,
+                "build-wasm-variants.sh",
+                "stage-web-runtime.py",
+                "export GAIUS_KERNELS_PREPARED=1",
+                "build-teavm-release.sh",
+                "build-pages-site.py",
+            )
+            and "SERVER_WORKER_MODULES" in build_portable_html
+            and 'data-gaius-worker-script="{name}"' in build_portable_html
+            and "kernelScripts: serverWorkerKernelScripts()" in source_text("port/web/boot/gaius-boot.js")
+            and "lightKernel: serverLightConfig()" in source_text("port/web/boot/gaius-boot.js")
+            and "root.__gaiusLightKernelConfig = Object.assign(" in server_worker_bootstrap
+            and all(
+                directory in BUILD_IDENTITY_SOURCE_DIRECTORIES
+                for directory in ("port/web/boot", "port/web/sw", "port/web/kernels", "port/web/runtime")
+            )
+            and all(
+                command in repository_guard
+                for command in (
+                    "node port/scripts/gaius-boot-smoke.mjs",
+                    "node port/scripts/launcher-quality-smoke.mjs",
+                    "node port/scripts/service-worker-headers-smoke.mjs",
+                    "node port/scripts/kernel-runtime-smoke.mjs",
+                    "python3 port/scripts/test-build-pages-site.py",
+                    "python3 port/scripts/test-stage-web-runtime.py",
+                    "./build-wasm-variants.sh --out target/kernels",
+                    "node port/scripts/worldgen-kernel-pool-smoke.mjs",
+                )
+            ),
         ),
         (
             "Portable artifact identity fixtures cover profile and gzip skew",

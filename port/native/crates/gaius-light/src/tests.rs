@@ -1,7 +1,9 @@
 //! Quick sanity checks: hand-computed scenes, and the bucket increase order
 //! against vanilla's first-in-first-out order on random columns.
 
-use crate::column::{flags, ColumnSpec, Layer, LightColumn, SIDE_EAST, SIDE_NORTH, SIDE_SOUTH, SIDE_WEST};
+use crate::column::{
+    flags, ColumnSpec, Layer, LightColumn, RING_CELLS, RING_LAYER_BYTES, SIDE_EAST, SIDE_NORTH, SIDE_SOUTH, SIDE_WEST,
+};
 use crate::section::SectionStates;
 use crate::table::{make_props, LightTable};
 use alloc::collections::BTreeMap;
@@ -376,6 +378,98 @@ fn bucket_order_matches_vanilla_order_on_random_columns() {
         assert!(
             a.0 == b.0 && a.1 == b.1,
             "after changes, seed {seed}: sky {sky_diff:?} block {block_diff:?} changes {changes:?}"
+        );
+    }
+}
+
+/// Index into a neighbour section of the cell that touches the column at
+/// `(y, along)` on `side`.
+fn facing_index(side: usize, y: usize, along: usize) -> usize {
+    let (x, z) = match side {
+        SIDE_NORTH => (along, 15),
+        SIDE_SOUTH => (along, 0),
+        SIDE_WEST => (15, along),
+        _ => (0, along),
+    };
+    (y << 8) | (z << 4) | x
+}
+
+impl Scene {
+    /// Like [`Scene::load`], but the neighbours arrive as ring slices only,
+    /// the way `light_column` jobs ship them.
+    fn load_ring(&self, column: &mut LightColumn, table: &LightTable) {
+        column.begin(self.spec()).unwrap();
+        for (section, ids) in self.states[0].iter().enumerate() {
+            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            column
+                .load_section(0, section, SectionStates::FlatU16(&bytes), table)
+                .unwrap();
+        }
+        for (light_section, &value) in self.flags[0].iter().enumerate() {
+            column.set_section_flags(0, light_section, value).unwrap();
+        }
+        for side in 0..4 {
+            if self.neighbours & (1 << side) == 0 {
+                continue;
+            }
+            let slot = side + 1;
+            for (section, ids) in self.states[slot].iter().enumerate() {
+                let mut palette: Vec<u32> = Vec::new();
+                let mut indices = vec![0u8; RING_CELLS];
+                for y in 0..16 {
+                    for along in 0..16 {
+                        let id = ids[facing_index(side, y, along)] as u32;
+                        let index = palette.iter().position(|&p| p == id).unwrap_or_else(|| {
+                            palette.push(id);
+                            palette.len() - 1
+                        });
+                        indices[(y << 4) | along] = index as u8;
+                    }
+                }
+                let indices = if palette.len() == 1 { None } else { Some(&indices[..]) };
+                column
+                    .load_ring_states(side, section, &palette, indices, table)
+                    .unwrap();
+            }
+            for (light_section, &value) in self.flags[slot].iter().enumerate() {
+                column.set_section_flags(slot, light_section, value).unwrap();
+                let (sky, block) = &self.ring_layers[slot][light_section];
+                for (layer, data) in [(Layer::Sky, sky), (Layer::Block, block)] {
+                    let mut ring = vec![0u8; RING_LAYER_BYTES];
+                    for y in 0..16 {
+                        for along in 0..16 {
+                            let i = facing_index(side, y, along);
+                            let level = (data[i >> 1] >> ((i & 1) << 2)) & 15;
+                            let r = (y << 4) | along;
+                            ring[r >> 1] |= level << ((r & 1) << 2);
+                        }
+                    }
+                    column.load_ring_layer(side, light_section, layer, &ring).unwrap();
+                }
+            }
+        }
+        column.compute_sources(table);
+    }
+}
+
+#[test]
+fn ring_slices_light_like_full_neighbour_sections() {
+    let table = table();
+    for seed in 1..21u64 {
+        let scene = random_scene(seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
+        let mut full = LightColumn::new();
+        let mut ring = LightColumn::new();
+        scene.load(&mut full, &table);
+        scene.load_ring(&mut ring, &table);
+        for column in [&mut full, &mut ring] {
+            column.enqueue_block_sources();
+            column.propagate(Layer::Block, &table);
+            column.enqueue_sky_sources();
+            column.propagate(Layer::Sky, &table);
+        }
+        assert!(
+            snapshot(&full, scene.sections) == snapshot(&ring, scene.sections),
+            "seed {seed}: ring slices light differently from full neighbour sections"
         );
     }
 }

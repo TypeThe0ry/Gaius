@@ -121,6 +121,9 @@ def main() -> int:
             'const dbName = "gaius-fs-v2-26.2"',
             'indexedDB.open(dbName, 2)',
             'window.__gaiusProfileId = "26.2"',
+            '  <script data-gaius-profile-early="v1">\n',
+            "window.__gaiusApplyQualityPixelRatio = function applyGaiusQualityPixelRatio()",
+            "try { GaiusQuality.caps.ensureTier(); } catch (e) {}",
             'window.__gaiusWorldVersion = 4903',
             'window.__gaiusStorageSchema = 2',
             'window.__gaiusStorageDatabaseName = "gaius-fs-v2-26.2"',
@@ -228,6 +231,21 @@ def main() -> int:
             raise AssertionError("postprocess is not idempotent")
         if "Index already patched" not in second.stdout:
             raise AssertionError("second postprocess did not report an idempotent result")
+        # build-pages-site.py and the release gates match the page's tags byte-for-byte, so the
+        # page is LF on every host, and a CRLF page from an earlier run is rewritten as LF.
+        if b"\r" in index.read_bytes():
+            raise AssertionError("postprocess wrote CRLF line endings")
+        index.write_bytes(index.read_bytes().replace(b"\n", b"\r\n"))
+        third = subprocess.run(
+            [sys.executable, str(POSTPROCESS), str(index), str(classes), "26.2", "32"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if third.returncode != 0:
+            raise AssertionError(f"CRLF postprocess failed:\n{third.stdout}\n{third.stderr}")
+        if index.read_bytes() != before_second_run.encode("utf-8"):
+            raise AssertionError("a CRLF page is not rewritten to the same LF page")
 
     print("Gaius browser-client shell smoke passed")
     return 0

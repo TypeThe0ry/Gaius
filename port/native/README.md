@@ -16,9 +16,15 @@ from the real client jars.
 | `crates/gaius-noise-wasm` | the `run_noise_points` kernel (cdylib) |
 | `crates/gaius-worldgen` | chunk generation from a generator IR exported by the Java side (`src/ir/mod.rs` documents the format): density evaluators for the 26.3 float sampler graph and the 26.2 double router, aquifers, ore veins, surface rules, multi-noise biomes, heightmaps |
 | `crates/gaius-worldgen-wasm` | the `load_generator` / `biomes` / `terrain` / `surface` kernels (cdylib); jobs encoded by `port/web/kernels/worldgen-job.js` |
+| `crates/gaius-mesher` | the 26.2 / 26.3 `SectionCompiler.compile` over flat section snapshots: model table, block and fluid quads, smooth lighting, tints, `VisGraph`, translucency sort |
+| `crates/gaius-mesher-wasm` | the `load_model_table` / `mesh_section` kernels and `mesh_trim` (cdylib); jobs encoded by `port/web/kernels/mesh-job.js` |
+| `crates/gaius-light` | sky and block light of one chunk column plus a one-block ring of its neighbours, following the 26.2 / 26.3 light engine |
+| `crates/gaius-light-wasm` | the `light_column` kernel and `light_trim` (cdylib); jobs encoded by `port/web/kernels/light-job.js` and by `BrowserLightKernel` on the Java side |
 | `golden/worldgen/` | vanilla comparison: exports the overworld IR and dumps density, biomes, blocks and heightmaps from the real 26.3 / 26.2 classes, then runs `tests/vanilla_reference.rs` |
 | `fixtures/<profile>/*.jsonl` | golden data, written by `golden/run-golden.sh` |
-| `build-wasm.sh`, `wasm-check.mjs` | release wasm build and its check |
+| `build-wasm.sh`, `wasm-check.mjs` | release wasm build of the noise and mesher kernels, and the check that every probe job answers like the native build |
+| `build-light-wasm.sh`, `build-worldgen-wasm.sh` | SIMD and baseline builds of the light and worldgen kernels, with their node checks |
+| `build-wasm-variants.sh`, `js/kernel-manifest.mjs` | every `crates/gaius-*-wasm` kernel in both builds plus the `kernels.json` manifest the kernel runtime loads |
 | `wasm-fixture-check.mjs`, `js/fixture-jobs.mjs` | the built wasm against the golden fixtures, jobs encoded by `port/web/kernels/noise-job.js` |
 | `golden/strict/` | JVM proof that the `StrictMath263` worldgen rewrite of the TeaVM path keeps vanilla results |
 | `teavm-fixture-check.mjs`, `js/teavm-*.mjs` | the golden fixtures through the TeaVM-compiled Java noise of a client build |
@@ -38,6 +44,8 @@ node wasm-fixture-check.mjs                       # wasm module vs golden fixtur
 node ../scripts/native-noise-pool-smoke.mjs       # wasm module through the kernel pool (worker threads)
 ./golden/strict/strict-math-check.sh              # StrictMath263 rewrite still dumps the 26.3 fixtures on the JVM
 ./build-worldgen-wasm.sh --check                   # worldgen kernel, simd128 and baseline builds, exports checked
+./build-light-wasm.sh --check                      # light kernel, both builds, through ../scripts/light-kernel-smoke.mjs
+./build-wasm-variants.sh [--out DIR]               # all kernels, both builds, and kernels.json (default target/kernels)
 GAIUS_WORLDGEN_PROFILE=26.2 ./golden/worldgen/run-worldgen-reference.sh   # kernel vs vanilla chunks (default 26.3)
 node teavm-fixture-check.mjs [classes.js]         # 26.3 fixtures through a TeaVM client build (./check.sh --teavm)
 ```
@@ -103,3 +111,27 @@ message. Details are in `crates/gaius-kernel-abi/src/lib.rs`; the
 
 On the page, `port/web/kernels/noise-job.js` (`GaiusNoiseJob`) frames
 `noise_points` jobs and reads their results for `kernel-pool.js`.
+
+Job kinds are defined once in `gaius_kernel_abi::kind`; the high byte names the
+kernel family:
+
+| Kind | Export | Kernel |
+| --- | --- | --- |
+| `0x0101` | `run_noise_points` | noise |
+| `0x0201` | `run_load_model_table` | mesher |
+| `0x0202` | `run_mesh_section` | mesher |
+| `0x0301` | `run_light_column` | light |
+| `0x0401` to `0x0404` | `run_load_generator`, `run_biomes`, `run_terrain`, `run_surface` | worldgen |
+
+A kernel may also export `trim` or `<name>_trim` (`mesh_trim`, `light_trim`):
+under memory pressure the kernel runtime asks every worker to call them, and
+they drop the cached tables and scratch buffers of the instance.
+
+The mesher and the light kernel keep a table per instance (the model table, the
+light table) and answer a job that names a table they do not hold with "table
+missing" instead of an error, so a fresh, respawned or trimmed worker recovers by
+getting the same job again with the table attached. `light_column` jobs (job
+version 2) carry only the one-block ring of the four neighbours that the column
+reads: per neighbour section a palette of the 256 cells touching the column and
+one index byte per cell, and per stored light layer the 128 bytes of those cells,
+instead of whole sections and 2048-byte layers. The kernel refuses version 1 jobs.

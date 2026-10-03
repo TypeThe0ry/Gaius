@@ -497,6 +497,11 @@
       }
     }
   </style>
+  <script data-gaius-profile-early="v1">
+    // The graphics quality layer the boot script loads caps the canvas ratio per profile, so the
+    // profile id must exist before any of it runs (postprocess-index-html.py fills it in).
+    window.__gaiusProfileId = "template";
+  </script>
   <script data-gaius-boot="v1" src="gaius-boot.js"></script>
 </head>
 <body>
@@ -658,6 +663,65 @@
       Math.min(3.0, Number.isFinite(requestedMaxDpr) && requestedMaxDpr > 0 ? requestedMaxDpr : defaultMaxDpr)
     );
     window.__gaiusDefaultMaxDpr = window.__gaiusMaxDpr;
+    // The graphics quality layer (port/web/runtime/quality, loaded by gaius-boot.js) caps the
+    // canvas ratio per GPU tier and profile: 1 on the low and mid tiers and wherever the world
+    // render scale is unavailable, more on high and ultra. Once the tier is known (right before
+    // main) that cap replaces the 1x default above, and the frame-rate governor below steps
+    // down from it. URL overrides keep precedence; without the layer nothing changes.
+    window.__gaiusApplyQualityPixelRatio = function applyGaiusQualityPixelRatio() {
+      const quality = window.GaiusQuality && window.GaiusQuality.runtime;
+      if (!quality || typeof quality.resolvePixelRatio !== "function") return false;
+      if (Number.isFinite(requestedMaxDpr) && requestedMaxDpr > 0) return false;
+      let tierDpr = NaN;
+      try {
+        tierDpr = Number(quality.resolvePixelRatio(Number(devicePixelRatio) || 1.0));
+      } catch (error) {
+        return false;
+      }
+      if (!Number.isFinite(tierDpr) || tierDpr <= 0) return false;
+      tierDpr = Math.min(3.0, tierDpr);
+      const floorDpr = Math.min(1.0, tierDpr);
+      window.__gaiusWorldMinDpr = Number.isFinite(requestedWorldMinDpr) && requestedWorldMinDpr > 0
+        ? window.__gaiusWorldMinDpr
+        : floorDpr;
+      window.__gaiusMenuMinDpr = Math.max(
+        window.__gaiusWorldMinDpr,
+        Number.isFinite(requestedMenuMinDpr) && requestedMenuMinDpr > 0 ? window.__gaiusMenuMinDpr : floorDpr
+      );
+      window.__gaiusMinDpr = window.__gaiusWorldMinDpr;
+      window.__gaiusMaxDpr = Math.max(window.__gaiusMenuMinDpr, tierDpr);
+      window.__gaiusDefaultMaxDpr = window.__gaiusMaxDpr;
+      if (window.__gaiusApplyCanvasResolution) {
+        window.__gaiusApplyCanvasResolution(window.innerWidth, window.innerHeight, true);
+      }
+      return true;
+    };
+    // A backing store below the device's pixel density (the 1x cap on a high-DPR screen, or the
+    // frame-rate governor stepping down) is magnified with nearest-neighbour sampling, so block
+    // edges and GUI pixels stay sharp instead of smeared. ?gaiusPixelated=0 keeps the browser's
+    // smooth scaling.
+    (function installGaiusCanvasSampling() {
+      const canvas = document.getElementById("mc-canvas");
+      if (!canvas || urlParams.get("gaiusPixelated") === "0") return;
+      let applied = null;
+      const update = () => {
+        const cssWidth = canvas.clientWidth || window.innerWidth || 0;
+        const devicePixels = cssWidth * (Number(window.devicePixelRatio) || 1.0);
+        const wanted = canvas.width > 0 && devicePixels > 0 && canvas.width < devicePixels - 0.5
+          ? "pixelated"
+          : "";
+        // Writing the style is itself an attribute mutation; only write a change.
+        if (wanted === applied) return;
+        applied = wanted;
+        canvas.style.imageRendering = wanted;
+      };
+      window.__gaiusUpdateCanvasSampling = update;
+      if (typeof MutationObserver === "function") {
+        new MutationObserver(update).observe(canvas, {attributes: true, attributeFilter: ["width", "height", "style"]});
+      }
+      window.addEventListener("resize", update);
+      update();
+    })();
     window.__gaiusMaxSingleBufferShadowBytes = Math.max(
       0,
       Math.min(256, Number(urlParams.get("singleShadowMB")) || 256) * 1024 * 1024
@@ -913,8 +977,27 @@
       recoveredCount: 0,
       lastSampleAt: performance.now()
     };
+    // Whether the world render scale answers low frame rates: the quality runtime's level hook is
+    // live (only a client with that hook calls it) and its scale runs in automatic mode. It then
+    // scales the 3D world alone, so the canvas ratio, which would also blur the GUI, stays put.
+    function gaiusRenderScaleGovernsFps() {
+      const quality = window.GaiusQuality;
+      if (!quality || !quality.runtime || !quality.profile) return false;
+      try {
+        const stats = quality.runtime.stats();
+        if (!stats || stats.disabled || !(stats.frames > 0)) return false;
+        return quality.profile.settings().renderScaleMode === "auto";
+      } catch (error) {
+        return false;
+      }
+    }
     function maybeDegradeResolutionForFps() {
       const fps = window.__gaiusFps;
+      if (gaiusRenderScaleGovernsFps()) {
+        fps.lowSamples = 0;
+        fps.highSamples = 0;
+        return;
+      }
       const minecraftState = window.__gaiusMinecraftState || null;
       const inWorld = !!(minecraftState && minecraftState.level);
       const screenName = minecraftState && minecraftState.screen ? String(minecraftState.screen) : "";
@@ -3570,6 +3653,10 @@
 	        setStatus("running", "classes.js loaded; calling net.minecraft.client.main.Main.main(args)...\n" + window.__gaiusDisplayArgs.join(" "), 68, "Starting Gaius Client...");
 	        // Runtime modules (kernels, quality tiers) and eager sounds, bounded by gaius-boot.js.
 	        if (window.__gaiusBoot) await window.__gaiusBoot.beforeMain();
+	        // The quality tier picks the first-launch option defaults (BrowserFilePersistence) and
+	        // the canvas ratio cap; ensureTier is cached, so the boot script's call is not repeated.
+	        try { GaiusQuality.caps.ensureTier(); } catch (e) {}
+	        if (window.__gaiusApplyQualityPixelRatio) window.__gaiusApplyQualityPixelRatio();
 	        await waitForPaint();
 	        bootTimings.mainStart = performance.now();
 	        main(window.__gaiusDefaultArgs);

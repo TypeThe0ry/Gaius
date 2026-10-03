@@ -14,9 +14,12 @@
 //    it is served cache-first from "gaius-immutable-v1" (query strings ignored) and fetched and
 //    stored once on a miss. Chrome keeps V8 code caches for scripts and wasm stored this way,
 //    which is what makes a warm boot fast. The page sends {type: "gaius-sw-prune", generation,
-//    keep: [urls]} after it booted; entries outside the last two generations are deleted.
+//    keep: [urls]} after it booted; entries under this worker's scope outside the last two
+//    generations are deleted (sibling profiles on the same origin share the cache and prune
+//    their own scopes). Entries over 4 MB are not stored while less than 1 GB of quota is left.
 // 3. Everything else same-origin is network-first; navigations and small files fall back to
 //    "gaius-shell-v1" when the network fails, so a cached site still starts offline.
+// 4. A CacheStorage failure never fails a request: it is fetched from the network instead.
 //
 // file:// pages have no Service Worker; the portable single-file build never registers one.
 // The policy functions are exposed as self.GaiusServiceWorker for the node smoke.
@@ -33,6 +36,8 @@
   const SHELL_MAX_BYTES = 4 * 1024 * 1024;
   const NULL_BODY_STATUS = [101, 103, 204, 205, 304];
   const GENERATIONS_KEPT = 2;
+  const LARGE_ENTRY_BYTES = 4 * 1024 * 1024;
+  const QUOTA_RESERVE_BYTES = 1024 * 1024 * 1024;
 
   function configFromUrl(href) {
     let coep = "credentialless";
@@ -116,10 +121,29 @@
     const config = deps.config;
     const scopeOrigin = deps.scopeOrigin;
     const scopeUrl = deps.scopeUrl;
+    const estimate = deps.estimate;
+    // Sibling profiles (<repo>/26.2/, <repo>/26.3/, ...) register their own workers on this
+    // origin and share its CacheStorage; this worker only manages entries under its scope.
+    const scopePrefix = scopeUrl ? stripSearch(scopeUrl) : "";
+    const inScope = (request) => stripSearch(typeof request === "string" ? request : request.url).indexOf(scopePrefix) === 0;
     const waitUntil = (event, promise) => {
       if (event && typeof event.waitUntil === "function") event.waitUntil(promise.catch(() => {}));
       else promise.catch(() => {});
     };
+
+    // Large entries are not stored while the origin is short of quota: world saves (IndexedDB,
+    // OPFS) share it, and a cache miss only costs a download.
+    async function roomFor(response) {
+      const length = Number(response.headers.get("Content-Length"));
+      if (!(length > LARGE_ENTRY_BYTES) || typeof estimate !== "function") return true;
+      try {
+        const quota = await estimate();
+        if (!quota || !(quota.quota > 0)) return true;
+        return quota.quota - (quota.usage || 0) - length >= QUOTA_RESERVE_BYTES;
+      } catch (_) {
+        return true;
+      }
+    }
 
     async function immutable(event, request) {
       const cache = await caches.open(IMMUTABLE_CACHE);
@@ -127,7 +151,8 @@
       if (hit) return {response: hit, source: "cache"};
       const response = await fetchFn(request);
       if (cacheable(response)) {
-        waitUntil(event, cache.put(stripSearch(request.url), response.clone()));
+        const copy = response.clone();
+        waitUntil(event, roomFor(copy).then((room) => room ? cache.put(stripSearch(request.url), copy) : null));
       }
       return {response, source: "network"};
     }
@@ -199,6 +224,8 @@
       let deleted = 0;
       for (const request of await cache.keys()) {
         const href = stripSearch(typeof request === "string" ? request : request.url);
+        // Another profile's entries belong to that profile's worker and generations.
+        if (!inScope(request)) continue;
         if (!union.has(href)) {
           await cache.delete(request);
           deleted++;
@@ -210,7 +237,7 @@
 
     async function status() {
       const cache = await caches.open(IMMUTABLE_CACHE);
-      const keys = await cache.keys();
+      const keys = (await cache.keys()).filter(inScope);
       return {type: "gaius-sw-status", version: SW_VERSION, coep: config.coep, immutableEntries: keys.length};
     }
 
@@ -239,6 +266,8 @@
     config: configFromUrl(scope.location.href),
     scopeOrigin: new URL(scopeUrl).origin,
     scopeUrl,
+    estimate: scope.navigator && scope.navigator.storage && typeof scope.navigator.storage.estimate === "function"
+      ? () => scope.navigator.storage.estimate() : null,
   });
   api.worker = worker;
 
@@ -252,7 +281,12 @@
 
   scope.addEventListener("fetch", (event) => {
     if (strategyFor(event.request, new URL(scopeUrl).origin) === "passthrough") return;
-    event.respondWith(worker.handle(event).then((result) => result ? result.response : scope.fetch(event.request)));
+    event.respondWith(worker.handle(event)
+      .then((result) => result ? result.response : scope.fetch(event.request))
+      // A CacheStorage failure (quota, a damaged store, storage blocked by policy) never fails
+      // the request: it goes to the network as if this worker kept no cache.
+      .catch(() => scope.fetch(event.request)
+        .then((response) => withIsolationHeaders(response, event.request, worker.config))));
   });
 
   scope.addEventListener("message", (event) => {

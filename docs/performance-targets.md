@@ -334,6 +334,86 @@ reports differences in interval, tick-work, and wait-phase counters for the
 measured window. Missing or reset counters are `null`, never zero. Pair these
 counts with visible entity movement and message-delay evidence.
 
+## Runtime Switches
+
+The runtime paths below can be switched back to their vanilla behavior or pinned
+for a run, so a measurement can attribute a change to one feature. Switches are
+page URL query parameters; where a setting persists, the `localStorage` key is
+listed. Unless a row lists other values, a switch is turned off with `0`,
+`false` or `off`, and parameter names are case-sensitive.
+
+### Terrain draw path
+
+These apply to the 26.2 and 26.3 renderers; 1.21.11 keeps its legacy section
+renderer.
+
+| Switch | Effect |
+| --- | --- |
+| `gaiusTerrainBatch=0` | No terrain shader rewrite and no draw batches: every section is drawn by its vanilla call. `globalThis.__gaiusTerrainBatch = false` does the same. |
+| `gaiusMultiDraw=0` | Batches do not use `WEBGL_multi_draw`; each section is drawn with the `gaius_DrawId` uniform instead. |
+| `gaiusQuadIndex=0` | Sequential quad element buffers are not mapped onto the shared quad index buffer. |
+| `gaiusBakedIndex=0` | Custom index heaps (translucent terrain) get no baked base-vertex index copies. |
+| `gaiusElementShadow=always` | Keeps a CPU shadow of every element buffer, as before v0.4.0, when the context has no usable base-vertex extension. |
+| `gaiusTerrainAlign=0` | Keeps the vanilla section vertex heap alignment instead of 4-vertex alignment (`0` or `false` only). |
+| `gaiusNeighborGate=vanilla` | Compiles a dirty section only once all eight neighbor chunks are ready, like the desktop game. `gaiusNeighborGate=provisional` restores the v0.2 center-only gate. |
+| `gaiusAnisotropy=0` | Does not enable `EXT_texture_filter_anisotropic`. |
+
+### Quality layer
+
+`port/web/runtime/quality/` turns the GPU tier into runtime settings. The world
+render scale, its upscaler and the post-processing chain are used by the 26.3
+renderer; `?gaiusPost=0&gaiusRenderScale=1&gaiusOit=0` is the vanilla setup.
+
+| Switch | Effect |
+| --- | --- |
+| `gaiusTier=low\|mid\|high\|ultra` | Pins the GPU tier for the page. A tier chosen in the game is stored as `gaius.quality.tierOverride`; `gaiusTier=auto` clears it. |
+| `gaiusGpuRebench=1` | Discards the remembered GPU benchmark (`gaius.quality.gpuTier.v1`) and measures again. |
+| `gaiusOit=0\|1` | Forces order-independent (improved) transparency off, or lifts its high/ultra tier condition. The float colour-buffer requirements still apply. |
+| `gaiusPresetReplay=1` | Re-applies the saved graphics preset at startup, the vanilla behavior (see Graphics quality pins). |
+| `gaiusRenderScale=1\|0.85\|0.75\|0.67\|0.6\|0.5\|auto` | World render scale (default 1); `auto` follows `gaiusTargetFps`. |
+| `gaiusTargetFps=<n>` | Frame-rate target of the automatic render scale (default 60, 20 to 240). |
+| `gaiusSharpness=<0..2>` | RCAS sharpening in stops, 0 being the strongest (default 0.25). |
+| `gaiusPost=0\|1` | Post-processing chain off or on (default on for the high and ultra tiers only). |
+| `gaiusPostTier=low\|mid\|high\|ultra` | Post stage set independent of the GPU tier. |
+| `gaiusFxaa=`, `gaiusTonemap=`, `gaiusSsao=`, `gaiusBloom=`, `gaiusSsr=` | Single post stages, `0` or `1`; screen-space reflections are off by default. |
+| `gaiusInventoryWorldFps=<n>` | World refresh rate behind inventory screens (0 freezes it; the default depends on the tier). |
+| `gaiusMaxDpr=<number>` | Canvas device-pixel-ratio cap (0.5 to 4; the default depends on the tier on 26.3 and is 1 on the other profiles). |
+
+The settings a player can change at runtime (`post`, `ssr`, `renderScale`,
+`sharpness`) persist in `gaius.quality.settings.v1`; a URL parameter wins over
+the stored value.
+
+### Wasm kernels
+
+| Switch | Effect |
+| --- | --- |
+| `gaiusKernels=0` | All wasm kernels off: meshing, light and world generation use the vanilla Java paths. `gaiusKernels=1` overrides a stored `enabled: false`. |
+| `gaiusKernelsOff=<names>` | Comma-separated kernels to turn off: `mesher`, `light`, `worldgen`, `noise`. |
+| `gaiusKernelSimd=0\|1` | `0` uses the baseline (non-SIMD) builds; `1` uses the SIMD builds without the feature probe. |
+| `gaiusKernelWorkers=<n>` | Fixed number of kernel workers instead of the adaptive count. |
+| `gaiusKernelBudgetMB=<n>` | Memory budget of the kernel runtime in MB. |
+| `meshKernel=0` | Sections compile on the vanilla Java path (`0`, `false`, `off` or `vanilla`). Stored setting: `gaius.meshKernel` = `off`. |
+| `gaiusMesher=0` | Turns off the mesh job codec, which also keeps the vanilla Java path (`0`, `false` or `vanilla`). Stored setting: `gaius.mesher.enabled` = `0`. |
+| `lightKernel=0` | First light of new chunks on the vanilla light engine (also spelled `lightkernel`; `0`, `off`, `false` or `no`). Stored setting: `gaius.lightKernel` = `off`. |
+| `worldgenKernel=0` | Chunk generation on the vanilla Java path (`0`, `off`, `false` or `no`), in the page or the server Worker URL. |
+| `worldgenKernelHost=auto\|shared\|worker` | Where worldgen jobs run: `shared` only through the page's kernel runtime, `worker` in kernel workers the server Worker starts itself, `auto` (default) lets the worldgen facade choose. |
+
+The kernel runtime settings persist in `gaius.kernels.settings.v1` as JSON
+`{enabled, off, simd, workers, budgetMB}` (`simd` is `"off"` or `"force"`,
+`off` a list of kernel names). Every kernel also falls back to its vanilla path
+on its own when its module cannot be compiled or loaded, or after repeated
+failures.
+
+### Boot and site
+
+| Switch | Effect |
+| --- | --- |
+| `gaiusSw=0` | Unregisters the Service Worker of the multi-file site (`0` only). |
+| `gaiusCoi=0\|credentialless\|require-corp` | Cross-origin isolation mode of the Service Worker (default `credentialless`; `0` or `off` turns it off). A stored `gaius.sw.coep` of `require-corp` or `off` is used when the parameter is absent. |
+| `gaiusSiteGzip=0\|1` | Forces whether the site loads its gzip copies of large text assets; otherwise the value learned for the host is kept in `gaius.site.gzip.v1`. |
+| `gaiusSounds=eager\|deferred` | `eager` makes the game start wait until the site's separate sound pack is merged into the vanilla assets; `deferred` starts without waiting and calls `window.__gaiusSoundReloadHook` once the pack is merged. Without the parameter the mode is `deferred` when that hook exists and `eager` otherwise. |
+| `gaiusPrefetch=0` | Does not prefetch the single-player and kernel payloads while the title screen idles (`0` only). |
+
 ## Optional structure-template preloading experiment
 
 The browser server can warm explicitly selected template IDs through its own

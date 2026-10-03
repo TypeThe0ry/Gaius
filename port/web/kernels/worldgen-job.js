@@ -20,6 +20,10 @@
 //           rigids: Int32Array of [minX, minY, minZ, maxX, maxY, maxZ, adjustment, groundDelta]*,
 //           junctions: Int32Array of [sourceX, sourceGroundY, sourceZ]*}
 // (adjustment: 0 none, 1 bury, 2 beard_thin, 3 beard_box, 4 encapsulate).
+// ringBiomes (terrain and surface options) are the global biome ids the neighbouring chunks store
+// around the chunk, 20 quart columns x the level height in quarts (job.rs documents the order); the
+// surface rules read them instead of computing those quarts. A ring naming a biome the generator
+// does not know fails the job with a "worldgen-fallback:" message.
 (function (global) {
   "use strict";
 
@@ -35,6 +39,7 @@
   });
   const FLAG_SURFACE = 1;
   const FLAG_BIOMES = 2;
+  const FLAG_RING_BIOMES = 4;
   const MISSING_PREFIX = "generator-missing:";
   const FNV_OFFSET = 0xcbf29ce484222325n;
   const FNV_PRIME = 0x100000001b3n;
@@ -138,6 +143,21 @@
     return p;
   }
 
+  function ringOf(options) {
+    const ring = options && options.ringBiomes;
+    return ring && ring.length > 0 ? ring : null;
+  }
+
+  function ringLength(ring) {
+    return ring ? 4 + 4 * ring.length : 0;
+  }
+
+  function writeRing(view, at, ring) {
+    view.setUint32(at, ring.length, true);
+    for (let i = 0; i < ring.length; i++) view.setUint32(at + 4 + 4 * i, ring[i] >>> 0, true);
+    return at + 4 + 4 * ring.length;
+  }
+
   function encodeLoad(gen, jobId, options) {
     const budgetKb = options && options.arenaBudgetKb ? options.arenaBudgetKb >>> 0 : 0;
     return frame(KINDS.load_generator, jobId, gen, true, 4, (view, at) => view.setUint32(at, budgetKb, true));
@@ -152,26 +172,30 @@
 
   function encodeTerrain(gen, chunkX, chunkZ, jobId, options, inline) {
     const o = options || {};
-    const flags = (o.surface ? FLAG_SURFACE : 0) | (o.biomes ? FLAG_BIOMES : 0);
-    return frame(KINDS.terrain, jobId, gen, inline, 12 + beardLength(o.beard), (view, at) => {
+    const ring = ringOf(o);
+    const flags = (o.surface ? FLAG_SURFACE : 0) | (o.biomes ? FLAG_BIOMES : 0) | (ring ? FLAG_RING_BIOMES : 0);
+    return frame(KINDS.terrain, jobId, gen, inline, 12 + beardLength(o.beard) + ringLength(ring), (view, at) => {
       view.setInt32(at, chunkX, true);
       view.setInt32(at + 4, chunkZ, true);
       view.setUint32(at + 8, flags, true);
-      writeBeard(view, at + 12, o.beard);
+      const end = writeBeard(view, at + 12, o.beard);
+      if (ring) writeRing(view, end, ring);
     });
   }
 
   // chunkBytes: the chunk part of a terrain result (readChunk(...).bytes).
   function encodeSurface(gen, chunk, jobId, options, inline) {
     const o = options || {};
+    const ring = ringOf(o);
     const bytes = toBytes(chunk.bytes || chunk);
-    const head = 12 + beardLength(o.beard);
+    const head = 12 + beardLength(o.beard) + ringLength(ring);
     const chunkAt = pad(head, 8);
     return frame(KINDS.surface, jobId, gen, inline, chunkAt + bytes.length, (view, at) => {
       view.setInt32(at, chunk.chunkX | 0, true);
       view.setInt32(at + 4, chunk.chunkZ | 0, true);
-      view.setUint32(at + 8, 0, true);
-      writeBeard(view, at + 12, o.beard);
+      view.setUint32(at + 8, ring ? FLAG_RING_BIOMES : 0, true);
+      const end = writeBeard(view, at + 12, o.beard);
+      if (ring) writeRing(view, end, ring);
       new Uint8Array(view.buffer, view.byteOffset + at + chunkAt, bytes.length).set(bytes);
     });
   }
@@ -327,7 +351,7 @@
   }
 
   global.GaiusWorldgenJob = Object.freeze({
-    ABI_VERSION, KINDS, FLAG_SURFACE, FLAG_BIOMES,
+    ABI_VERSION, KINDS, FLAG_SURFACE, FLAG_BIOMES, FLAG_RING_BIOMES,
     simdSupported, pickModule, compileModule, fnv1a64, generator,
     encodeLoad, encodeBiomes, encodeTerrain, encodeSurface,
     readResult, readLoadInfo, readBiomes, readChunk, sectionState, isGeneratorMissing,

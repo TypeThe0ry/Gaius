@@ -6,7 +6,8 @@ use gaius_kernel_abi::{
 use gaius_noise::Profile;
 use gaius_worldgen::beard::Beard;
 use gaius_worldgen::ir::example::overworld;
-use gaius_worldgen_wasm::job::{self, encode_surface, encode_terrain, write_ref};
+use gaius_worldgen::Generator;
+use gaius_worldgen_wasm::job::{self, encode_surface, encode_surface_with, encode_terrain, write_ref, write_ring};
 
 fn run(
     kind: u16,
@@ -86,5 +87,125 @@ fn jobs_round_trip_through_the_framing() {
         assert_eq!(status, 0);
         let b = payload_of(&data);
         assert_eq!(b.len(), 8 + 24 * 64 * 4);
+    }
+}
+
+/// The ring a server would send for chunk (cx, cz) when every neighbour stores the biomes this
+/// generator computes for it.
+fn computed_ring(generator: &mut Generator, cx: i32, cz: i32) -> Vec<u32> {
+    let size_y = generator.section_count() as i32 * 4;
+    let mut neighbours = std::collections::HashMap::new();
+    let mut ring = Vec::new();
+    for gx in 0..6 {
+        for gz in 0..6 {
+            if (1..=4).contains(&gx) && (1..=4).contains(&gz) {
+                continue;
+            }
+            let (qx, qz) = (cx * 4 - 1 + gx, cz * 4 - 1 + gz);
+            let ids = neighbours
+                .entry((qx >> 2, qz >> 2))
+                .or_insert_with(|| generator.run_biomes(qx >> 2, qz >> 2));
+            for y in 0..size_y {
+                let at = (y >> 2) * 64 + ((y & 3) * 4 + (qz & 3)) * 4 + (qx & 3);
+                ring.push(ids[at as usize]);
+            }
+        }
+    }
+    ring
+}
+
+#[test]
+fn ring_biomes_reach_terrain_and_surface_jobs() {
+    for (key, profile) in [(11u32, Profile::V26_2), (12, Profile::V26_3)] {
+        job::clear_cache();
+        let ir = overworld(profile, 777).encode();
+        let mut generator = Generator::load(&ir).expect("loads");
+        let (cx, cz) = (-2, 3);
+        let ring = computed_ring(&mut generator, cx, cz);
+        assert_eq!(ring.len(), generator.ring_len());
+
+        let plain = encode_terrain(key, &ir, true, cx, cz, job::FLAG_SURFACE, &Beard::default());
+        let (status, data) = run(job::KIND_TERRAIN, &plain, job::terrain);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        let expected = payload_of(&data).to_vec();
+
+        // Neighbours storing what the kernel computes change nothing.
+        let mut seeded = encode_terrain(
+            key,
+            &ir,
+            false,
+            cx,
+            cz,
+            job::FLAG_SURFACE | job::FLAG_RING_BIOMES,
+            &Beard::default(),
+        );
+        write_ring(&mut seeded, &ring);
+        let (status, data) = run(job::KIND_TERRAIN, &seeded, job::terrain);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        assert_eq!(payload_of(&data), &expected[..], "{profile:?}: ring of computed biomes");
+
+        let fill = encode_terrain(key, &ir, false, cx, cz, 0, &Beard::default());
+        let (status, data) = run(job::KIND_TERRAIN, &fill, job::terrain);
+        assert_eq!(status, 0);
+        let filled = payload_of(&data).to_vec();
+        let surface = encode_surface_with(key, &ir, false, (cx, cz), &Beard::default(), Some(&ring), &filled);
+        let (status, data) = run(job::KIND_SURFACE, &surface, job::surface);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        assert_eq!(
+            &payload_of(&data)[24..],
+            &expected[24..],
+            "{profile:?}: surface job with a ring"
+        );
+
+        // The surface rules read the ring: neighbours that all store the example's badlands
+        // (global id 42, clay bands) change the border columns.
+        assert!(
+            ring.iter().any(|&id| id != 42),
+            "{profile:?}: pick a chunk outside the badlands"
+        );
+        let badlands = vec![42u32; ring.len()];
+        let surface = encode_surface_with(key, &ir, false, (cx, cz), &Beard::default(), Some(&badlands), &filled);
+        let (status, data) = run(job::KIND_SURFACE, &surface, job::surface);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        assert!(
+            payload_of(&data)[24..] != expected[24..],
+            "{profile:?}: the surface rules ignored the ring"
+        );
+
+        // A neighbour biome outside the generator's table only refuses this chunk.
+        let mut foreign = ring.clone();
+        foreign[7] = 0x7fff_0000;
+        let surface = encode_surface_with(key, &ir, false, (cx, cz), &Beard::default(), Some(&foreign), &filled);
+        let (status, data) = run(job::KIND_SURFACE, &surface, job::surface);
+        assert_eq!(status, Status::BadPayload as u32);
+        assert!(String::from_utf8_lossy(&data).starts_with(job::FALLBACK_PREFIX));
+        let mut unknown = encode_terrain(
+            key,
+            &ir,
+            false,
+            cx,
+            cz,
+            job::FLAG_SURFACE | job::FLAG_RING_BIOMES,
+            &Beard::default(),
+        );
+        write_ring(&mut unknown, &foreign);
+        let (status, data) = run(job::KIND_TERRAIN, &unknown, job::terrain);
+        assert_eq!(status, Status::BadPayload as u32);
+        assert!(String::from_utf8_lossy(&data).starts_with(job::FALLBACK_PREFIX));
+
+        // A ring of the wrong size is a broken job, not a fallback.
+        let mut short = encode_terrain(
+            key,
+            &ir,
+            false,
+            cx,
+            cz,
+            job::FLAG_SURFACE | job::FLAG_RING_BIOMES,
+            &Beard::default(),
+        );
+        write_ring(&mut short, &ring[1..]);
+        let (status, data) = run(job::KIND_TERRAIN, &short, job::terrain);
+        assert_eq!(status, Status::BadPayload as u32);
+        assert!(!String::from_utf8_lossy(&data).starts_with(job::FALLBACK_PREFIX));
     }
 }

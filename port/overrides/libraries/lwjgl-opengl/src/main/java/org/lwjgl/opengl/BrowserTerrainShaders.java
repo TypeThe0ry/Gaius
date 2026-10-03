@@ -20,8 +20,10 @@ import java.util.List;
  * whose members are exactly one {@code ivec3} and one {@code float} (26.3 renames blocks to
  * {@code _uniform_SS_BB}). Vertex shaders also export the selected values as flat varyings for
  * fragment shaders that read the visibility directly (26.2 terrain.fsh). Sources without such
- * a block are returned unchanged. A program whose rewritten shaders do not link is relinked
- * from the original sources by BrowserOpenGL.</p>
+ * a block are returned unchanged. BrowserOpenGL never lets a rewrite cost a pipeline: a
+ * rewritten shader that does not compile is recompiled from the mode 2 rewrite (in mode 1) or
+ * from its original source, and a program whose rewritten shaders do not link, or that mixes
+ * them with a reverted shader, is relinked from the original sources.</p>
  */
 final class BrowserTerrainShaders {
     static final String BLOCK_NAME = "GaiusChunkSections";

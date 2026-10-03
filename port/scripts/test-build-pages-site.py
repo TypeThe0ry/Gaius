@@ -134,6 +134,29 @@ class BuildPagesSiteTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 SITE.build(dist, root / "site", None, True)
 
+    def test_crlf_page_is_wired_like_an_lf_page(self) -> None:
+        # postprocess-index-html.py on a Windows host once wrote dist/index.html with CRLF.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist = make_dist(root)
+            (dist / "index.html").write_bytes(INDEX.replace("\n", "\r\n").encode("utf-8"))
+            SITE.build(dist, root / "site", None, True)
+            assets = json.loads((root / "site" / "gaius-site.json").read_text(encoding="utf-8"))["assets"]
+            index = (root / "site" / "index.html").read_bytes().decode("utf-8")
+            self.assertNotIn("\r", index)
+            self.assertIn('<script data-gaius-boot="v1" src="' + assets["gaius-boot.js"] + '"></script>', index)
+            self.assertIn('src="' + assets["gaius-shader-toolchain.js"] + '"', index)
+            self.assertNotIn("gaius-shader-toolchain.js?v=", index)
+
+    def test_unrecognised_toolchain_loader_tag_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist = make_dist(root)
+            (dist / "index.html").write_bytes(
+                INDEX.replace('data-profile="26.3" src=', 'data-profile="26.3" defer src=').encode("utf-8"))
+            with self.assertRaises(RuntimeError):
+                SITE.build(dist, root / "site", None, True)
+
     def test_hashed_names(self) -> None:
         self.assertRegex(SITE.hashed_name("classes.js", b"x"), r"^classes\.[0-9a-f]{16}\.js$")
         self.assertRegex(SITE.hashed_name("vanilla-assets.pack.gz", b"x"), r"^vanilla-assets\.pack\.[0-9a-f]{16}\.gz$")

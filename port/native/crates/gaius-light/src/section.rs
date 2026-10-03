@@ -59,8 +59,20 @@ fn read_var_int(bytes: &[u8], at: &mut usize) -> Result<u32, &'static str> {
     Err("section palette VarInt is too long")
 }
 
+/// Props with zero dampening and an empty shape.
 #[inline(always)]
-fn lookup(table: &LightTable, id: u32) -> Result<Props, &'static str> {
+pub(crate) const fn transparent_props(props: Props) -> bool {
+    props & 0xff0f == 0
+}
+
+/// Props with a non-zero light emission.
+#[inline(always)]
+pub(crate) const fn emitting_props(props: Props) -> bool {
+    props & 0x00f0 != 0
+}
+
+#[inline(always)]
+pub(crate) fn lookup(table: &LightTable, id: u32) -> Result<Props, &'static str> {
     table
         .props(id)
         .ok_or("section names a block state outside the light table")
@@ -137,10 +149,10 @@ impl<'a> DecodedSection<'a> {
     /// dampening and an empty shape (air, most plants, glass is not one).
     pub fn is_transparent(&self) -> bool {
         match self.kind {
-            Kind::Uniform(props) => props & 0xff0f == 0,
+            Kind::Uniform(props) => transparent_props(props),
             Kind::Packed {
                 palette: Some(palette), ..
-            } => palette.iter().all(|&p| p & 0xff0f == 0),
+            } => palette.iter().all(|&p| transparent_props(p)),
             _ => false,
         }
     }
@@ -148,10 +160,10 @@ impl<'a> DecodedSection<'a> {
     /// True when some cell may emit light.
     pub fn may_emit(&self) -> bool {
         match self.kind {
-            Kind::Uniform(props) => props & 0x00f0 != 0,
+            Kind::Uniform(props) => emitting_props(props),
             Kind::Packed {
                 palette: Some(palette), ..
-            } => palette.iter().any(|&p| p & 0x00f0 != 0),
+            } => palette.iter().any(|&p| emitting_props(p)),
             _ => true,
         }
     }

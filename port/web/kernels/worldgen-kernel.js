@@ -42,6 +42,11 @@
 // a byte budget) under a token; submitSurfaceStored(token) later runs the kernel surface rules on
 // it and reports only the blocks the rules changed.
 //
+// Ring biomes: submitTerrain / submitSurface / submitSurfaceStored take an optional last argument,
+// the global biome ids the neighbouring chunks store around the chunk (Int32Array; empty or
+// missing: the kernel computes them). A ring the kernel cannot use ("worldgen-fallback:") is a
+// transient refusal: that chunk takes the Java path.
+//
 // Off-switch: `worldgenKernel=0` (or `off`/`false`/`no`) in the page or worker URL,
 // `__gaiusWorldgenKernelConfig.enabled === false`, or the shared runtime's own switches
 // (?gaiusKernels=0, ?gaiusKernelsOff=worldgen). A job refused for a transient reason (memory
@@ -56,6 +61,7 @@
   const TERRAIN_RESULT_BYTES = 256 * 1024;
   const BIOMES_RESULT_BYTES = 8 * 1024;
   const FLAG_KEEP_NOISE = 1 << 8;
+  const FALLBACK_PREFIX = "worldgen-fallback:";
   const KERNEL_FLAGS_MASK = 0xff;
   const DEFAULT_DEADLINE_MS = 60000;
   const WATCHDOG_INTERVAL_MS = 1000;
@@ -100,6 +106,8 @@
     evicted: 0,
     surfaces: 0,
     surfaceChanges: 0,
+    ringJobs: 0,
+    ringFallbacks: 0,
   };
 
   function config() {
@@ -370,8 +378,14 @@
     return error && error.message ? error.message : String(error);
   }
 
+  // A kernel refusal of one chunk's input (a neighbour biome outside the generator's table).
+  function isFallback(error) {
+    return !!error && typeof error === "object" && typeof error.message === "string"
+      && error.message.indexOf(FALLBACK_PREFIX) >= 0;
+  }
+
   function isTransient(error) {
-    return !!error && typeof error === "object" && TRANSIENT_CODES.has(error.code);
+    return !!error && typeof error === "object" && (TRANSIENT_CODES.has(error.code) || isFallback(error));
   }
 
   function transientError(code, message) {
@@ -436,6 +450,7 @@
         job.onResult(value);
       } else if (isTransient(value)) {
         state.transient++;
+        if (isFallback(value)) state.ringFallbacks++;
         job.onError("transient:" + messageOf(value));
       } else {
         generatorFailed(job.key, value);
@@ -660,14 +675,22 @@
 
   // ---- Java entry points ----
 
-  function submitTerrain(key, chunkX, chunkZ, flags, beard, onResult, onError) {
+  function ringOf(ring) {
+    if (!ring || !(ring.length > 0)) return null;
+    state.ringJobs++;
+    return ring;
+  }
+
+  function submitTerrain(key, chunkX, chunkZ, flags, beard, onResult, onError, ringBiomes) {
     const J = global.GaiusWorldgenJob;
     const keep = (flags & FLAG_KEEP_NOISE) !== 0;
     const kernelFlags = flags & KERNEL_FLAGS_MASK;
+    const ring = ringOf(ringBiomes);
     submit(key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.terrain(r, handle, chunkX, chunkZ, {
       surface: (kernelFlags & J.FLAG_SURFACE) !== 0,
       biomes: (kernelFlags & J.FLAG_BIOMES) !== 0,
       beard: beardOf(beard),
+      ringBiomes: ring,
     }, opts).then((chunk) => {
       const flat = flatten(chunk);
       if (keep && (kernelFlags & J.FLAG_SURFACE) === 0) flat.token = storeChunk(chunk);
@@ -682,14 +705,16 @@
   }
 
   // Surface rules on raw chunk bytes (the chunk part of an earlier terrain result).
-  function submitSurface(key, chunkBytes, chunkX, chunkZ, beard, onResult, onError) {
+  function submitSurface(key, chunkBytes, chunkX, chunkZ, beard, onResult, onError, ringBiomes) {
     const J = global.GaiusWorldgenJob;
+    const ring = ringOf(ringBiomes);
     submit(key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.surface(r, handle,
-      {bytes: chunkBytes, chunkX, chunkZ}, {beard: beardOf(beard)}, opts).then(flatten), onResult, onError);
+      {bytes: chunkBytes, chunkX, chunkZ}, {beard: beardOf(beard), ringBiomes: ring}, opts).then(flatten),
+      onResult, onError);
   }
 
   // Surface rules on a kept noise chunk; reports the changed blocks only. The entry is consumed.
-  function submitSurfaceStored(key, token, chunkX, chunkZ, beard, onResult, onError) {
+  function submitSurfaceStored(key, token, chunkX, chunkZ, beard, onResult, onError, ringBiomes) {
     const entry = state.store.get(token);
     if (!entry || entry.chunk.chunkX !== chunkX || entry.chunk.chunkZ !== chunkZ) {
       if (entry) dropStored(token);
@@ -700,8 +725,9 @@
     dropStored(token);
     const J = global.GaiusWorldgenJob;
     const before = entry.chunk;
+    const ring = ringOf(ringBiomes);
     submit(key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.surface(r, handle,
-      {bytes: before.bytes, chunkX, chunkZ}, {beard: beardOf(beard)}, opts).then((after) => {
+      {bytes: before.bytes, chunkX, chunkZ}, {beard: beardOf(beard), ringBiomes: ring}, opts).then((after) => {
       const diff = surfaceDiff(before, after);
       state.surfaces++;
       state.surfaceChanges += diff.count;
@@ -736,6 +762,8 @@
       evicted: state.evicted,
       surfaces: state.surfaces,
       surfaceChanges: state.surfaceChanges,
+      ringJobs: state.ringJobs,
+      ringFallbacks: state.ringFallbacks,
       pool: state.pool ? state.pool.telemetry() : null,
       hostRuntime: state.runtime ? state.runtime.telemetry() : null,
     };
@@ -743,6 +771,7 @@
 
   global.GaiusWorldgenKernel = Object.freeze({
     FLAG_KEEP_NOISE,
+    FALLBACK_PREFIX,
     start,
     usable,
     status: () => state.status,

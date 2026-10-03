@@ -80,6 +80,8 @@ pub struct BiomeGrid {
 }
 
 pub const GRID_XZ: i32 = 6;
+/// Grid columns outside the chunk (the 6 x 6 grid minus the chunk's 4 x 4).
+pub const RING_COLUMNS: usize = 20;
 const UNKNOWN: u16 = u16::MAX;
 
 impl BiomeGrid {
@@ -121,6 +123,31 @@ impl BiomeGrid {
     #[inline]
     pub fn set_index(&mut self, i: usize, biome: u16) {
         self.values[i] = biome;
+    }
+
+    /// Whether grid column (`x`, `z`) (grid-relative) lies outside the chunk.
+    #[inline]
+    pub fn is_ring_column(x: i32, z: i32) -> bool {
+        !(1..=4).contains(&x) || !(1..=4).contains(&z)
+    }
+
+    /// Fills the quarts outside the chunk with `ring`: per ring column in grid order (x, then
+    /// z), every quart y from the bottom. These are the biomes the neighbouring chunks store,
+    /// which is what vanilla's `BiomeManager` reads through the `WorldGenRegion`.
+    pub fn seed_ring(&mut self, ring: &[u16]) {
+        let size_y = self.size_y as usize;
+        assert_eq!(ring.len(), RING_COLUMNS * size_y, "ring biome count");
+        let mut k = 0;
+        for x in 0..GRID_XZ {
+            for z in 0..GRID_XZ {
+                if !Self::is_ring_column(x, z) {
+                    continue;
+                }
+                let base = ((x * GRID_XZ + z) * self.size_y) as usize;
+                self.values[base..base + size_y].copy_from_slice(&ring[k..k + size_y]);
+                k += size_y;
+            }
+        }
     }
 }
 
@@ -281,5 +308,31 @@ mod tests {
             assert_eq!(low, 0.8);
             assert!(high < low);
         }
+    }
+
+    #[test]
+    fn ring_seeds_only_the_quarts_outside_the_chunk() {
+        let (cx, cz) = (-3, 7);
+        let mut grid = BiomeGrid::new(cx, cz, -64, 384);
+        let size_y = grid.size_y;
+        let ring: Vec<u16> = (0..RING_COLUMNS as i32 * size_y).map(|i| (i % 1000) as u16).collect();
+        grid.seed_ring(&ring);
+        let mut k = 0;
+        for x in 0..GRID_XZ {
+            for z in 0..GRID_XZ {
+                let (qx, qz) = ((cx << 2) - 1 + x, (cz << 2) - 1 + z);
+                let outside = !(0..4).contains(&(qx - (cx << 2))) || !(0..4).contains(&(qz - (cz << 2)));
+                for y in 0..size_y {
+                    let i = grid.index(qx, grid.min_qy + y, qz).expect("inside the grid");
+                    if outside {
+                        assert_eq!(grid.get_index(i), Some(ring[k]));
+                        k += 1;
+                    } else {
+                        assert_eq!(grid.get_index(i), None);
+                    }
+                }
+            }
+        }
+        assert_eq!(k, ring.len());
     }
 }

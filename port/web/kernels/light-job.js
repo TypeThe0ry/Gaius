@@ -10,11 +10,18 @@
 //   const job = GaiusLightJob.lightColumn({
 //     ops: GaiusLightJob.OPS.INITIAL, sky: true, block: true, emitOutgoing: true,
 //     chunkX, chunkZ, minSection: -4, sectionCount: 24, skyBottomSection: -5,
-//     table: tableBytes, tableEpoch: epoch,
+//     table: tableBytes, tableEpoch: epoch,           // table optional, see below
 //     column: {flags, sections, sky, block},          // see below
 //     neighbours: {north, south, west, east},         // same shape, omitted = not loaded
 //     checks: [x, y, z, ...]}, jobId);
-//   const result = GaiusLightJob.readLightColumn(await pool.submit("light_column", job), jobId);
+//   let result = GaiusLightJob.readLightColumn(await pool.submit("light_column", job), jobId);
+//   if (result.tableMissing) ... resubmit GaiusLightJob.withTable(job, tableBytes)
+//
+// A job may leave the table out (table_len 0) and name only its epoch: an instance that holds
+// that epoch reuses it, any other answers {tableMissing: true}, and withTable() splices the
+// table into the same job for the resend. Job version 2 ships neighbours as ring slices (the
+// one-block ring the kernel reads); the kernel refuses version 1 jobs, so a stale module and a
+// new page never mix silently.
 //
 // In the server Worker, GaiusLightJob.installHost(runner, {enabled}) exposes a kernel pool or the
 // kernel runtime to the Java light engine (BrowserLightKernel), which encodes and decodes the
@@ -23,13 +30,17 @@
 // A slot ({column} or a neighbour) is {flags, sections, sky, block}:
 //   flags     Uint8Array(sectionCount + 2) of SECTION_FLAGS storing bits per light section
 //             (index 0 = the padding section below the world); the data bits are added here
-//   sections  sectionCount entries: Uint8Array of PalettedContainer.write bytes (encoding
-//             NETWORK), {single: stateId}, {flat: Uint16Array(4096)} or {encoding, bytes}
-//   sky/block optional arrays of sectionCount + 2 entries: a 2048-byte DataLayer or null
+//   sections  sectionCount entries. Column: Uint8Array of PalettedContainer.write bytes
+//             (encoding NETWORK), {single: stateId}, {flat: Uint16Array(4096)} or
+//             {encoding, bytes}. Neighbour: {single: stateId}, {ring: 256 ids} (the cells that
+//             touch the column, (y << 4) | along) or {flat: Uint16Array(4096)} (the ring is cut
+//             out of it here)
+//   sky/block optional arrays of sectionCount + 2 entries: a 2048-byte DataLayer or null; a
+//             neighbour may also give the 128-byte ring slice of a layer
 //
-// result: {lightSections, sectionFlags, sky[], block[] (Uint8Array views or null),
-//          outgoing: {count, kind, side, along, level, y, entry, count16} (struct of arrays),
-//          stats: {increasePops, decreasePops}}
+// result: {tableMissing, lightSections, sectionFlags, sky[], block[] (Uint8Array views or
+//          null), outgoing: {count, kind, side, along, level, y, entry, count16} (struct of
+//          arrays), stats: {increasePops, decreasePops}}
 (function (global) {
   "use strict";
 
@@ -38,10 +49,14 @@
   const RESULT_MAGIC = 0x53524b47;  // "GKRS"
   const HEADER_LEN = 16;
   const KIND_LIGHT_COLUMN = 0x0301;
-  const JOB_VERSION = 1;
+  const JOB_VERSION = 2;
+  const RESULT_VERSION = 2;
   const PAYLOAD_HEADER_LEN = 48;
   const RESULT_HEADER_LEN = 32;
   const LAYER_BYTES = 2048;
+  const RING_CELLS = 256;
+  const RING_LAYER_BYTES = 128;
+  const RESULT_TABLE_MISSING = 1;
   const OUTGOING_LEN = 12;
   const MAX_SECTIONS = 254;
 
@@ -50,7 +65,7 @@
     SKY: 1, BLOCK: 2, SKY_LIGHT_ON: 4, BLOCK_LIGHT_ON: 8, PULL_RING: 16, EMIT_OUTGOING: 32, OMIT_UNCHANGED: 64,
   });
   const SECTION_FLAGS = Object.freeze({SKY_STORING: 1, BLOCK_STORING: 2, SKY_DATA: 4, BLOCK_DATA: 8});
-  const ENCODING = Object.freeze({SINGLE: 0, NETWORK: 1, FLAT_U16: 2});
+  const ENCODING = Object.freeze({SINGLE: 0, NETWORK: 1, FLAT_U16: 2, RING_PALETTE: 3});
   const OUTGOING = Object.freeze({SKY_INCREASE: 0, BLOCK_INCREASE: 1, SKY_DECREASE: 2, BLOCK_DECREASE: 3});
   // Ring side order of the job, and the Direction ordinal from the column into each side.
   const SIDES = Object.freeze(["north", "south", "west", "east"]);
@@ -110,8 +125,72 @@
     return new Uint8Array(data);
   }
 
-  // Normalizes a slot: flags with data bits, blobs, and the layers in payload order.
-  function prepareSlot(slot, sectionCount, what) {
+  // Index into a neighbour section (y << 8 | z << 4 | x) of the cell that touches the column at
+  // ring cell (y, along) on side (0 north, 1 south, 2 west, 3 east).
+  function facingIndex(side, y, along) {
+    if (side === 0) return (y << 8) | (15 << 4) | along;
+    if (side === 1) return (y << 8) | along;
+    if (side === 2) return (y << 8) | (along << 4) | 15;
+    return (y << 8) | (along << 4);
+  }
+
+  // Encodes 256 ring ids as SINGLE or RING_PALETTE (u16 count, u16 0, u32 ids, u8 index[256]).
+  function ringBlob(ids) {
+    if (ids.length !== RING_CELLS) throw new RangeError("a ring slice holds 256 state ids");
+    const palette = [];
+    const indices = new Uint8Array(RING_CELLS);
+    for (let i = 0; i < RING_CELLS; i++) {
+      const id = ids[i] >>> 0;
+      let index = palette.indexOf(id);
+      if (index < 0) {
+        index = palette.length;
+        palette.push(id);
+      }
+      indices[i] = index;
+    }
+    if (palette.length === 1) return sectionBlob({single: palette[0]});
+    const bytes = new Uint8Array(4 + palette.length * 4 + RING_CELLS);
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0, palette.length, true);
+    palette.forEach((id, i) => view.setUint32(4 + 4 * i, id, true));
+    bytes.set(indices, 4 + palette.length * 4);
+    return [ENCODING.RING_PALETTE, bytes];
+  }
+
+  function ringSection(section, side) {
+    if (section && typeof section.single === "number") return sectionBlob(section);
+    if (section && section.ring) return ringBlob(section.ring);
+    if (section && section.flat) {
+      if (section.flat.length !== 4096) throw new RangeError("flat sections hold 4096 state ids");
+      const ids = new Uint32Array(RING_CELLS);
+      for (let y = 0; y < 16; y++) {
+        for (let along = 0; along < 16; along++) ids[(y << 4) | along] = section.flat[facingIndex(side, y, along)];
+      }
+      return ringBlob(ids);
+    }
+    throw new TypeError("neighbour sections must be {single}, {ring} or {flat}");
+  }
+
+  // A neighbour layer as its 128-byte ring slice (cut out of a full DataLayer when given one).
+  function ringLayer(data, side, what) {
+    const layer = asBytes(data);
+    if (layer.byteLength === RING_LAYER_BYTES) return layer;
+    if (layer.byteLength !== LAYER_BYTES) throw new RangeError(`${what} light layers are 2048 or 128 bytes`);
+    const ring = new Uint8Array(RING_LAYER_BYTES);
+    for (let y = 0; y < 16; y++) {
+      for (let along = 0; along < 16; along++) {
+        const i = facingIndex(side, y, along);
+        const level = (layer[i >> 1] >> ((i & 1) << 2)) & 15;
+        const r = (y << 4) | along;
+        ring[r >> 1] |= level << ((r & 1) << 2);
+      }
+    }
+    return ring;
+  }
+
+  // Normalizes a slot: flags with data bits, blobs, and the layers in payload order. `side` is
+  // the ring side of a neighbour, or -1 for the column.
+  function prepareSlot(slot, sectionCount, what, side) {
     const lightSections = sectionCount + 2;
     if (!slot || !slot.flags || slot.flags.length !== lightSections) {
       throw new RangeError(`${what} needs flags for ${lightSections} light sections`);
@@ -130,14 +209,17 @@
     }
     for (const [list, bit] of [[sky, SECTION_FLAGS.SKY_DATA], [block, SECTION_FLAGS.BLOCK_DATA]]) {
       for (let i = 0; i < lightSections; i++) {
-        if (flags[i] & bit) {
-          const layer = asBytes(list[i]);
-          if (layer.byteLength !== LAYER_BYTES) throw new RangeError(`${what} light layers are 2048 bytes`);
-          layers.push(layer);
+        if (!(flags[i] & bit)) continue;
+        if (side >= 0) {
+          layers.push(ringLayer(list[i], side, what));
+          continue;
         }
+        const layer = asBytes(list[i]);
+        if (layer.byteLength !== LAYER_BYTES) throw new RangeError(`${what} light layers are 2048 bytes`);
+        layers.push(layer);
       }
     }
-    const blobs = slot.sections.map(sectionBlob);
+    const blobs = side >= 0 ? slot.sections.map((section) => ringSection(section, side)) : slot.sections.map(sectionBlob);
     return {flags, blobs, layers};
   }
 
@@ -162,13 +244,13 @@
     const sectionCount = job.sectionCount | 0;
     if (sectionCount < 1 || sectionCount > MAX_SECTIONS) throw new RangeError("sectionCount must be 1..=254");
     const lightSections = sectionCount + 2;
-    const slots = [prepareSlot(job.column, sectionCount, "column")];
+    const slots = [prepareSlot(job.column, sectionCount, "column", -1)];
     let neighbours = 0;
     const around = job.neighbours || {};
     SIDES.forEach((side, i) => {
       if (around[side]) {
         neighbours |= 1 << i;
-        slots.push(prepareSlot(around[side], sectionCount, side + " neighbour"));
+        slots.push(prepareSlot(around[side], sectionCount, side + " neighbour", i));
       }
     });
     const table = job.table ? asBytes(job.table) : new Uint8Array(0);
@@ -191,7 +273,9 @@
     for (const slot of slots) {
       for (const [, bytes] of slot.blobs) length = pad8(length + 8 + bytes.byteLength);
     }
-    for (const slot of slots) length += slot.layers.length * LAYER_BYTES;
+    for (const slot of slots) {
+      for (const layer of slot.layers) length += layer.byteLength;
+    }
     length += (checks.length / 3) * 8;
 
     const buffer = new ArrayBuffer(HEADER_LEN + length);
@@ -236,7 +320,7 @@
     for (const slot of slots) {
       for (const layer of slot.layers) {
         bytes.set(layer, at);
-        at += LAYER_BYTES;
+        at += layer.byteLength;
       }
     }
     for (let i = 0; i < checks.length; i += 3) {
@@ -267,13 +351,48 @@
     return new Uint8Array(buffer, HEADER_LEN, length);
   }
 
+  // True when a framed light_column result says the instance lacked the job's table.
+  function isTableMissing(buffer) {
+    if (!buffer || buffer.byteLength < HEADER_LEN + 2) return false;
+    const view = new DataView(buffer);
+    return view.getUint32(0, true) === RESULT_MAGIC && view.getUint16(6, true) === 0
+      && view.getUint8(HEADER_LEN) === RESULT_VERSION && view.getUint8(HEADER_LEN + 1) === RESULT_TABLE_MISSING;
+  }
+
+  // Returns a copy of a framed job with `table` spliced in (the job left it out). The rest of
+  // the payload keeps its 8-byte alignment because the table section is padded to 8.
+  function withTable(job, table) {
+    const source = new Uint8Array(job);
+    const head = new DataView(job);
+    if (source.byteLength < HEADER_LEN + PAYLOAD_HEADER_LEN || head.getUint32(0, true) !== JOB_MAGIC) {
+      throw new Error("not a framed light_column job");
+    }
+    if (head.getUint8(HEADER_LEN) !== JOB_VERSION) throw new Error("light_column job version " + head.getUint8(HEADER_LEN));
+    if (head.getUint32(HEADER_LEN + 28, true) !== 0) return job.slice(0);
+    const tableBytes = asBytes(table);
+    const inserted = pad8(tableBytes.byteLength);
+    const out = new Uint8Array(source.byteLength + inserted);
+    const cut = HEADER_LEN + PAYLOAD_HEADER_LEN;
+    out.set(source.subarray(0, cut), 0);
+    out.set(tableBytes, cut);
+    out.set(source.subarray(cut), cut + inserted);
+    const view = new DataView(out.buffer);
+    view.setUint32(12, head.getUint32(12, true) + inserted, true);
+    view.setUint32(HEADER_LEN + 28, tableBytes.byteLength, true);
+    return out.buffer;
+  }
+
   // Decodes a light_column result. Layers and records are views into `buffer` (no copies).
   function readLightColumn(buffer, jobId) {
     const payload = readResult(buffer, jobId);
     const base = payload.byteOffset;
     const view = new DataView(buffer, base, payload.byteLength);
-    if (payload.byteLength < RESULT_HEADER_LEN || view.getUint8(0) !== 1) throw new Error("bad light_column result");
+    if (payload.byteLength < RESULT_HEADER_LEN || view.getUint8(0) !== RESULT_VERSION) throw new Error("bad light_column result");
     const lightSections = view.getUint16(2, true);
+    if (view.getUint8(1) === RESULT_TABLE_MISSING) {
+      return {tableMissing: true, lightSections, sectionFlags: new Uint8Array(0), sky: [], block: [],
+        outgoing: {count: 0}, stats: {increasePops: 0, decreasePops: 0}};
+    }
     const skyCount = view.getUint32(4, true);
     const blockCount = view.getUint32(8, true);
     const recordCount = view.getUint32(12, true);
@@ -311,6 +430,7 @@
       outgoing.emptySections[i] = view.getUint16(at + 10, true);
     }
     return {
+      tableMissing: false,
       lightSections,
       sectionFlags,
       skyChanged: (i) => (sectionFlags[i] & 4) !== 0,
@@ -322,14 +442,19 @@
     };
   }
 
-  // The page switch: ?lightkernel=0 or the gaius.lightKernel=off setting turn the kernel off,
+  // The page switch: ?lightKernel=0 (also lightkernel, off/false/no, as gaius-boot.js reads it)
+  // or the gaius.lightKernel=off setting turn the kernel off,
   // and so does globalThis.GAIUS_LIGHT_KERNEL === false. A Worker has neither the page URL nor
   // localStorage, so the page passes its decision to installHost there.
   function lightKernelEnabled(scope) {
     if (scope.GAIUS_LIGHT_KERNEL === false) return false;
     try {
       const search = scope.location && scope.location.search;
-      if (search && new URLSearchParams(search).get("lightkernel") === "0") return false;
+      if (search) {
+        const params = new URLSearchParams(search);
+        const value = params.get("lightKernel") !== null ? params.get("lightKernel") : params.get("lightkernel");
+        if (value !== null && /^(0|off|false|no)$/i.test(value)) return false;
+      }
     } catch (_) {
       // No usable location: keep the default.
     }
@@ -381,8 +506,8 @@
   }
 
   global.GaiusLightJob = Object.freeze({
-    ABI_VERSION, KIND_LIGHT_COLUMN, OPS, FLAGS, SECTION_FLAGS, ENCODING, OUTGOING, SIDES, SIDE_DIRECTION,
-    LAYER_BYTES, supportsSimd, pickModule, lightColumn, readResult, readLightColumn, lightKernelEnabled,
-    installHost,
+    ABI_VERSION, KIND_LIGHT_COLUMN, JOB_VERSION, RESULT_VERSION, OPS, FLAGS, SECTION_FLAGS, ENCODING, OUTGOING,
+    SIDES, SIDE_DIRECTION, LAYER_BYTES, RING_LAYER_BYTES, supportsSimd, pickModule, lightColumn, withTable,
+    isTableMissing, readResult, readLightColumn, lightKernelEnabled, installHost,
   });
 })(typeof globalThis !== "undefined" ? globalThis : self);

@@ -1,5 +1,6 @@
 package dev.gaius.tools;
 
+import dev.gaius.tools.kernel.MeshKernelPatches;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -416,7 +417,21 @@ public final class MinecraftClientPatcher {
         PatchRegistry.run("MinecraftClientPatcher.generateSoundApiStubs", () -> generateSoundApiStubs(root));
         PatchRegistry.run("MinecraftClientPatcher.generateCryptoApiStubs", () -> generateCryptoApiStubs(root));
         PatchRegistry.run("MinecraftClientPatcher.generateUnsafeStub", () -> generateUnsafeStub(root));
+        // 26.2 and 26.3 take the mesh kernel patches in Minecraft262BrowserPatcher, after the
+        // compile task rewrites there; any other profile logs here that it keeps vanilla meshing.
+        if (!isModernProfile(minecraftVersion)) {
+            PatchRegistry.run("MinecraftClientPatcher.meshKernelPatches", () -> meshKernelPatches(args[0], root, minecraftVersion));
+        }
         PatchRegistry.printSummary();
+    }
+
+    /** Legacy profiles only: {@link MeshKernelPatches} leaves the section compiler alone. */
+    private static void meshKernelPatches(String jar, Path root, String minecraftVersion)
+            throws IOException {
+        if (MeshKernelPatches.apply(jar, root, minecraftVersion)) {
+            throw new IllegalStateException(
+                    "Minecraft " + minecraftVersion + " must keep the vanilla section compiler");
+        }
     }
 
     private static void patchOptionsBrowserLowSimulationDistance(String jar, Path output)
@@ -16847,7 +16862,8 @@ public final class MinecraftClientPatcher {
                 "(III)Lnet/minecraft/core/Holder;",
                 true));
         code.add(new InsnNode(Opcodes.ARETURN));
-        replace(method, code, 5, 6);
+        // Peak stack: source, the x and y arguments, then z >> 2, the corner bits and the mask.
+        replace(method, code, 6, 6);
         write(node, output);
     }
 
