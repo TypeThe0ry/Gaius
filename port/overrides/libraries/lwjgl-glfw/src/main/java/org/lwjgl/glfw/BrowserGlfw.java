@@ -1153,12 +1153,14 @@ public final class BrowserGlfw {
                 Object.keys(injected.keys).forEach(code => { if (injected.keys[code]) injectKey(code, false); });
                 Object.keys(injected.buttons).forEach(b => { if (injected.buttons[b]) injectButton(b | 0, false); });
               },
-              state: () => ({
-                backend: 'glfw',
-                wantPointerLock: !!window.__gaiusWantPointerLock,
-                textInput: null,
-                textInputArea: null
-              })
+              state: () => {
+                return {
+                  backend: 'glfw',
+                  wantPointerLock: !!window.__gaiusWantPointerLock,
+                  textInput: null,
+                  textInputArea: null
+                };
+              }
             };
             addEventListener('mousedown', e => {
               const c = canvas();

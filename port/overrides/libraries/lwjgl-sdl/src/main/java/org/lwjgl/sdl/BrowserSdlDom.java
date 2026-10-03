@@ -687,12 +687,14 @@ final class BrowserSdlDom {
                 });
                 for (let button = 0; button <= 4; button++) injectButton(button, false);
               },
-              state: () => ({
-                backend: 'sdl',
-                wantPointerLock: !!w.__gaiusWantPointerLock,
-                textInput: !!sdl.textInput,
-                textInputArea: sdl.textInputArea
-              })
+              state: () => {
+                return {
+                  backend: 'sdl',
+                  wantPointerLock: !!w.__gaiusWantPointerLock,
+                  textInput: !!sdl.textInput,
+                  textInputArea: sdl.textInputArea
+                };
+              }
             };
             addEventListener('mousedown', e => {
               const c = canvas();
