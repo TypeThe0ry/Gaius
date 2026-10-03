@@ -692,8 +692,24 @@ async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
   } catch(error) {
     chunkDrawTelemetryError=String(error?.message||error);
   }
+  // Evidence for the render pipeline, quality tier and wasm kernels; informational only.
+  let pipeline=null;
+  try {
+    pipeline=await evaluate(cdp,`(()=>{const g=globalThis;const pick=(o,re)=>o?Object.fromEntries(Object.entries(o).filter(([k,v])=>re.test(k)&&(typeof v!=='object'||v===null))):null;
+      const safe=f=>{try{return f();}catch(e){return {error:String(e&&e.message||e)};}};
+      return {gl:pick(g.__gaiusGLStats,/^(terrain|baseVertex|bakedIndex|mappedPool|quadIndex|shiftedIndex|multiDraw)/),
+        gpuCaps:safe(()=>g.__gaiusGpuCaps?{tier:g.__gaiusGpuCaps.tier,rendererClass:g.__gaiusGpuCaps.rendererClass,renderer:g.__gaiusGpuCaps.renderer,
+          multiDraw:g.__gaiusGpuCaps.multiDraw,terrainBatchMode:g.__gaiusGpuCaps.terrainBatchMode,anisotropicFiltering:g.__gaiusGpuCaps.anisotropicFiltering}:null),
+        quality:safe(()=>({settings:g.__gaiusQualitySettings||null,stats:g.__gaiusQualityStats||null,devicePixelRatio:g.devicePixelRatio})),
+        kernels:safe(()=>g.__gaiusKernels&&g.__gaiusKernels.telemetry?g.__gaiusKernels.telemetry():null),
+        meshKernel:safe(()=>g.__gaiusMeshKernel&&g.__gaiusMeshKernel.status?g.__gaiusMeshKernel.status():null),
+        guards:{noSuspendViolations:g.__gaiusNoSuspendViolations|0,clinitSuspensions:g.__gaiusClinitSuspensions|0,
+          lastNoSuspendViolation:g.__gaiusLastNoSuspendViolation?String(g.__gaiusLastNoSuspendViolation).slice(0,500):null}};})()`);
+  } catch(error) {
+    pipeline={error:String(error?.message||error)};
+  }
   const terrain={ready:false,screenshotPath,identity,baselineScreenshotPath,baselineIdentity,
-    chunkDrawTelemetry,chunkDrawTelemetryError,
+    chunkDrawTelemetry,chunkDrawTelemetryError,pipeline,
     startupPerformance:{
       start:'CDP create-world command requested',
       end:'first observed multi-chunk terrain screenshot passing visual checks',

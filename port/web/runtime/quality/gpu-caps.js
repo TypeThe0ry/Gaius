@@ -123,6 +123,7 @@
       renderer: caps.renderer,
       vendor: caps.vendor,
       rebench: !!caps.rebench,
+      lowBench: !!caps.lowBench,
       extensions: caps.extensions || null,
       floatTargets: caps.floatTargets || null,
       maxTextureSize: caps.maxTextureSize || 0,
@@ -514,6 +515,8 @@
     const cls = classifyRenderer(caps.renderer, caps.vendor, nav);
     caps.kind = cls.kind;
     let index = tierFromScore(score);
+    caps.benchTierIndex = index;
+    caps.guessTierIndex = cls.guess;
     if (index < 0) index = cls.guess;
     index = clampTier(index, cls.floor, cls.cap);
     let cap = TIERS.length - 1;
@@ -652,7 +655,20 @@
       caps = fromStoredRecord(record, nav);
     } else {
       caps = probeTemporaryContext(nav);
-      if (caps) writeStoredRecord(caps);
+      if (caps) {
+        // A score below what the renderer suggests usually means a busy machine (a compile, a
+        // game, another tab) rather than a weak GPU: keep the renderer's tier this boot and
+        // benchmark again next boot; only a second low measurement lowers the tier.
+        const low = caps.benchTierIndex >= 0 && caps.benchTierIndex < caps.guessTierIndex;
+        if (low && !(record && record.lowBench)) {
+          const score = caps.score;
+          decideTier(caps, 0);
+          caps.score = score;
+          caps.lowBench = true;
+          caps.rebench = true;
+        }
+        writeStoredRecord(caps);
+      }
     }
     if (!caps) {
       // No document (Worker) or no WebGL2: classify from the user agent alone.
