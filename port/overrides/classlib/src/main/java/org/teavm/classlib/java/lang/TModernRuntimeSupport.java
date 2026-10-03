@@ -101,13 +101,22 @@ public final class TModernRuntimeSupport {
      * Browser world generation can have several continuations sharing one emulated Java thread;
      * using TThread.sleep there lets an unrelated wake-up cancel the wrong continuation.
      * Returns at once while a class initializer or a method that the role options compiled
-     * synchronously runs (see {@link #inClassInitializer}).
+     * synchronously runs (see {@link #inClassInitializer}), and when called from a plain
+     * JavaScript callback that has no TeaVM thread to suspend: the yield is optional, so
+     * skipping it there is correct where suspending would throw.
      */
     public static void yieldToEventLoop(int delayMillis) {
         if (inClassInitializer()) {
             return;
         }
-        suspendToEventLoop(delayMillis);
+        try {
+            suspendToEventLoop(delayMillis);
+        } catch (RuntimeException e) {
+            String message = e.getMessage();
+            if (message == null || !message.contains("Suspension point reached from non-threading context")) {
+                throw e;
+            }
+        }
     }
 
     /**

@@ -832,7 +832,9 @@ public final class BrowserRenderScheduler {
             return;
         }
         pumpScheduled = true;
-        Platform.schedule(BrowserRenderScheduler::runPump, 0);
+        // A TeaVM thread, not a plain timeout callback: the pump yields between slices and
+        // queued tasks may suspend (upload retries), which needs a coroutine context.
+        Platform.startThread(BrowserRenderScheduler::runPump);
     }
 
     /**

@@ -5906,7 +5906,7 @@ def check_source_patches() -> None:
             and "BrowserRenderScheduler" in client_patcher
             and "BROWSER_SECTION_UPLOAD_BUDGET = 8" in client_patcher
             and "BROWSER_SECTION_CLOSE_BUDGET = 16" in client_patcher
-            and "Platform.schedule(BrowserRenderScheduler::runPump, 0)" in browser_render_scheduler
+            and "Platform.startThread(BrowserRenderScheduler::runPump)" in browser_render_scheduler
             and "FRAME_WATCHDOG_MILLIS = 50" in browser_render_scheduler
             and "SLICE_NANOS = 2_000_000L" in browser_render_scheduler
             and "TModernRuntimeSupport.yieldToEventLoop(0)" in browser_render_scheduler
