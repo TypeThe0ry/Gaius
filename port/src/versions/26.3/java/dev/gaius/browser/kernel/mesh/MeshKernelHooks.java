@@ -29,7 +29,9 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.system.BrowserMemory;
+import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSObject;
+import org.teavm.platform.Platform;
 
 /**
  * Section compiles through the Rust mesher kernel (26.3 copy; 26.2 differs only in the render
@@ -76,8 +78,7 @@ public final class MeshKernelHooks {
 
     private static final int VANILLA_VERTEX_BYTES = 28;
     private static final int NEARBY_BLOCKS = 32;
-    private static final long EXPORT_SLICE_NANOS = 4_000_000L;
-    private static final long EXPORT_GAP_NANOS = 12_000_000L;
+    private static final long EXPORT_SLICE_NANOS = 8_000_000L;
     private static final long ANSWER_TIMEOUT_MILLIS = 10_000L;
     private static final long ANSWER_TIMEOUT_NANOS = ANSWER_TIMEOUT_MILLIS * 1_000_000L;
     private static final ChunkSectionLayer[] LAYERS = {
@@ -94,7 +95,6 @@ public final class MeshKernelHooks {
     private static ModelTableExporter exporter;
     private static Object failedModels;
     private static int nextEpoch = 1;
-    private static long nextExportStepNanos;
 
     private MeshKernelHooks() {
     }
@@ -358,7 +358,10 @@ public final class MeshKernelHooks {
                 || "backpressure".equals(code);
     }
 
-    /** The model table of {@code compiler}'s resources, exporting it in slices; null until done. */
+    /**
+     * The model table of {@code compiler}'s resources; null (vanilla compiles) until its export,
+     * started here on its own TeaVM thread, has finished.
+     */
     private static MeshModelTable currentTable(SectionCompiler compiler) {
         MeshKernelAccess.Compiler access = (MeshKernelAccess.Compiler) (Object) compiler;
         var models = access.gaius$blockModelSet();
@@ -380,32 +383,38 @@ public final class MeshKernelHooks {
         }
         if (exporter == null || !exporter.matches(models, fluids, colors)) {
             table = null;
-            exporter = new ModelTableExporter(models, fluids, colors, nextEpoch++);
+            ModelTableExporter job = new ModelTableExporter(models, fluids, colors, nextEpoch++);
+            exporter = job;
+            // About 0.6 s of work for every block state: run it in slices separated by one
+            // event-loop turn on a thread of its own, so the kernel is ready for the first chunks
+            // of a world instead of advancing a few milliseconds per compile request.
+            Platform.startThread(() -> runExport(job, models));
         }
-        long now = System.nanoTime();
-        if (now < nextExportStepNanos) {
-            return null;
-        }
+        return null;
+    }
+
+    private static void runExport(ModelTableExporter job, Object models) {
         try {
-            boolean done = exporter.step(now + EXPORT_SLICE_NANOS);
-            nextExportStepNanos = System.nanoTime() + EXPORT_GAP_NANOS;
-            if (!done) {
-                return null;
+            while (exporter == job) {
+                if (job.step(System.nanoTime() + EXPORT_SLICE_NANOS)) {
+                    MeshModelTable done = job.finish();
+                    if (exporter == job) {
+                        exporter = null;
+                        table = done;
+                        MeshKernelBridge.setTable(done.bytes, done.bytes.length, done.epoch);
+                    }
+                    return;
+                }
+                TModernRuntimeSupport.yieldToEventLoop(0);
             }
-            current = exporter.finish();
         } catch (RuntimeException error) {
-            failedModels = models;
-            exporter = null;
-            System.out.println("[mesh-kernel] model table export failed, sections use the vanilla compiler: "
-                    + error);
-            return null;
+            if (exporter == job) {
+                failedModels = models;
+                exporter = null;
+                System.out.println("[mesh-kernel] model table export failed, sections use the vanilla compiler: "
+                        + error);
+            }
         }
-        exporter = null;
-        table = current;
-        if (!MeshKernelBridge.setTable(current.bytes, current.bytes.length, current.epoch)) {
-            return null;
-        }
-        return current;
     }
 
     // --- results ----------------------------------------------------------------------------------
