@@ -120,6 +120,7 @@ public final class PatchRegistry {
     private static int applied;
     private static int dropped;
     private static int bringupSkipped;
+    private static int targetSkipped;
     private static boolean pendingPrinted;
     /** Drops registered by the {@link #run} bodies executing on this thread, innermost last. */
     private static final ThreadLocal<java.util.ArrayDeque<int[]>> RUN_DROPS =
@@ -281,6 +282,28 @@ public final class PatchRegistry {
         applied(patchId);
     }
 
+    /**
+     * {@link #run} for a patch that only speeds up the JavaScript output: for the wasmgc target
+     * ({@link BuildTarget}) the vanilla code stays and the patch is reported as
+     * {@code PATCH_TARGET_SKIPPED}.
+     */
+    public static void runJsOnly(String patchId, IORunnable body) throws IOException {
+        if (BuildTarget.wasmGc()) {
+            targetSkipped(patchId);
+            return;
+        }
+        run(patchId, body);
+    }
+
+    private static synchronized void targetSkipped(String patchId) {
+        requirePatchId(patchId);
+        resolve();
+        queried.add(patchId);
+        scopes.add(scopeOf(patchId));
+        targetSkipped++;
+        System.out.println("PATCH_TARGET_SKIPPED " + patchId + " target=" + BuildTarget.name());
+    }
+
     /** A {@link #run} whose body registered drops: seen, but not counted as applied. */
     private static synchronized void droppedRun(String patchId) {
         requirePatchId(patchId);
@@ -304,7 +327,8 @@ public final class PatchRegistry {
             }
         }
         System.out.println("PATCH_SUMMARY applied=" + applied + " dropped=" + dropped
-                + " bringupSkipped=" + bringupSkipped);
+                + " bringupSkipped=" + bringupSkipped
+                + (targetSkipped > 0 ? " targetSkipped=" + targetSkipped : ""));
     }
 
     /** Parses a bring-up list. Exposed for smokes and for build scripts written in Java. */

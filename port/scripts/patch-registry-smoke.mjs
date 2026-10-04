@@ -9,7 +9,12 @@
 // - dev.gaius.tools.Minecraft263BrowserPatcher: refuses 26.2/1.21.11 and non-renderpearl jars,
 //   runs the six m263 package domains and the JdkCompat domain in order on the 26.3 jar;
 // - MinecraftClientPatcher/Minecraft262BrowserPatcher main(): every patch call is wrapped in
-//   PatchRegistry.run("<Class>.<method>", () -> <method>(...)).
+//   PatchRegistry.run("<Class>.<method>", () -> <method>(...)) or, for a patch that only speeds
+//   up the JavaScript output, PatchRegistry.runJsOnly(...) with the same shape;
+// - PatchRegistry.runJsOnly: runs like run() for the js TeaVM target and reports
+//   PATCH_TARGET_SKIPPED without running the body for wasmgc; check-build-log-skips.mjs (G4)
+//   accepts exactly the ids of port/tools/target-skips/wasmgc.txt in a wasmgc log and none in a
+//   js log, and that list names exactly the runJsOnly patch ids of port/tools.
 // When port/tools/bringup/26.3.txt exists (or --bringup-list PATH is given), it also runs
 // MCP -> M262 -> M263 on a copy of the 26.3 jar in bring-up mode and checks that every skip is
 // listed (pass --require-bringup-list to fail instead of skipping that part without a list).
@@ -99,6 +104,14 @@ public final class PatchRegistrySmokeDriver {
                 PatchRegistry.applied("Manual.patch");
                 PatchRegistry.printSummary();
             }
+            case "jsonly" -> {
+                PatchRegistry.configureProfile(args[1]);
+                for (int i = 2; i < args.length; i++) {
+                    String id = args[i];
+                    PatchRegistry.runJsOnly(id, () -> System.out.println("BODY " + id));
+                }
+                PatchRegistry.printSummary();
+            }
             case "dropped" -> {
                 String[] targets = java.util.Arrays.copyOfRange(args, 3, args.length);
                 try {
@@ -153,7 +166,8 @@ function mainBody(source, name) {
 }
 
 // Every statement of main() is a declaration, control flow, a comment, a PatchRegistry
-// bookkeeping call or PatchRegistry.run("<Class>.<method>", () -> <method>(...)).
+// bookkeeping call or PatchRegistry.run("<Class>.<method>", () -> <method>(...)) (runJsOnly for
+// the JavaScript-only patches).
 function checkWrappedMain(source, className, minimumWrapped) {
   const body = mainBody(source, className);
   const ids = [];
@@ -163,7 +177,8 @@ function checkWrappedMain(source, className, minimumWrapped) {
     const line = raw.trim();
     if (line === "" || line.startsWith("//")) continue;
     if (statementStart && depth === 0) {
-      const wrapped = line.match(/^PatchRegistry\.run\("([A-Za-z0-9]+)\.([A-Za-z0-9_]+)", \(\) -> ([A-Za-z0-9_]+)\(/);
+      const wrapped = line.match(
+        /^PatchRegistry\.(?:run|runJsOnly)\("([A-Za-z0-9]+)\.([A-Za-z0-9_]+)", \(\) -> ([A-Za-z0-9_]+)\(/);
       if (wrapped) {
         assert.equal(wrapped[1], className, `${className}: wrong class in id: ${line}`);
         assert.equal(wrapped[2], wrapped[3], `${className}: id does not name the called method: ${line}`);
@@ -215,7 +230,7 @@ try {
   const classpath = [classes, asm, asmTree].join(delimiter);
   const baseEnv = {...process.env};
   for (const name of ["GAIUS_BRINGUP", "GAIUS_BRINGUP_LIST", "GAIUS_PROFILE",
-    "GAIUS_MINECRAFT_VERSION", "GAIUS_PATCH_VERBOSE", "GAIUS_AUTHLIB_JAR"]) {
+    "GAIUS_MINECRAFT_VERSION", "GAIUS_PATCH_VERBOSE", "GAIUS_AUTHLIB_JAR", "GAIUS_TEAVM_TARGET"]) {
     delete baseEnv[name];
   }
   const run = (args, env = {}, cwd = work) => {
@@ -387,6 +402,99 @@ try {
   result = driver(["run", "26.2", "Demo.patchFail"], {GAIUS_BRINGUP_LIST: list});
   assert.match(result.out, /^RETHROWN boom Demo\.patchFail$/m);
   assert.doesNotMatch(result.err, /BRINGUP_PENDING/, "26.2 never loads a bring-up list");
+
+  // runJsOnly: the TeaVM target comes from gaius.teavm.target, then GAIUS_TEAVM_TARGET
+  // (BuildTarget); js is the default.
+  result = driver(["jsonly", "26.3", "Demo.patchJs"], {GAIUS_PATCH_VERBOSE: "1"});
+  assert.equal(result.status, 0, result.err);
+  assert.match(result.out, /^BODY Demo\.patchJs$/m, "a JavaScript-only patch must run for js");
+  assert.match(result.out, /^PATCH_APPLIED Demo\.patchJs$/m);
+  assert.match(result.out, /^PATCH_SUMMARY applied=1 dropped=0 bringupSkipped=0$/m,
+    "the js summary line must not change");
+  result = driver(["jsonly", "26.3", "Demo.patchJs"], {GAIUS_TEAVM_TARGET: "wasmgc"});
+  assert.equal(result.status, 0, result.err);
+  assert.doesNotMatch(result.out, /^BODY /m, "a JavaScript-only patch must not run for wasmgc");
+  assert.match(result.out, /^PATCH_TARGET_SKIPPED Demo\.patchJs target=wasmgc$/m);
+  assert.match(result.out, /^PATCH_SUMMARY applied=0 dropped=0 bringupSkipped=0 targetSkipped=1$/m);
+  result = run(["-Dgaius.teavm.target=js", "PatchRegistrySmokeDriver", "jsonly", "26.3", "Demo.patchJs"],
+    {GAIUS_TEAVM_TARGET: "wasmgc"});
+  assert.equal(result.status, 0, result.err);
+  assert.match(result.out, /^BODY Demo\.patchJs$/m, "gaius.teavm.target overrides GAIUS_TEAVM_TARGET");
+  result = driver(["jsonly", "26.3", "Demo.patchJs"], {GAIUS_TEAVM_TARGET: "wasm"});
+  assert.notEqual(result.status, 0, "an unknown TeaVM target must fail");
+  assert.match(result.err, /Unknown TeaVM target 'wasm'/);
+
+  // G4 and target skips: a wasmgc log must skip exactly the listed ids for its profile.
+  const targetRoot = join(work, "target-root");
+  await mkdir(join(targetRoot, "port/tools/target-skips"), {recursive: true});
+  await mkdir(join(targetRoot, "port/scripts"), {recursive: true});
+  await copyFile(join(repositoryRoot, "port/scripts/check-build-log-skips.mjs"),
+    join(targetRoot, "port/scripts/check-build-log-skips.mjs"));
+  await writeFile(join(targetRoot, "port/tools/target-skips/wasmgc.txt"), [
+    "# test list",
+    "Demo.patchJs | * | JavaScript-only",
+    "Demo.patch263 | 26.3 | only 26.3 has it",
+    "",
+  ].join("\n"));
+  const g4 = async (name, lines, extra = []) => {
+    const log = join(work, `${name}.log`);
+    await writeFile(log, lines.join("\n") + "\n");
+    return spawnSync(process.execPath, [join(targetRoot, "port/scripts/check-build-log-skips.mjs"),
+      "--profile", "26.3", ...extra, log], {encoding: "utf8"});
+  };
+  const wasmLines = (ids, count = ids.length) => [
+    "Adding wasmgc classlib overrides from /x/port/overrides/classlib/src/target-wasmgc/java",
+    ...ids.map((id) => `PATCH_TARGET_SKIPPED ${id} target=wasmgc`),
+    `PATCH_SUMMARY applied=3 dropped=0 bringupSkipped=0 targetSkipped=${count}`,
+  ];
+  result = await g4("wasm-ok", wasmLines(["Demo.patchJs", "Demo.patch263"]));
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /target=wasmgc targetSkipped=2 /);
+  result = await g4("wasm-unlisted", wasmLines(["Demo.patchJs", "Demo.patch263", "Demo.semantic"]));
+  assert.equal(result.status, 1, "an unlisted target skip must fail G4");
+  assert.match(result.stdout, /Demo\.semantic was skipped for wasmgc, but .* does not list it for 26\.3/);
+  result = await g4("wasm-missing", wasmLines(["Demo.patchJs"]));
+  assert.equal(result.status, 1, "a listed id that the build ran must fail G4");
+  assert.match(result.stdout, /lists Demo\.patch263 for 26\.3, but the wasmgc build did not skip it/);
+  result = await g4("wasm-count", wasmLines(["Demo.patchJs", "Demo.patch263"], 1));
+  assert.equal(result.status, 1, "a summary that disagrees with the lines must fail G4");
+  result = await g4("wasm-26.2", wasmLines(["Demo.patchJs"]), ["--profile", "26.2"]);
+  assert.equal(result.status, 0, "an id listed for 26.3 only is not expected in a 26.2 log: "
+    + result.stdout + result.stderr);
+  result = await g4("js-skip", ["PATCH_TARGET_SKIPPED Demo.patchJs target=wasmgc",
+    "PATCH_SUMMARY applied=1 dropped=0 bringupSkipped=0 targetSkipped=1"], ["--target", "js"]);
+  assert.equal(result.status, 1, "a js log must not skip patches for a target");
+  result = await g4("js-ok", ["PATCH_SUMMARY applied=1 dropped=0 bringupSkipped=0"]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /target=/, "the js result line stays unchanged");
+  result = await g4("summary-garbled", ["PATCH_SUMMARY applied=1 dropped=0 bringupSkipped=0 extra=1"]);
+  assert.equal(result.status, 1, "an unrecognized PATCH_SUMMARY line must fail G4");
+  // The repository list names exactly the runJsOnly patch ids of port/tools, for every profile.
+  const listedIds = (await readFile(join(repositoryRoot, "port/tools/target-skips/wasmgc.txt"), "utf8"))
+    .split(/\r?\n/).map((line) => line.replace(/#.*$/, "").trim()).filter(Boolean)
+    .map((line) => line.split("|").map((field) => field.trim()));
+  assert.ok(listedIds.every((fields) => fields.length === 3 && fields[1] === "*" && fields[2]),
+    "port/tools/target-skips/wasmgc.txt: '<patchId> | * | <reason>'");
+  const jsOnlyIds = [];
+  const toolSources = async (directory) => {
+    for (const entry of await readdir(directory, {withFileTypes: true})) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await toolSources(path);
+      } else if (entry.name.endsWith(".java")) {
+        for (const match of (await readFile(path, "utf8")).matchAll(/PatchRegistry\.runJsOnly\("([^"]+)"/g)) {
+          jsOnlyIds.push(match[1]);
+        }
+      }
+    }
+  };
+  await toolSources(toolsRoot);
+  assert.deepEqual(listedIds.map((fields) => fields[0]).sort(), jsOnlyIds.sort(),
+    "port/tools/target-skips/wasmgc.txt must list exactly the PatchRegistry.runJsOnly ids");
+  await copyFile(join(repositoryRoot, "port/tools/target-skips/wasmgc.txt"),
+    join(targetRoot, "port/tools/target-skips/wasmgc.txt"));
+  result = await g4("repository-list", wasmLines(jsOnlyIds));
+  assert.equal(result.status, 0, "the repository list parses: " + result.stdout + result.stderr);
 
   // dropped(): targets must be absent; members are checked by name or exact descriptor.
   const tinyJar = join(work, "tiny.jar");

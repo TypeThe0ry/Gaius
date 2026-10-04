@@ -138,14 +138,19 @@ try {
     const patchOutput = join(temp, 'formatter-patches');
     await mkdir(patcherClasses, {recursive: true});
     await mkdir(patchOutput, {recursive: true});
-    const patcherSource = join(repositoryRoot,
-      'port/tools/src/main/java/dev/gaius/tools/TeaVMClasslibPatcher.java');
+    const toolSources = join(repositoryRoot, 'port/tools/src/main/java');
+    const patcherSource = join(toolSources, 'dev/gaius/tools/TeaVMClasslibPatcher.java');
+    // The patcher reads the TeaVM target through BuildTarget; -sourcepath resolves any other
+    // tools class it references.
+    const buildTargetSource = join(toolSources, 'dev/gaius/tools/BuildTarget.java');
     const patcherClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
     execFileSync(fixtureJavac, ['--release', '21', '-proc:none', '-cp', patcherClasspath,
-      '-d', patcherClasses, patcherSource], {
+      '-sourcepath', toolSources, '-d', patcherClasses, patcherSource, buildTargetSource], {
       stdio: 'pipe', maxBuffer: 20 * 1024 * 1024,
     });
-    execFileSync(fixtureJava, ['-cp', [patcherClasses, patcherClasspath].join(delimiter),
+    // The fixture compiles with the JavaScript backend: patch the class library for it.
+    execFileSync(fixtureJava, ['-Dgaius.teavm.target=js',
+      '-cp', [patcherClasses, patcherClasspath].join(delimiter),
       'dev.gaius.tools.TeaVMClasslibPatcher', workingClasslib, patchOutput], {
       stdio: 'pipe', timeout: 120_000, maxBuffer: 20 * 1024 * 1024,
     });

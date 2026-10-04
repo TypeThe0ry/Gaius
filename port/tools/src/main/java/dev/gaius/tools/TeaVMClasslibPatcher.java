@@ -339,6 +339,59 @@ public final class TeaVMClasslibPatcher {
         patchZipFileRawInflaterPadding(jar, root);
         patchFormatterPercentArgument(jar, root);
         patchTemplateCollectionLookups(jar, root);
+        if (BuildTarget.wasmGc()) {
+            patchDateToStringWasmGC(root);
+        }
+    }
+
+    /**
+     * TeaVM 0.15 marks {@code Date.toString} {@code @UnsupportedOn(WEBASSEMBLY_GC)} although
+     * its body has a WebAssembly GC branch ({@code teavmDate.dateToString}, the JS
+     * {@code Date.prototype.toString} format that the JavaScript build prints as well). The
+     * marker turns every reachable call (log and crash report timestamps) into a compile
+     * error, so the wasmgc classlib drops it. Reads the TDate class the delegate patches
+     * wrote above. TeaVM 0.16 no longer carries the marker, so its absence is accepted there.
+     */
+    private static void patchDateToStringWasmGC(Path root) throws IOException {
+        String className = "org/teavm/classlib/java/util/TDate";
+        Path patched = root.resolve(className + ".class");
+        ClassNode node = new ClassNode();
+        new ClassReader(Files.readAllBytes(patched)).accept(node, 0);
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("toString")
+                        && candidate.desc.equals("()Ljava/lang/String;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(className + ".toString not found"));
+        String marker = "Lorg/teavm/interop/UnsupportedOn;";
+        int removed = 0;
+        if (method.visibleAnnotations != null) {
+            int before = method.visibleAnnotations.size();
+            method.visibleAnnotations.removeIf(annotation -> annotation.desc.equals(marker));
+            removed += before - method.visibleAnnotations.size();
+        }
+        if (method.invisibleAnnotations != null) {
+            int before = method.invisibleAnnotations.size();
+            method.invisibleAnnotations.removeIf(annotation -> annotation.desc.equals(marker));
+            removed += before - method.invisibleAnnotations.size();
+        }
+        if (removed == 0 && callsWasmGCBranch(method)) {
+            // TeaVM 0.16 dropped the marker itself; the Wasm GC branch is already reachable.
+            return;
+        }
+        if (removed != 1) {
+            throw new IllegalStateException(className + ".toString: expected one "
+                    + marker + " annotation, found " + removed);
+        }
+        writeClass(root, className, node);
+    }
+
+    private static boolean callsWasmGCBranch(MethodNode method) {
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof MethodInsnNode call && call.name.equals("toStringWebAssemblyGC")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

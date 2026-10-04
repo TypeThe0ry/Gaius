@@ -1,5 +1,6 @@
 package dev.gaius.tools.m263;
 
+import dev.gaius.tools.BuildTarget;
 import dev.gaius.tools.PatchRegistry;
 import java.io.IOException;
 import java.io.InputStream;
@@ -43,6 +44,10 @@ import org.objectweb.asm.tree.VarInsnNode;
  * comparisons are already exact in TeaVM and are left alone. Every rewrite keeps the operand
  * stack shape, so the existing stack map frames stay valid.
  *
+ * <p>The WebAssembly GC build ({@link BuildTarget}) computes float in f32 and converts with
+ * saturation (nontrapping conversions), so only the sum rewrite applies there: TeaVM's class
+ * library sums a DoubleStream naively on both backends.
+ *
  * <p>Standalone: {@code java dev.gaius.tools.m263.StrictMath263 <client.jar> <output-root>}
  * rewrites the scope of a jar into {@code output-root} (used by
  * {@code port/native/golden/strict-math-check.sh}, which proves the result is still vanilla on
@@ -73,13 +78,16 @@ public final class StrictMath263 {
 
     /** Called by Minecraft263BrowserPatcher after the package domains, before JdkCompatPatches263. */
     public static void apply(String jar, Path root) throws IOException {
+        boolean sumsOnly = BuildTarget.wasmGc();
         PatchRegistry.run("StrictMath263.roundWorldgenArithmetic", () -> {
-            Stats stats = rewrite(jar, root);
-            if (stats.classes == 0 || stats.rounded == 0) {
-                throw new IllegalStateException("StrictMath263: no float arithmetic in the worldgen scope of "
-                        + jar + " (" + stats + ")");
+            Stats stats = rewrite(jar, root, sumsOnly);
+            if (stats.classes == 0 || (sumsOnly ? stats.sums == 0 : stats.rounded == 0)) {
+                throw new IllegalStateException("StrictMath263: no "
+                        + (sumsOnly ? "DoubleStream sum" : "float arithmetic")
+                        + " in the worldgen scope of " + jar + " (" + stats + ")");
             }
-            System.out.println("StrictMath263: " + stats);
+            System.out.println("StrictMath263: " + (sumsOnly ? "wasmgc, DoubleStream sums only: " : "")
+                    + stats);
         });
     }
 
@@ -95,6 +103,11 @@ public final class StrictMath263 {
 
     /** Rewrites every class of the scope, reading the chain's current version (root, then jar). */
     static Stats rewrite(String jar, Path root) throws IOException {
+        return rewrite(jar, root, false);
+    }
+
+    /** As {@link #rewrite(String, Path)}; {@code sumsOnly} keeps only the DoubleStream.sum rewrite. */
+    static Stats rewrite(String jar, Path root, boolean sumsOnly) throws IOException {
         Stats stats = new Stats();
         try (ZipFile zip = new ZipFile(jar)) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
@@ -115,7 +128,11 @@ public final class StrictMath263 {
                 new ClassReader(bytes).accept(node, 0);
                 int before = stats.total();
                 for (MethodNode method : node.methods) {
-                    rewrite(method, stats);
+                    if (sumsOnly) {
+                        rewriteSums(method, stats);
+                    } else {
+                        rewrite(method, stats);
+                    }
                 }
                 if (stats.total() > before) {
                     stats.classes++;
@@ -151,8 +168,7 @@ public final class StrictMath263 {
                 case Opcodes.INVOKEVIRTUAL, Opcodes.INVOKESPECIAL, Opcodes.INVOKESTATIC,
                         Opcodes.INVOKEINTERFACE -> {
                     MethodInsnNode call = (MethodInsnNode) instruction;
-                    if (call.owner.equals("java/util/stream/DoubleStream") && call.name.equals("sum")
-                            && call.desc.equals("()D")) {
+                    if (isDoubleStreamSum(call)) {
                         method.instructions.set(call, helper("sum", "(Ljava/util/stream/DoubleStream;)D"));
                         stats.sums++;
                     } else if (call.desc.endsWith(")F") && !inScope(call.owner) && !call.owner.equals(HELPER)) {
@@ -178,6 +194,21 @@ public final class StrictMath263 {
             }
         }
         roundParameters(method, stats);
+    }
+
+    /** The DoubleStream.sum rewrite of {@link #rewrite(MethodNode, Stats)} alone. */
+    static void rewriteSums(MethodNode method, Stats stats) {
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call && isDoubleStreamSum(call)) {
+                method.instructions.set(call, helper("sum", "(Ljava/util/stream/DoubleStream;)D"));
+                stats.sums++;
+            }
+        }
+    }
+
+    private static boolean isDoubleStreamSum(MethodInsnNode call) {
+        return call.owner.equals("java/util/stream/DoubleStream") && call.name.equals("sum")
+                && call.desc.equals("()D");
     }
 
     /** Rounds the float parameters of a method that code outside the scope may call. */

@@ -6,6 +6,7 @@ set -euo pipefail
 # profile's generated resources, Maven target, overlay JARs, or dist assets.
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
+gaius_require_js_target || exit 2
 # Bring-up builds skip the patches listed in port/tools/bringup/<profile>.txt
 # and must never produce release artifacts.  build-teavm-release.sh repeats
 # this check and also refuses overlays that a bring-up build left behind.

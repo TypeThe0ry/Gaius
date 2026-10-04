@@ -43,6 +43,30 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 version="$GAIUS_MINECRAFT_VERSION"
 
+# TeaVM backend (D2 of the v0.4.0 design): js (default) builds the existing
+# JavaScript overlays; wasmgc builds them for TeaVM WEBASSEMBLY_GC.  Every source
+# root <x>/src/main/java may have a sibling <x>/src/target-<target>/java whose
+# files replace the shared (and profile/version) files with the same relative
+# path and may add new ones.  The patchers read GAIUS_TEAVM_TARGET
+# (dev.gaius.tools.BuildTarget) and skip the JavaScript-only acceleration
+# patches for wasmgc.  The overlay directory records its target in TEAVM_TARGET;
+# generate-pom.sh refuses overlays of another target.
+teavm_target="${GAIUS_TEAVM_TARGET:-js}"
+case "$teavm_target" in
+  js|wasmgc) ;;
+  *)
+    echo "Unknown GAIUS_TEAVM_TARGET '$teavm_target' (expected js or wasmgc)" >&2
+    exit 1
+    ;;
+esac
+export GAIUS_TEAVM_TARGET="$teavm_target"
+
+# target_source_root MAIN_ROOT: prints the target-specific sibling of a
+# .../src/main/java source root.
+target_source_root() {
+  printf '%s/target-%s/java\n' "$(dirname "$(dirname "$1")")" "$teavm_target"
+}
+
 # The client patcher chain is chosen by the profile's patchSet, and the
 # profile's extraPatchers run in order at the tail of that chain.  Unknown
 # values stop the build before any work is done.
@@ -245,6 +269,12 @@ output="$overlay_work/teavm-classlib-$teavm_version-gaius.jar"
 
 mkdir -p "$classes" "$overlay_work"
 
+# Target marker (TEAVM_TARGET, read by generate-pom.sh and build-wasmgc.sh):
+# "<target>-incomplete" while this script rebuilds the overlays, the target
+# itself only after the last overlay is complete, so the overlays of a failed
+# rebuild (possibly of the other target) never pass for a complete set.
+printf '%s-incomplete\n' "$teavm_target" >"$overlay_work/TEAVM_TARGET"
+
 # Bring-up marker: a bring-up build writes $overlay_work/BRINGUP (the profile
 # and the listed patch ids) before it changes any overlay, and only a
 # complete build outside bring-up mode removes it.  build-teavm-release.sh
@@ -263,9 +293,19 @@ fi
 find "$classes" -type f -delete
 
 sources=()
+classlib_target_root="$(target_source_root "$source_root")"
 while IFS= read -r source; do
+  if [[ -f "$classlib_target_root/${source#"$source_root/"}" ]]; then
+    continue
+  fi
   sources+=("$source")
 done < <(find "$source_root" -type f -name '*.java' -print | sort)
+if [[ -d "$classlib_target_root" ]]; then
+  echo "Adding $teavm_target classlib overrides from $classlib_target_root"
+  while IFS= read -r source; do
+    sources+=("$source")
+  done < <(find "$classlib_target_root" -type f -name '*.java' -print | sort)
+fi
 for source in \
   "$root/port/src/main/java/org/teavm/classlib/java/net/TAuthenticator.java" \
   "$root/port/src/main/java/org/teavm/classlib/java/net/TIDN.java" \
@@ -282,6 +322,10 @@ for source in \
   "$root/port/src/main/java/org/teavm/classlib/java/nio/channels/TFileChannel.java" \
   "$root/port/src/main/java/org/teavm/classlib/java/nio/channels/TFileLock.java" \
   "$root/port/src/main/java/org/teavm/classlib/java/util/concurrent/locks/TLockSupport.java"; do
+  # A target-specific classlib root may replace one of these (wasmgc: TLockSupport).
+  if [[ -f "$classlib_target_root/${source#"$root/port/src/main/java/"}" ]]; then
+    continue
+  fi
   sources+=("$source")
 done
 if [[ "${#sources[@]}" -eq 0 ]]; then
@@ -296,11 +340,45 @@ done
 classpath="$classpath${java_classpath_separator}${java_maven_repository}/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
 classpath="$classpath${java_classpath_separator}$java_work_classpath"
 
+# JSPI mode (wasmgc, gaius.teavm.jspi; v0.4.0 design D3): TThread/TObject route their thread
+# and monitor primitives to TJspiThreadSupport (target-wasmgc root), which compiles against
+# the patched classes, so they are patched before the classlib overrides compile. The same
+# step applies the WebAssembly GC class library fixes (TeaVMClasslibWasmGcPatcher).
+classlib_jspi_patches=""
+if [[ "$teavm_target" == wasmgc ]]; then
+  classlib_jspi_patches="$overlay_work/classlib-jspi-patches"
+  classlib_jspi_tool="$overlay_work/classlib-jspi-tool"
+  rm -rf "$classlib_jspi_patches" "$classlib_jspi_tool"
+  mkdir -p "$classlib_jspi_patches" "$classlib_jspi_tool"
+  javac --release 21 -proc:none \
+    -classpath "$java_asm_jar${java_classpath_separator}$java_asm_tree_jar" \
+    -d "$classlib_jspi_tool" \
+    "$root/port/tools/src/main/java/dev/gaius/tools/TeaVMClasslibJspiPatcher.java" \
+    "$root/port/tools/src/main/java/dev/gaius/tools/TeaVMClasslibWasmGcPatcher.java"
+  java -classpath "$classlib_jspi_tool:$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar:$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar" \
+    dev.gaius.tools.TeaVMClasslibJspiPatcher "$upstream" "$classlib_jspi_patches"
+  # TeaVM 0.15 direct-buffer fixes that only the WebAssembly GC backend needs (TByteBufferNative).
+  java -classpath "$classlib_jspi_tool:$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar:$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar" \
+    dev.gaius.tools.TeaVMClasslibWasmGcPatcher "$upstream" "$classlib_jspi_patches"
+  native_jspi_patches="$classlib_jspi_patches"
+  if command -v cygpath >/dev/null 2>&1; then
+    native_jspi_patches="$(cygpath -m "$classlib_jspi_patches")"
+  fi
+  classpath="$native_jspi_patches${java_classpath_separator}$classpath"
+fi
+
 javac_with_source_argfile "$overlay_work/classlib-sources.argfile" \
   --release 21 -proc:none -classpath "$classpath" -d "$classes" \
   -- "${sources[@]}"
 cp "$upstream" "$output"
+if [[ -n "$classlib_jspi_patches" ]]; then
+  jar --update --file "$output" -C "$classlib_jspi_patches" .
+fi
 jar --update --file "$output" -C "$classes" .
+java_classlib_classes="$classes"
+if command -v cygpath >/dev/null 2>&1; then
+  java_classlib_classes="$(cygpath -m "$classes")"
+fi
 
 # Library overlays merge two source roots, with the same rules as the client
 # overrides: port/overrides/libraries/<name>/src/main/java is shared by every
@@ -322,7 +400,9 @@ build_library_overlay() {
   version_dir="$(dirname "$(dirname "$source_dir")")/versions/$artifact_version"
   local version_source_dir="$version_dir/java"
   local version_excludes="$version_dir/excludes.txt"
-  if [[ ! -d "$source_dir" && ! -d "$version_source_dir" ]]; then
+  local target_source_dir
+  target_source_dir="$(target_source_root "$source_dir")"
+  if [[ ! -d "$source_dir" && ! -d "$version_source_dir" && ! -d "$target_source_dir" ]]; then
     echo "Using unmodified $name base: no source overrides at $source_dir"
     mkdir -p "$(dirname "$output_jar")"
     cp "$source_jar" "$output_jar"
@@ -330,10 +410,16 @@ build_library_overlay() {
   fi
   local output_classes="$overlay_work/library-classes/$name"
   local java_source_jar="$(if command -v cygpath >/dev/null 2>&1; then cygpath -m "$source_jar"; else printf '%s' "$source_jar"; fi)"
-  local compile_classpath="$java_source_jar${java_classpath_separator}$java_client_jar${java_classpath_separator}$java_work_classpath"
+  # The classlib overlay classes (dev.gaius.browser.HostLoop, JsArrays) are shared
+  # by every overlay; TeaVM resolves them from the classlib overlay jar.
+  local compile_classpath="$java_source_jar${java_classpath_separator}$java_client_jar${java_classpath_separator}$java_classlib_classes${java_classpath_separator}$java_work_classpath"
   for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-platform; do
     compile_classpath="$compile_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
   done
+  if [[ "$teavm_target" == wasmgc ]]; then
+    # The wasmgc memory backend allocates with org.teavm.runtime.heap.Heap.
+    compile_classpath="$compile_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
+  fi
   local library_sources=()
   local relative_source
   local library_excludes
@@ -342,7 +428,8 @@ build_library_overlay() {
   if [[ -d "$source_dir" ]]; then
     while IFS= read -r source; do
       relative_source="${source#"$source_dir/"}"
-      if [[ -f "$version_source_dir/$relative_source" ]]; then
+      if [[ -f "$version_source_dir/$relative_source" \
+          || -f "$target_source_dir/$relative_source" ]]; then
         continue
       fi
       if [[ -n "$library_excludes" ]] \
@@ -355,8 +442,17 @@ build_library_overlay() {
   if [[ -d "$version_source_dir" ]]; then
     echo "Adding $name $artifact_version overrides from $version_source_dir"
     while IFS= read -r source; do
+      if [[ -f "$target_source_dir/${source#"$version_source_dir/"}" ]]; then
+        continue
+      fi
       library_sources+=("$source")
     done < <(find "$version_source_dir" -type f -name '*.java' -print | sort)
+  fi
+  if [[ -d "$target_source_dir" ]]; then
+    echo "Adding $name $teavm_target overrides from $target_source_dir"
+    while IFS= read -r source; do
+      library_sources+=("$source")
+    done < <(find "$target_source_dir" -type f -name '*.java' -print | sort)
   fi
 
   if [[ "${#library_sources[@]}" -eq 0 ]]; then
@@ -460,6 +556,7 @@ if command -v cygpath >/dev/null 2>&1; then
   java_authlib_jar="$(cygpath -m "$java_authlib_jar")"
 fi
 patch_registry_properties=(
+  "-Dgaius.teavm.target=$teavm_target"
   "-Dgaius.profile=$version"
   "-Dgaius.bringup=$bringup_active"
   "-Dgaius.bringup.list=$GAIUS_BRINGUP_LIST"
@@ -835,10 +932,18 @@ run_lwjgl_steps() {
   done
 }
 
+# wasmgc: BrowserMemory reaches the linear-memory buffer factory of the classlib
+# overlay (java.nio.GaiusLinearMemory) through a javac-visible stand-in, which
+# WasmGcAliasPatcher renames.
+lwjgl_target_steps=()
+if [[ "$teavm_target" == wasmgc ]]; then
+  lwjgl_target_steps+=(patcher:WasmGcAliasPatcher)
+fi
 run_lwjgl_steps \
   lwjgl \
   "$overlay_work/libraries/$lwjgl_path" \
   "$overlay_work/library-patches/lwjgl" \
+  ${lwjgl_target_steps[@]+"${lwjgl_target_steps[@]}"} \
   patcher:LwjglMemoryPatcher \
   guard:LwjglArchitectureGuard \
   guard:LwjglPlatformGuard \
@@ -971,6 +1076,7 @@ client_override_classes="$overlay_work/client-override-classes"
 client_override_root="$root/port/overrides/client/src/main/java"
 client_version_override_root="$root/port/overrides/client/src/versions/$version/java"
 client_version_excludes="$root/port/overrides/client/src/versions/$version/excludes.txt"
+client_target_override_root="$(target_source_root "$client_override_root")"
 mkdir -p "$client_patch_classes"
 find "$client_patch_classes" -type f -delete
 cp "$work/client-named.jar" "$client_output"
@@ -987,7 +1093,8 @@ client_override_sources=()
 client_excludes="$(gaius_version_excludes "$client_version_excludes" "$client_override_root")"
 while IFS= read -r source; do
   relative_source="${source#"$client_override_root/"}"
-  if [[ -f "$client_version_override_root/$relative_source" ]]; then
+  if [[ -f "$client_version_override_root/$relative_source" \
+      || -f "$client_target_override_root/$relative_source" ]]; then
     continue
   fi
   if [[ -n "$client_excludes" ]] \
@@ -998,11 +1105,20 @@ while IFS= read -r source; do
 done < <(find "$client_override_root" -type f -name '*.java' -print | sort)
 if [[ -d "$client_version_override_root" ]]; then
   while IFS= read -r source; do
+    if [[ -f "$client_target_override_root/${source#"$client_version_override_root/"}" ]]; then
+      continue
+    fi
     client_override_sources+=("$source")
   done < <(find "$client_version_override_root" -type f -name '*.java' -print | sort)
 fi
+if [[ -d "$client_target_override_root" ]]; then
+  echo "Adding $teavm_target client overrides from $client_target_override_root"
+  while IFS= read -r source; do
+    client_override_sources+=("$source")
+  done < <(find "$client_target_override_root" -type f -name '*.java' -print | sort)
+fi
 echo "Compiling ${#client_override_sources[@]} Minecraft $version browser overrides"
-client_override_classpath="$java_client_jar${java_classpath_separator}$java_work_classpath"
+client_override_classpath="$java_client_jar${java_classpath_separator}$java_classlib_classes${java_classpath_separator}$java_work_classpath"
 for artifact in teavm-interop teavm-jso teavm-jso-apis; do
   client_override_classpath="$client_override_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
@@ -1089,4 +1205,5 @@ if [[ "$bringup_active" == true ]]; then
 else
   rm -f "$bringup_marker"
 fi
+printf '%s\n' "$teavm_target" >"$overlay_work/TEAVM_TARGET"
 echo "$output"

@@ -135,6 +135,22 @@ gaius_refuse_bringup_release() {
   return 0
 }
 
+# The JavaScript build entry points (build-teavm.sh, build-teavm-server-worker.sh,
+# build-teavm-release.sh, build-version-release.sh) refuse an inherited
+# GAIUS_TEAVM_TARGET other than js: build-overlays.sh, generate-pom.sh and the
+# patchers read it, so it would build WebAssembly GC overlays and a
+# WEBASSEMBLY_GC POM into the JavaScript output roots (build-wasmgc.sh is the
+# wasmgc entry point).  Exports GAIUS_TEAVM_TARGET=js for the child scripts.
+gaius_require_js_target() {
+  local target="${GAIUS_TEAVM_TARGET:-js}"
+  if [[ "$target" != js ]]; then
+    echo "$(basename "$0") builds the JavaScript target, but GAIUS_TEAVM_TARGET=$target" >&2
+    echo "Unset GAIUS_TEAVM_TARGET, or build the wasmgc target with port/scripts/build-wasmgc.sh" >&2
+    return 1
+  fi
+  export GAIUS_TEAVM_TARGET=js
+}
+
 # Prints the patch ids of the profile's bring-up list, one per line.  Fails
 # on malformed lines so a typo cannot silently widen or narrow the list.
 # Whether a vanilla client jar uses the renderpearl render API (26.3+), whose

@@ -1,0 +1,17 @@
+# JavaScript-only patches that a GAIUS_TEAVM_TARGET=wasmgc overlay build skips
+# (PatchRegistry.runJsOnly prints "PATCH_TARGET_SKIPPED <patchId> target=wasmgc").
+# check-build-log-skips.mjs (G4) requires a wasmgc build log to skip exactly the
+# ids listed here for its profile, so a semantic patch cannot disappear from the
+# WebAssembly GC build by being marked runJsOnly, and a JavaScript accelerator
+# cannot reach it by losing the mark.  Each one must leave vanilla bytecode that
+# is exact on wasm (i64 and f32 are native there, casts saturate).
+#
+# <patchId> | <profiles: * or comma-separated ids> | <reason>
+MinecraftClientPatcher.patchBlockPosBrowserPackedCoordinates | * | BrowserBlockPos JSBody (BigInt) coordinate packing; the i64 shifts are native in wasm
+MinecraftClientPatcher.patchAquiferBrowserNearestCenters | * | nearest-center fast path for the JavaScript output; the vanilla code is exact and fast in wasm
+MinecraftClientPatcher.patchClimateRTreeNodeBrowserDoubleDistance | * | BrowserClimate distance in doubles instead of TeaVM's emulated longs; longs are native in wasm
+MinecraftClientPatcher.patchFriendlyByteBufBrowserLongArray | * | BrowserLongArrayCodec long-array codec for the JavaScript output; longs are native in wasm
+MinecraftClientPatcher.patchSimpleBitStorageBrowserUnpack | * | BrowserBitStorage unpacking for the JavaScript output; longs are native in wasm
+MinecraftClientPatcher.patchHeightmapBrowserStorage | * | cached BrowserBitStorage heightmap fields for the JavaScript output; vanilla BitStorage is native in wasm
+MinecraftClientPatcher.patchBufferBuilderBrowserFastVertex | * | byte-array vertex writers of the JavaScript BrowserMemory; the wasm BrowserMemory has no backing byte array
+MinecraftClientPatcher.patchByteBufferBuilderBrowserReserve | * | byte-array cache and Math.addExact removal for the JavaScript BrowserMemory; the wasm BrowserMemory has no backing byte array

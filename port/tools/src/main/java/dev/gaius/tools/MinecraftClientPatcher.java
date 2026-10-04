@@ -200,11 +200,11 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/server/level/ServerPlayerGameMode.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchChunkGeneratorStructureStateBrowserFastRings", () -> patchChunkGeneratorStructureStateBrowserFastRings(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/ChunkGeneratorStructureState.class")));
-        PatchRegistry.run("MinecraftClientPatcher.patchBlockPosBrowserPackedCoordinates", () -> patchBlockPosBrowserPackedCoordinates(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchBlockPosBrowserPackedCoordinates", () -> patchBlockPosBrowserPackedCoordinates(args[0], root.resolve(
                 "net/minecraft/core/BlockPos.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchBiomeManagerBrowserNearestCorner", () -> patchBiomeManagerBrowserNearestCorner(args[0], root.resolve(
                 "net/minecraft/world/level/biome/BiomeManager.class")));
-        PatchRegistry.run("MinecraftClientPatcher.patchAquiferBrowserNearestCenters", () -> patchAquiferBrowserNearestCenters(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchAquiferBrowserNearestCenters", () -> patchAquiferBrowserNearestCenters(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/Aquifer$NoiseBasedAquifer.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchBeardifierBrowserPackedCompute", () -> patchBeardifierBrowserPackedCompute(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/Beardifier.class")));
@@ -229,7 +229,7 @@ public final class MinecraftClientPatcher {
         PatchRegistry.run("MinecraftClientPatcher.patchClimateRTreeBrowserSynchronous", () -> patchClimateRTreeBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"),
                 deepWorldgenCheckpoints));
-        PatchRegistry.run("MinecraftClientPatcher.patchClimateRTreeNodeBrowserDoubleDistance", () -> patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchClimateRTreeNodeBrowserDoubleDistance", () -> patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$Node.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchSurfaceSystemBrowserSynchronous", () -> patchSurfaceSystemBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceSystem.class"),
@@ -255,17 +255,17 @@ public final class MinecraftClientPatcher {
         PatchRegistry.run("MinecraftClientPatcher.patchLevelChunkSectionBrowserSynchronous", () -> patchLevelChunkSectionBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/LevelChunkSection.class"),
                 deepWorldgenCheckpoints));
-        PatchRegistry.run("MinecraftClientPatcher.patchFriendlyByteBufBrowserLongArray", () -> patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchFriendlyByteBufBrowserLongArray", () -> patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
                 "net/minecraft/network/FriendlyByteBuf.class")));
-        PatchRegistry.run("MinecraftClientPatcher.patchSimpleBitStorageBrowserUnpack", () -> patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchSimpleBitStorageBrowserUnpack", () -> patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
                 "net/minecraft/util/SimpleBitStorage.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchProtoChunkBrowserHeightmapCache", () -> patchProtoChunkBrowserHeightmapCache(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/ProtoChunk.class")));
-        PatchRegistry.run("MinecraftClientPatcher.patchHeightmapBrowserStorage", () -> patchHeightmapBrowserStorage(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchHeightmapBrowserStorage", () -> patchHeightmapBrowserStorage(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/Heightmap.class")));
-        PatchRegistry.run("MinecraftClientPatcher.patchBufferBuilderBrowserFastVertex", () -> patchBufferBuilderBrowserFastVertex(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchBufferBuilderBrowserFastVertex", () -> patchBufferBuilderBrowserFastVertex(args[0], root.resolve(
                 "com/mojang/blaze3d/vertex/BufferBuilder.class")));
-        PatchRegistry.run("MinecraftClientPatcher.patchByteBufferBuilderBrowserReserve", () -> patchByteBufferBuilderBrowserReserve(args[0], root.resolve(
+        PatchRegistry.runJsOnly("MinecraftClientPatcher.patchByteBufferBuilderBrowserReserve", () -> patchByteBufferBuilderBrowserReserve(args[0], root.resolve(
                 "com/mojang/blaze3d/vertex/ByteBufferBuilder.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchCompiledSectionMeshBrowserVertexBufferReuse", () -> patchCompiledSectionMeshBrowserVertexBufferReuse(args[0], root.resolve(
                 "net/minecraft/client/renderer/chunk/CompiledSectionMesh.class")));

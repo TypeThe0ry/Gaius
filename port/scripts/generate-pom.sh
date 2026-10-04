@@ -72,6 +72,22 @@ output="$(gaius_resolve_path "$root" "${GAIUS_POM:-$build_root/generated-pom.xml
 #   STRIP_TELEMETRY      true drops the gaius-telemetry platform tag, so
 #                        @PlatformMarker("gaius-telemetry") checks compile to
 #                        false (build-teavm-release.sh sets it).
+# TeaVM backend (D2 of the v0.4.0 design): js (default, the existing build) or
+# wasmgc (TeaVM WEBASSEMBLY_GC).  wasmgc stages port/src/target-wasmgc/java over
+# the shared and profile sources, writes classes.wasm, needs overlays built for
+# the same target (build-overlays.sh with GAIUS_TEAVM_TARGET=wasmgc) and defaults
+# to stock TeaVM async analysis: the role options below cut async propagation,
+# which is only guarded by the JavaScript runtime (thread.js), so a WebAssembly
+# GC build turns them on only on explicit request.  A js POM is unchanged.
+teavm_target="${GAIUS_TEAVM_TARGET:-js}"
+case "$teavm_target" in
+  js|wasmgc) ;;
+  *)
+    echo "Invalid GAIUS_TEAVM_TARGET: $teavm_target (expected js or wasmgc)" >&2
+    exit 1
+    ;;
+esac
+
 teavm_role="${GAIUS_TEAVM_ROLE:-}"
 if [[ -z "$teavm_role" ]]; then
   if [[ "${GAIUS_MAIN_CLASS:-}" == "dev.gaius.browser.BrowserIntegratedServerMain" ]]; then
@@ -105,6 +121,11 @@ case "$teavm_role" in
     exit 1
     ;;
 esac
+if [[ "$teavm_target" == wasmgc ]]; then
+  default_sync_clinits=false
+  default_sync_monitors=false
+  default_async_barrier=none
+fi
 main_class="${GAIUS_MAIN_CLASS:-$default_main_class}"
 if [[ "$teavm_role" == "client" \
       && "$main_class" == "dev.gaius.browser.BrowserIntegratedServerMain" ]] \
@@ -170,7 +191,11 @@ if [[ -n "${GAIUS_TARGET_DIRECTORY:-}" ]]; then
 else
   target_directory="$(gaius_dist_directory "$root")"
 fi
-target_file="${GAIUS_TARGET_FILE:-classes.js}"
+if [[ "$teavm_target" == wasmgc ]]; then
+  target_file="${GAIUS_TARGET_FILE:-classes.wasm}"
+else
+  target_file="${GAIUS_TARGET_FILE:-classes.js}"
+fi
 maven_directory="$(gaius_resolve_path "$root" "${GAIUS_MAVEN_DIRECTORY:-$build_root/maven}")"
 resource_directory="$(gaius_resolve_path "$root" "${GAIUS_RESOURCE_DIRECTORY:-$build_root/generated-resources}")"
 patched_classlib="$overlay_directory/teavm-classlib-$teavm_version-gaius.jar"
@@ -219,6 +244,7 @@ fi
 shared_source_root="$root/port/src/main/java"
 version_source_root="$root/port/src/versions/$version/java"
 version_source_excludes="$root/port/src/versions/$version/excludes.txt"
+target_source_root="$root/port/src/target-$teavm_target/java"
 staged_source_directory="$build_root/sources"
 
 stage_profile_sources() {
@@ -237,6 +263,9 @@ stage_profile_sources() {
   done <<<"$excludes"
   if [[ -d "$version_source_root" ]]; then
     cp -R "$version_source_root/." "$staging/"
+  fi
+  if [[ -d "$target_source_root" ]]; then
+    cp -R "$target_source_root/." "$staging/"
   fi
   if [[ -d "$staged_source_directory" ]] \
       && diff -rq "$staged_source_directory" "$staging" >/dev/null 2>&1; then
@@ -285,6 +314,50 @@ if [[ ! -f "$metadata" || ! -f "$client" || ! -f "$patched_classlib" ]]; then
   echo "Run fetch-version.sh and remap-client.sh first" >&2
   echo "Then run build-overlays.sh" >&2
   exit 1
+fi
+# Overlays without a TEAVM_TARGET marker predate the marker and are js overlays.
+overlay_target="js"
+if [[ -f "$overlay_directory/TEAVM_TARGET" ]]; then
+  overlay_target="$(tr -d '\r\n' <"$overlay_directory/TEAVM_TARGET")"
+fi
+if [[ "$overlay_target" != "$teavm_target" ]]; then
+  echo "Overlays in $overlay_directory were built for TeaVM target $overlay_target, not $teavm_target" >&2
+  echo "Rebuild them with GAIUS_TEAVM_TARGET=$teavm_target build-overlays.sh" >&2
+  exit 1
+fi
+
+# Optional async census (TeaVMCoreBrowserPatcher, M0 spike S2): GAIUS_TEAVM_ASYNC_DUMP
+# names the census file; GAIUS_TEAVM_ASYNC_DUMP_STOP=true ends the compilation after it.
+async_dump_properties=""
+if [[ -n "${GAIUS_TEAVM_ASYNC_DUMP:-}" ]]; then
+  async_dump_properties="                <property>
+                  <name>gaius.teavm.asyncDump</name>
+                  <value>$(maven_path "$GAIUS_TEAVM_ASYNC_DUMP")</value>
+                </property>
+"
+  if [[ "${GAIUS_TEAVM_ASYNC_DUMP_STOP:-false}" == "true" ]]; then
+    async_dump_properties="$async_dump_properties                <property>
+                  <name>gaius.teavm.asyncDumpStop</name>
+                  <value>true</value>
+                </property>
+"
+  fi
+fi
+# JSPI mode (v0.4.0 design D3): the wasmgc roles compile no method as a coroutine and
+# suspend through WebAssembly.Suspending imports instead (GaiusTeaVMOptions.JSPI).
+# GAIUS_TEAVM_JSPI=false keeps TeaVM's coroutine (Fiber) mode for comparison runs.
+jspi_properties=""
+if [[ "$teavm_target" == wasmgc && "${GAIUS_TEAVM_JSPI:-true}" == "true" ]]; then
+  jspi_properties="                <property>
+                  <name>gaius.teavm.jspi</name>
+                  <value>true</value>
+                </property>
+"
+fi
+target_type_element=""
+if [[ "$teavm_target" == wasmgc ]]; then
+  target_type_element="              <targetType>WEBASSEMBLY_GC</targetType>
+"
 fi
 
 mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
@@ -472,7 +545,7 @@ $compiler_source_excludes
               <assertionsRemoved>$assertions_removed</assertionsRemoved>
               <stopOnErrors>true</stopOnErrors>
               <maxTopLevelNames>$max_top_level_names</maxTopLevelNames>
-              <properties>
+${target_type_element}              <properties>
                 <property>
                   <name>gaius.teavm.role</name>
                   <value>$teavm_role</value>
@@ -501,7 +574,7 @@ $compiler_source_excludes
                   <name>gaius.teavm.cutReport</name>
                   <value>$maven_maven_directory/gaius-teavm-sync-methods.txt</value>
                 </property>
-              </properties>
+${async_dump_properties}${jspi_properties}              </properties>
             </configuration>
           </execution>
         </executions>
@@ -513,5 +586,5 @@ EOF
 } >"$output"
 
 # Callers capture stdout as the POM path; the role summary goes to stderr.
-echo "TeaVM role $teavm_role: maxTopLevelNames=$max_top_level_names syncClinits=$teavm_sync_clinits syncMonitors=$teavm_sync_monitors asyncBarrier=$teavm_async_barrier pinRuntimeNames=$teavm_pin_runtime_names telemetry=$teavm_telemetry" >&2
+echo "TeaVM target $teavm_target role $teavm_role: maxTopLevelNames=$max_top_level_names syncClinits=$teavm_sync_clinits syncMonitors=$teavm_sync_monitors asyncBarrier=$teavm_async_barrier pinRuntimeNames=$teavm_pin_runtime_names telemetry=$teavm_telemetry" >&2
 echo "$output"

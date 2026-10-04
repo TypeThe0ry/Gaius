@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
 source "$root/port/scripts/teavm-publication-gate.sh"
+gaius_require_js_target || exit 2
 gaius_load_version_profile "$root"
 minecraft_version="$GAIUS_MINECRAFT_VERSION"
 build_root="$(gaius_build_root "$root")"
