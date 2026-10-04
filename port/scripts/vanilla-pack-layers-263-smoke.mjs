@@ -149,6 +149,24 @@ public final class VanillaPackLayersDriver {
 }
 `;
 
+// 26.3's StrictMath263 rewrite makes Mth (reached from Util.<clinit>) call
+// dev.gaius.browser.BrowserStrictMath, which lives in port/src. The driver compiles its JVM
+// twin, as section-task-queue-smoke.mjs does: the Math.fround JSBody natives become float
+// casts, which round the same way on the JVM.
+function writeStrictMathTwin(work) {
+  const source = readFileSync(join(root, "port/src/main/java/dev/gaius/browser/BrowserStrictMath.java"), "utf8");
+  const twin = source
+    .replace(/^import org\.teavm\.jso\.JSBody;\r?\n/m, "")
+    .replace(/@JSBody\(.*\)\r?\n\s*public static native float (\w+)\((\w+) value\);/g,
+      "public static float $1($2 value) {\n        return (float) value;\n    }");
+  assert.ok(!/\bnative\b/.test(twin.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "")),
+    "BrowserStrictMath gained a native the JVM twin does not cover");
+  const file = join(work, "strict-math/dev/gaius/browser/BrowserStrictMath.java");
+  mkdirSync(join(work, "strict-math/dev/gaius/browser"), {recursive: true});
+  writeFileSync(file, twin);
+  return file;
+}
+
 function runDriver(label, jar, work) {
   const classes = join(work, `classes-${label}`);
   const resources = join(work, `resources-${label}`);
@@ -158,7 +176,7 @@ function runDriver(label, jar, work) {
   const separator = process.platform === "win32" ? ";" : ":";
   const classpath = [jar, ...libraries()].join(separator);
   execFileSync(jdkTool("javac"), ["--release", "25", "-proc:none", "-nowarn", "-cp", classpath,
-    "-d", classes, join(work, "VanillaPackLayersDriver.java")], {stdio: "inherit"});
+    "-d", classes, join(work, "VanillaPackLayersDriver.java"), writeStrictMathTwin(work)], {stdio: "inherit"});
   const result = spawnSync(jdkTool("java"), ["-cp", [classes, resources, classpath].join(separator),
     "VanillaPackLayersDriver"], {encoding: "utf8", timeout: 180_000, maxBuffer: 64 << 20});
   if (result.status !== 0) {
