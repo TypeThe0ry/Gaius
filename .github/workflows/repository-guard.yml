@@ -131,7 +131,8 @@ jobs:
         run: |
           set -euo pipefail
           for script in port/web/boot/gaius-boot.js port/web/sw/gaius-sw.js port/web/kernels/*.js \
-              port/web/runtime/quality/*.js port/web/singleplayer/server-worker-bootstrap.js; do
+              port/web/runtime/quality/*.js port/web/singleplayer/server-worker-bootstrap.js \
+              port/web/runtime/wasmgc/*.js port/web/runtime/wasmgc/*.mjs port/web/runtime/webgpu/*.js; do
             node --check "$script"
           done
           node port/scripts/gaius-boot-smoke.mjs
