@@ -73,6 +73,30 @@ public final class GaiusTeaVMOptions {
     public static final String TELEMETRY = PREFIX + "telemetry";
     /** Optional file that receives the methods the async options compiled synchronously. */
     public static final String CUT_REPORT = PREFIX + "cutReport";
+    /**
+     * Optional file that receives the async method census (M0 spike S2): every method the
+     * async analysis made a coroutine, the root that made it async (an {@code @Async}
+     * primitive or a monitor), the virtual families that turn call sites async, and the
+     * async methods reachable from the client loop and the server tick. A summary goes to
+     * {@code <file>.summary.txt}. Reporting only: it never changes the output.
+     */
+    public static final String ASYNC_DUMP = PREFIX + "asyncDump";
+    /**
+     * "true" stops the compilation right after {@link #ASYNC_DUMP} is written, for census
+     * runs that do not need the generated code.
+     */
+    public static final String ASYNC_DUMP_STOP = PREFIX + "asyncDumpStop";
+    /**
+     * WebAssembly GC JSPI mode (DESIGN D3): the async analysis yields an empty set, so no
+     * method is compiled as a coroutine. Blocking primitives (monitors, wait/notify, sleep,
+     * park, thread start) suspend the whole wasm stack through WebAssembly.Suspending imports
+     * instead (dev.gaius.browser.JspiHost), and every Java thread runs as one
+     * WebAssembly.promising activation. The class library selects those primitives through
+     * the {@link #JSPI_TAG} platform tag. A reachable {@code @Async} method fails the build,
+     * because nothing would suspend for it. Only for the WEBASSEMBLY_GC target; exclusive with
+     * the coroutine cutting options.
+     */
+    public static final String JSPI = PREFIX + "jspi";
 
     /**
      * Platform tag present unless the role strips telemetry. Code marks a static boolean
@@ -83,6 +107,8 @@ public final class GaiusTeaVMOptions {
     public static final String TELEMETRY_TAG = "gaius-telemetry";
     /** Platform tag prefix for the role, for example {@code gaius-role-client}. */
     public static final String ROLE_TAG_PREFIX = "gaius-role-";
+    /** Platform tag of the JSPI mode ({@link #JSPI}), read by JspiHost.enabled(). */
+    public static final String JSPI_TAG = "gaius-jspi";
 
     /** JS counter of active frames that must not suspend (cut methods). */
     public static final String NO_SUSPEND_COUNTER = "globalThis.__gaiusNoSuspendDepth";
@@ -92,7 +118,7 @@ public final class GaiusTeaVMOptions {
 
     private static final Set<String> KNOWN_KEYS = Set.of(
             ROLE, SYNC_CLINITS, SYNC_MONITORS, ASYNC_BARRIER, PIN_RUNTIME_NAMES, TELEMETRY,
-            CUT_REPORT);
+            CUT_REPORT, ASYNC_DUMP, ASYNC_DUMP_STOP, JSPI);
     private static final Set<String> ROLES = Set.of("client", "singleplayer-worker");
 
     /**
@@ -115,7 +141,11 @@ public final class GaiusTeaVMOptions {
     private static boolean syncMonitors;
     private static boolean pinRuntimeNames;
     private static boolean telemetry = true;
+    private static boolean jspi;
     private static String cutReport;
+    private static String asyncDump;
+    private static boolean asyncDumpStop;
+    private static final Map<Object, Object> asyncCauses = new HashMap<>();
     private static List<String[]> barrierEntries = List.of();
     private static Set<String> barrierNames = Set.of();
     private static Set<String> barrierGroupNames = Set.of();
@@ -209,10 +239,16 @@ public final class GaiusTeaVMOptions {
         boolean newSyncMonitors = parseBoolean(gaius, SYNC_MONITORS, false);
         boolean newPin = parseBoolean(gaius, PIN_RUNTIME_NAMES, false);
         boolean newTelemetry = parseBoolean(gaius, TELEMETRY, true);
+        boolean newJspi = parseBoolean(gaius, JSPI, false);
         String newReport = gaius.get(CUT_REPORT);
         if (newReport != null && newReport.isEmpty()) {
             newReport = null;
         }
+        String newDump = gaius.get(ASYNC_DUMP);
+        if (newDump != null && newDump.isEmpty()) {
+            newDump = null;
+        }
+        boolean newDumpStop = parseBoolean(gaius, ASYNC_DUMP_STOP, false);
         Set<String> groups = new LinkedHashSet<>();
         String barrier = gaius.getOrDefault(ASYNC_BARRIER, "none");
         if (!barrier.isEmpty() && !barrier.equals("none")) {
@@ -226,10 +262,16 @@ public final class GaiusTeaVMOptions {
                 groups.add(trimmed);
             }
         }
+        if (newJspi && (newSyncClinits || newSyncMonitors || !groups.isEmpty())) {
+            throw new IllegalStateException(JSPI + " compiles no method as a coroutine; remove "
+                    + SYNC_CLINITS + ", " + SYNC_MONITORS + " and " + ASYNC_BARRIER
+                    + " from this role");
+        }
         if (configured) {
             if (!newRole.equals(role) || newSyncClinits != syncClinits
                     || newSyncMonitors != syncMonitors || newPin != pinRuntimeNames
-                    || newTelemetry != telemetry || !groups.equals(barrierGroupNames)) {
+                    || newTelemetry != telemetry || newJspi != jspi
+                    || !groups.equals(barrierGroupNames)) {
                 throw new IllegalStateException(
                         "The Gaius TeaVM options changed during one compilation");
             }
@@ -248,7 +290,10 @@ public final class GaiusTeaVMOptions {
         syncMonitors = newSyncMonitors;
         pinRuntimeNames = newPin;
         telemetry = newTelemetry;
+        jspi = newJspi;
         cutReport = newReport;
+        asyncDump = newDump;
+        asyncDumpStop = newDumpStop;
         barrierEntries = List.copyOf(entries);
         barrierNames = Set.copyOf(names);
         barrierGroupNames = Collections.unmodifiableSet(groups);
@@ -256,7 +301,8 @@ public final class GaiusTeaVMOptions {
         System.out.println("[gaius-teavm] role=" + role + " syncClinits=" + syncClinits
                 + " syncMonitors=" + syncMonitors + " asyncBarrier="
                 + (groups.isEmpty() ? "none" : String.join(",", groups))
-                + " pinRuntimeNames=" + pinRuntimeNames + " telemetry=" + telemetry);
+                + " pinRuntimeNames=" + pinRuntimeNames + " telemetry=" + telemetry
+                + " jspi=" + jspi);
     }
 
     private static boolean parseBoolean(Map<String, String> values, String key, boolean fallback) {
@@ -301,6 +347,9 @@ public final class GaiusTeaVMOptions {
         if (telemetry) {
             tags.add(TELEMETRY_TAG);
         }
+        if (jspi) {
+            tags.add(JSPI_TAG);
+        }
         return tags.toArray(new String[0]);
     }
 
@@ -310,6 +359,45 @@ public final class GaiusTeaVMOptions {
 
     public static boolean syncMonitors() {
         return syncMonitors;
+    }
+
+    public static boolean jspi() {
+        return jspi;
+    }
+
+    /**
+     * Patched {@code AsyncMethodFinder.find} start: true in JSPI mode, where the analysis
+     * stops with an empty async set. Fails the build when an {@code @Async} method is still
+     * reachable: its callers would run it synchronously and its callback would never resume
+     * them. The class library replaces every {@code @Async} primitive with a JspiHost import
+     * when the gaius-jspi tag is present (TeaVMClasslibJspiPatcher).
+     */
+    public static synchronized boolean jspiSkipAsyncAnalysis(Object classSource, Object dependency) {
+        if (!jspi) {
+            return false;
+        }
+        Object reachable = invoke(dependency, "getReachableMethods");
+        List<String> violations = new ArrayList<>();
+        for (Object name : (Collection<?>) invoke(classSource, "getClassNames")) {
+            Object cls = invoke(classSource, "get", name);
+            if (cls == null) {
+                continue;
+            }
+            for (Object method : (Collection<?>) invoke(cls, "getMethods")) {
+                if (hasAnnotation(method, "org.teavm.interop.Async")
+                        && (Boolean) invoke(reachable, "contains", invoke(method, "getReference"))) {
+                    violations.add(String.valueOf(invoke(method, "getReference")));
+                }
+            }
+        }
+        if (!violations.isEmpty()) {
+            Collections.sort(violations);
+            throw new IllegalStateException(JSPI + ": " + violations.size()
+                    + " @Async methods are reachable but nothing suspends for them in JSPI mode"
+                    + " (route them through JspiHost): " + violations);
+        }
+        System.out.println("[gaius-teavm] jspi: async analysis skipped, 0 coroutine methods");
+        return true;
     }
 
     public static boolean pinRuntimeNames() {
@@ -330,6 +418,7 @@ public final class GaiusTeaVMOptions {
 
     /** Patched {@code AsyncMethodFinder.find} start. */
     public static synchronized void beginAsyncAnalysis() {
+        asyncCauses.clear();
         cutMethods.clear();
         cutCounts.clear();
         cutDescriptions.clear();
@@ -496,6 +585,457 @@ public final class GaiusTeaVMOptions {
     /** Patched {@code Renderer.renderRegularBody}: JS written after the method body. */
     public static synchronized String guardClose(Object methodRef) {
         return cutMethods.contains(methodRef) ? GUARD_CLOSE : null;
+    }
+
+    /**
+     * Patched {@code AsyncMethodFinder.add}, right after a method joined the async set: keeps
+     * the finder's call stack (the chain from this method down to the root that made it
+     * async) for {@link #dumpAsync}. A no-op without {@link #ASYNC_DUMP}.
+     */
+    public static synchronized void recordAsync(Object methodRef, Object callStack) {
+        if (asyncDump != null) {
+            asyncCauses.put(methodRef, callStack);
+        }
+    }
+
+    /** Methods whose forward call closure the census reports, as class name and method name. */
+    private static final String[][] CENSUS_ENTRIES = {
+        {"net.minecraft.client.Minecraft", "run"},
+        {"net.minecraft.client.Minecraft", "renderFrame"},
+        {"net.minecraft.client.Minecraft", "tick"},
+        {"net.minecraft.client.renderer.GameRenderer", "render"},
+        {"net.minecraft.server.MinecraftServer", "runServer"},
+        {"net.minecraft.server.MinecraftServer", "tickServer"},
+        {"net.minecraft.server.MinecraftServer", "tickChildren"},
+    };
+
+    /**
+     * Patched {@code AsyncMethodFinder.find} end: writes the async census to
+     * {@link #ASYNC_DUMP} (no-op without it). Reads the finder's fields reflectively.
+     */
+    public static synchronized void dumpAsync(Object finder) {
+        if (asyncDump == null) {
+            return;
+        }
+        try {
+            writeAsyncCensus(finder);
+        } catch (RuntimeException | Error failure) {
+            if (asyncDumpStop) {
+                throw failure;
+            }
+            // Reporting only: a census failure must not fail the compilation.
+            System.out.println("[gaius-teavm] async census failed: " + failure);
+            failure.printStackTrace(System.out);
+        }
+        if (asyncDumpStop) {
+            throw new IllegalStateException("Gaius async census written to " + asyncDump
+                    + "; stopping the compilation as " + ASYNC_DUMP_STOP + " requests");
+        }
+    }
+
+    private static void writeAsyncCensus(Object finder) {
+        long started = System.nanoTime();
+        Set<?> asyncMethods = (Set<?>) field(finder, "asyncMethods");
+        Map<?, ?> families = (Map<?, ?>) field(finder, "asyncFamilyMethods");
+        Object callGraph = field(finder, "callGraph");
+        Object classSource = field(finder, "classSource");
+        Set<String> async = new TreeSet<>();
+        Map<String, String> rootOf = new HashMap<>();
+        Map<String, String> viaOf = new HashMap<>();
+        Map<String, Integer> rootCounts = new TreeMap<>();
+        Map<String, Integer> rootKinds = new TreeMap<>();
+        Map<String, String> kindCache = new HashMap<>();
+        for (Object method : asyncMethods) {
+            String name = String.valueOf(method);
+            async.add(name);
+            Object stack = asyncCauses.get(method);
+            String root = name;
+            String via = "";
+            if (stack != null) {
+                Object next = field(stack, "next");
+                if (next != null) {
+                    via = String.valueOf(field(next, "method"));
+                }
+                Object last = stack;
+                for (Object cursor = stack; cursor != null; cursor = field(cursor, "next")) {
+                    last = cursor;
+                }
+                root = String.valueOf(field(last, "method"));
+            }
+            rootOf.put(name, root);
+            viaOf.put(name, via);
+            rootCounts.merge(root, 1, Integer::sum);
+        }
+        for (String root : rootCounts.keySet()) {
+            rootKinds.merge(rootKind(classSource, root, kindCache), rootCounts.get(root),
+                    Integer::sum);
+        }
+        Set<String> familyMembers = new TreeSet<>();
+        for (Map.Entry<?, ?> entry : families.entrySet()) {
+            if (Boolean.TRUE.equals(entry.getValue())) {
+                familyMembers.add(String.valueOf(entry.getKey()));
+            }
+        }
+        List<String> summary = new ArrayList<>();
+        summary.add("role=" + role + " syncClinits=" + syncClinits + " syncMonitors=" + syncMonitors
+                + " asyncBarrier=" + (barrierGroupNames.isEmpty() ? "none"
+                        : String.join(",", barrierGroupNames)));
+        summary.add("asyncMethods=" + async.size() + " asyncFamilyMethods=" + familyMembers.size()
+                + " cut=" + cutMethods.size());
+        summary.add("rootKinds=" + rootKinds);
+        List<Map.Entry<String, Integer>> topRoots = new ArrayList<>(rootCounts.entrySet());
+        topRoots.sort((left, right) -> Integer.compare(right.getValue(), left.getValue()));
+        summary.add("topRoots:");
+        for (int index = 0; index < Math.min(40, topRoots.size()); index++) {
+            Map.Entry<String, Integer> root = topRoots.get(index);
+            summary.add("  " + root.getValue() + "  "
+                    + rootKind(classSource, root.getKey(), kindCache) + "  " + root.getKey());
+        }
+        List<String> lines = new ArrayList<>();
+        for (String[] entry : CENSUS_ENTRIES) {
+            for (Object start : entryMethods(classSource, entry[0], entry[1])) {
+                Object node = invoke(callGraph, "getNode", start);
+                if (node == null) {
+                    summary.add("entry " + start + ": not in the call graph");
+                    continue;
+                }
+                Set<String> reachable = new HashSet<>();
+                Set<String> reachableAsync = new TreeSet<>();
+                ArrayDeque<Object> pending = new ArrayDeque<>();
+                pending.add(node);
+                reachable.add(String.valueOf(start));
+                while (!pending.isEmpty()) {
+                    Object current = pending.poll();
+                    String currentName = String.valueOf(invoke(current, "getMethod"));
+                    if (async.contains(currentName)) {
+                        reachableAsync.add(currentName);
+                    }
+                    for (Object site : (Collection<?>) invoke(current, "getCallSites")) {
+                        for (Object callee : (Collection<?>) invoke(site, "getCalledMethods")) {
+                            if (reachable.add(String.valueOf(invoke(callee, "getMethod")))) {
+                                pending.add(callee);
+                            }
+                        }
+                    }
+                }
+                Map<String, Integer> kinds = new TreeMap<>();
+                for (String method : reachableAsync) {
+                    kinds.merge(rootKind(classSource, rootOf.get(method), kindCache), 1,
+                            Integer::sum);
+                }
+                summary.add("entry " + start + ": reachable=" + reachable.size()
+                        + " reachableAsync=" + reachableAsync.size() + " byRootKind=" + kinds
+                        + " entryAsync=" + async.contains(String.valueOf(start)));
+                lines.add("# entry " + start + " reachableAsync=" + reachableAsync.size());
+                for (String method : reachableAsync) {
+                    lines.add("R\t" + start + "\t" + method);
+                }
+            }
+        }
+        for (String method : async) {
+            lines.add("A\t" + method + "\t" + rootKind(classSource, rootOf.get(method), kindCache)
+                    + "\t" + rootOf.get(method) + "\t" + viaOf.get(method));
+        }
+        for (String method : familyMembers) {
+            lines.add("F\t" + method);
+        }
+        summary.add("census time " + (System.nanoTime() - started) / 1_000_000 + " ms");
+        try {
+            Path path = Path.of(asyncDump);
+            if (path.getParent() != null) {
+                Files.createDirectories(path.getParent());
+            }
+            Files.write(path, lines, StandardCharsets.UTF_8);
+            Files.write(Path.of(asyncDump + ".summary.txt"), summary, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not write " + asyncDump, e);
+        }
+        for (String line : summary) {
+            System.out.println("[gaius-teavm] async census: " + line);
+        }
+    }
+
+    /** {@code async} for an {@code @Async} root, {@code monitor...} for any other root. */
+    private static String rootKind(Object classSource, String root, Map<String, String> cache) {
+        if (root == null) {
+            return "unknown";
+        }
+        String cached = cache.get(root);
+        if (cached != null) {
+            return cached;
+        }
+        String kind = "unknown";
+        int paren = root.indexOf('(');
+        int dot = paren < 0 ? -1 : root.lastIndexOf('.', paren);
+        if (dot >= 0) {
+            String className = root.substring(0, dot);
+            Object cls = invoke(classSource, "get", className);
+            if (cls != null) {
+                for (Object method : (Iterable<?>) invoke(cls, "getMethods")) {
+                    if (String.valueOf(invoke(method, "getReference")).equals(root)) {
+                        if (hasAnnotation(method, "org.teavm.interop.Async")) {
+                            kind = "async";
+                        } else {
+                            kind = hasModifier(method, "SYNCHRONIZED")
+                                    ? "monitor-synchronized" : "monitor";
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        cache.put(root, kind);
+        return kind;
+    }
+
+    private static List<Object> entryMethods(Object classSource, String className, String name) {
+        List<Object> result = new ArrayList<>();
+        Object cls = invoke(classSource, "get", className);
+        if (cls == null) {
+            return result;
+        }
+        for (Object method : (Iterable<?>) invoke(cls, "getMethods")) {
+            if (name.equals(invoke(method, "getName"))) {
+                result.add(invoke(method, "getReference"));
+            }
+        }
+        return result;
+    }
+
+    private static Object field(Object target, String name) {
+        Class<?> type = target.getClass();
+        while (type != null) {
+            try {
+                java.lang.reflect.Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field.get(target);
+            } catch (NoSuchFieldException e) {
+                type = type.getSuperclass();
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot read " + name + " of "
+                        + target.getClass(), e);
+            }
+        }
+        throw new IllegalStateException("TeaVM API changed: no field " + name + " in "
+                + target.getClass().getName());
+    }
+
+    /** Exception classes whose catch clauses {@link #wasmCatchBranch} dropped (logged once). */
+    private static final Set<String> droppedWasmCatchTypes = new TreeSet<>();
+
+    /**
+     * Patched {@code WasmGCInstructionGenerationVisitor.visit(TryCatchStatement)} (WebAssembly GC
+     * only): the {@code br_on_cast} of one catch clause. TeaVM 0.15 gives a class that is not
+     * in the reachable class source (named by a catch clause but missing from the class path,
+     * so never instantiated) a struct type without its supertype chain, and the cast from
+     * Throwable to it fails validation ("invalid types for br_on_cast"). No thrown object can
+     * have such a class, so the clause is dropped: its handler stays in the code but nothing
+     * branches to it. The
+     * struct (which has the fields of java.lang.Object) is declared a subtype of the Object
+     * struct, so the handler, which stores the exception in a local, still validates.
+     *
+     * <p>This is the fallback behind {@link #wasmDropUnreachableCatches}, which already removes
+     * those clauses from the program (the 26.3 client and server builds never reach this path).
+     * It is fail-closed: a clause is only dropped when {@code exceptionType} is absent from the
+     * reachable class source (the same view as {@link #wasmDropUnreachableCatches}). A reachable
+     * class whose struct lost its supertype chain would be a different TeaVM defect, and
+     * dropping its clause would let the exception escape the handler that catches it on the JVM,
+     * so the build fails instead.
+     *
+     * @param visitor the WasmGCInstructionGenerationVisitor (its generation context holds the
+     *     class hierarchy)
+     * @param exceptionType the Java class name of the clause (java.lang.Throwable for a
+     *     catch-all clause)
+     */
+    public static synchronized Object wasmCatchBranch(Object builder, Object condition, Object from,
+            Object to, Object target, Object visitor, String exceptionType) {
+        Object fromType = compositeOf(from);
+        Object toType = compositeOf(to);
+        if (fromType != null && toType != null && !isWasmSupertype(fromType, toType)) {
+            Object classSource = invoke(invoke(fieldValue(visitor, "context"), "hierarchy"),
+                    "getClassSource");
+            if (exceptionType == null || invoke(classSource, "get", exceptionType) != null) {
+                throw new IllegalStateException("Gaius: the WebAssembly GC struct of the reachable "
+                        + "exception class " + exceptionType + " (" + invoke(toType, "getName")
+                        + ") is not a subtype of " + invoke(fromType, "getName") + ", so its catch "
+                        + "clause cannot be compiled; dropping it would change which handler "
+                        + "catches the exception. TeaVM lost the supertype chain of a reachable "
+                        + "class (GaiusTeaVMOptions.wasmCatchBranch only drops clauses of "
+                        + "unreachable classes).");
+            }
+            Object root = fromType;
+            for (Object parent = invoke(root, "getSupertype"); parent != null;
+                    parent = invoke(root, "getSupertype")) {
+                root = parent;
+            }
+            if (invoke(toType, "getSupertype") == null && toType != root) {
+                invoke(toType, "setSupertype", root);
+            }
+            String name = String.valueOf(invoke(toType, "getName"));
+            if (droppedWasmCatchTypes.add(name)) {
+                System.out.println("[gaius-teavm] wasm: dropped the catch clause of unreachable class "
+                        + name);
+            }
+            return builder;
+        }
+        return invoke(builder, "castBranch", condition, from, to, target);
+    }
+
+    /** Methods whose catch clauses of unreachable classes {@link #wasmDropUnreachableCatches} removed. */
+    private static int droppedWasmCatchMethods;
+
+    /**
+     * Patched {@code WasmGCMethodGenerator.generateRegularMethodBody} (WebAssembly GC only),
+     * before the method is decompiled: removes the try/catch edges whose exception class the
+     * dependency analysis never reached and deletes the handlers that become unreachable. No
+     * thrown object can have such a class, so this is exact; it matters because TeaVM 0.15 maps
+     * the handler's exception variable to java.lang.Object while the handler code still passes
+     * it where a Throwable is expected, which does not validate.
+     *
+     * <p>{@code hierarchy.getClassSource()} is the class set after the dependency analysis, not
+     * the class path (TeaVM 0.15): {@code TeaVM.build} hands that set to
+     * {@code WasmGCTarget.emit}, {@code WasmGCDeclarationsGenerator} wraps it in the
+     * ClassHierarchy it passes to WasmGCMethodGenerator, and both pipelines restrict it to the
+     * reached classes that exist ({@code TeaVM.link} copies only those;
+     * {@code TeaVM$PostProcessingClassHolderSource.get} returns null for any other name).
+     * TeaVM's DependencyGraphBuilder links the exception type of every catch clause of a reached
+     * method, so a class that exists on the class path is always in that set when a generated
+     * method catches it: the null case is a class missing from the class path (the 26.3 builds
+     * drop UnsatisfiedLinkError, InvalidKeyException and other classes absent from the TeaVM
+     * class library), and no object of it can exist. Subclasses do not change this:
+     * {@code DependencyAnalyzer.linkClass} links the superclass and the interfaces of every class
+     * it reaches and reports a missing one as a compile error. GaiusTeaVMOptionsWasmTest
+     * (port/tools/src/test) pins these points through a TeaVM compile: the hierarchy of the code
+     * generation reads null for a class on the class path that nothing references, the catch of
+     * a class missing from the class path is dropped, and the catch of a class that only the
+     * catch clause names is kept.
+     */
+    public static synchronized void wasmDropUnreachableCatches(Object generator, Object method) {
+        Object program = invoke(method, "getProgram");
+        if (program == null) {
+            return;
+        }
+        Object classSource = invoke(fieldValue(generator, "hierarchy"), "getClassSource");
+        boolean changed = false;
+        for (Object block : (Iterable<?>) invoke(program, "getBasicBlocks")) {
+            if (block == null) {
+                continue;
+            }
+            List<?> tryCatches = (List<?>) invoke(block, "getTryCatchBlocks");
+            for (int i = tryCatches.size() - 1; i >= 0; i--) {
+                Object tryCatch = tryCatches.get(i);
+                Object type = invoke(tryCatch, "getExceptionType");
+                if (type == null || invoke(classSource, "get", type) != null) {
+                    continue;
+                }
+                Object handler = invoke(tryCatch, "getHandler");
+                tryCatches.remove(i);
+                boolean stillLinked = false;
+                for (Object other : tryCatches) {
+                    if (invoke(other, "getHandler") == handler) {
+                        stillLinked = true;
+                    }
+                }
+                if (!stillLinked) {
+                    invoke(handler, "removeIncomingsFrom", block);
+                }
+                changed = true;
+            }
+        }
+        if (!changed) {
+            return;
+        }
+        droppedWasmCatchMethods++;
+        try {
+            Class<?> eliminator = Class.forName("org.teavm.model.optimization.UnreachableBasicBlockEliminator",
+                    true, program.getClass().getClassLoader());
+            invoke(eliminator.getConstructor().newInstance(), "optimize", program);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: UnreachableBasicBlockEliminator", e);
+        }
+        if (droppedWasmCatchMethods <= 20) {
+            System.out.println("[gaius-teavm] wasm: dropped catch clauses of unreachable classes in "
+                    + invoke(method, "getReference"));
+        }
+    }
+
+    private static Object fieldValue(Object target, String name) {
+        for (Class<?> type = target.getClass(); type != null; type = type.getSuperclass()) {
+            try {
+                java.lang.reflect.Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field.get(target);
+            } catch (NoSuchFieldException e) {
+                // Declared further up.
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("TeaVM API changed: " + type.getName() + "." + name, e);
+            }
+        }
+        throw new IllegalStateException("TeaVM API changed: no field " + name + " on " + target.getClass());
+    }
+
+    /**
+     * Patched {@code WasmGCMethodGenerator.generateRegularMethodBody} (WebAssembly GC only),
+     * after the body is generated: when every path of a value-returning method returns or
+     * throws inside a block, TeaVM 0.15 ends the body with that block, but a wasm validator
+     * treats the end of a block, loop, if or try_table as reachable and finds no return value
+     * ("expected 1 elements on the stack for fallthru, found 0"). An {@code unreachable} after
+     * a block without a result is never executed and makes the body valid.
+     *
+     * <p>Only that shape is touched: a void function, an empty body, a body whose last
+     * instruction is anything but a block, if or try (a {@code return}, a value expression)
+     * and a structured instruction that has a result are left as they are. TeaVM generates
+     * statements with an empty operand stack between them, so nothing below the final block
+     * could have been the return value either: every body this changes was invalid before.
+     */
+    public static void wasmSealFunctionBody(Object function) {
+        Object type = invoke(function, "getType");
+        if (invoke(type, "getSingleReturnType") == null) {
+            return;
+        }
+        Object body = invoke(function, "getBody");
+        Object last = invoke(body, "getLast");
+        if (last == null) {
+            return;
+        }
+        String kind = last.getClass().getSimpleName();
+        if (!kind.equals("WasmBlock") && !kind.equals("WasmConditional") && !kind.equals("WasmTry")) {
+            return;
+        }
+        // A structured instruction without a result cannot provide the return value, so the
+        // Java method never reaches its end (javac guarantees a return or throw on every path).
+        if (invoke(last, "getType") != null) {
+            return;
+        }
+        try {
+            Class<?> unreachable = Class.forName("org.teavm.backend.wasm.model.instruction.WasmUnreachable",
+                    true, last.getClass().getClassLoader());
+            invoke(body, "add", unreachable.getConstructor().newInstance());
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: WasmUnreachable", e);
+        }
+    }
+
+    private static Object compositeOf(Object reference) {
+        try {
+            return reference.getClass().getField("composite").get(reference);
+        } catch (NoSuchFieldException e) {
+            return null;
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("TeaVM API changed: WasmType.CompositeReference", e);
+        }
+    }
+
+    private static boolean isWasmSupertype(Object supertype, Object type) {
+        if (!type.getClass().getSimpleName().equals("WasmStructure")) {
+            return true;
+        }
+        for (Object current = type; current != null; current = invoke(current, "getSupertype")) {
+            if (current == supertype) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Object invoke(Object target, String name, Object... arguments) {

@@ -19,6 +19,7 @@ import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
@@ -44,10 +45,24 @@ import org.objectweb.asm.tree.VarInsnNode;
  * the telemetry platform tag.</li>
  * <li>thread.js: a suspension inside a method that those options compiled synchronously
  * throws instead of corrupting the coroutine stack.</li>
+ * <li>JSPI mode (gaius.teavm.jspi, WebAssembly GC only): AsyncMethodFinder.find stops with
+ * an empty async set, so no method is compiled as a coroutine.</li>
+ * <li>WebAssembly GC code generation (TeaVM 0.15 emits invalid wasm otherwise): catch clauses
+ * of classes the dependency analysis never reached are removed from the program, and a value-returning body that
+ * ends with a block without a result gets a closing {@code unreachable}; class-path resource
+ * reads honour the array offset (WasmGCResources.readBytes) and the InputStream contract for
+ * the range and for an empty read (ResourceInputStream.read).</li>
+ * <li>Heap.alloc (Wasm GC off-heap memory) also grows by the record header when the last
+ * record is allocated (TeaVM 0.16 fix; skipped when the TeaVM version already has it).</li>
+ * <li>Async census (gaius.teavm.asyncDump, reporting only): AsyncMethodFinder records why each
+ * method became async and writes the census when the analysis ends; it is shared by the
+ * JavaScript and WebAssembly GC backends.</li>
  * </ul>
  *
  * <p>Every patch locates its bytecode or text anchor exactly and throws when the TeaVM shape
- * differs; the patched jar only exists for TeaVM 0.15.
+ * differs; the patched jar only exists for TeaVM 0.15. Where TeaVM 0.16 carries the same fix
+ * (the ClassInfoGenerator null guard, Heap.alloc), the patch detects it and leaves the class
+ * as it is.
  */
 public final class TeaVMCoreBrowserPatcher {
     private static final String CLASS =
@@ -56,6 +71,12 @@ public final class TeaVMCoreBrowserPatcher {
             "org/teavm/runtime/fs/memory/InMemoryVirtualFileSystem.class";
     private static final String ASYNC_FINDER_CLASS = "org/teavm/model/util/AsyncMethodFinder";
     private static final String RENDERER_CLASS = "org/teavm/backend/javascript/rendering/Renderer";
+    private static final String WASM_GC_VISITOR =
+            "org/teavm/backend/wasm/generate/methods/WasmGCInstructionGenerationVisitor";
+    private static final String WASM_GC_METHOD_GENERATOR =
+            "org/teavm/backend/wasm/generate/methods/WasmGCMethodGenerator";
+    private static final String WASM_GC_RESOURCES = "org/teavm/backend/wasm/runtime/WasmGCResources";
+    private static final String WASM_GC_RESOURCE_STREAM = WASM_GC_RESOURCES + "$ResourceInputStream";
     private static final String SOURCE_WRITER = "org/teavm/backend/javascript/codegen/SourceWriter";
     private static final String TEAVM_CLASS = "org/teavm/vm/TeaVM";
     private static final String MINIFYING_ALIASES =
@@ -67,6 +88,9 @@ public final class TeaVMCoreBrowserPatcher {
             "org/teavm/backend/javascript/rendering/RenderingUtil";
     private static final String THREAD_JS = "org/teavm/backend/javascript/thread.js";
     private static final String OPTIONS = "dev/gaius/tools/runtime/GaiusTeaVMOptions";
+    private static final String HEAP_CLASS = "org/teavm/runtime/heap/Heap";
+    private static final String HEAP_RECORD = "org/teavm/runtime/heap/HeapRecord";
+    private static final String STRUCTURE = "org/teavm/interop/Structure";
     /** Helper classes the patched TeaVM classes call; copied into the patched jar. */
     private static final List<String> RUNTIME_HELPERS = List.of(OPTIONS);
     private static final String PINNED_NAME_METHOD = "gaiusPinnedTopLevelName";
@@ -174,6 +198,7 @@ public final class TeaVMCoreBrowserPatcher {
         VarInsnNode classLoad = null;
         LabelNode continueLabel = null;
         boolean sawClassLookup = false;
+        boolean alreadyGuarded = false;
         for (var instruction = method.instructions.getFirst();
                 instruction != null;
                 instruction = instruction.getNext()) {
@@ -187,6 +212,9 @@ public final class TeaVMCoreBrowserPatcher {
                     && variable.var == 10) {
                 classLoad = variable;
                 sawClassLookup = false;
+                // TeaVM 0.16 skips a missing class itself (if (cls == null || ...) continue).
+                alreadyGuarded = nextReal(variable) instanceof JumpInsnNode jump
+                        && jump.getOpcode() == Opcodes.IFNULL;
             } else if (instruction instanceof IincInsnNode increment
                     && increment.var == 7
                     && increment.incr == 1) {
@@ -198,10 +226,12 @@ public final class TeaVMCoreBrowserPatcher {
         if (classLoad == null || continueLabel == null) {
             throw new IllegalStateException("TeaVM ClassInfoGenerator patch point not found");
         }
-        InsnList nullGuard = new InsnList();
-        nullGuard.add(new VarInsnNode(Opcodes.ALOAD, 10));
-        nullGuard.add(new JumpInsnNode(Opcodes.IFNULL, continueLabel));
-        method.instructions.insertBefore(classLoad, nullGuard);
+        if (!alreadyGuarded) {
+            InsnList nullGuard = new InsnList();
+            nullGuard.add(new VarInsnNode(Opcodes.ALOAD, 10));
+            nullGuard.add(new JumpInsnNode(Opcodes.IFNULL, continueLabel));
+            method.instructions.insertBefore(classLoad, nullGuard);
+        }
 
         ClassWriter writer = new ClassWriter(
                 ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
@@ -258,6 +288,18 @@ public final class TeaVMCoreBrowserPatcher {
         writePatched(patchRoot, DEFAULT_ALIASES,
                 patchDefaultAliasProvider(readClass(jarPath, DEFAULT_ALIASES)));
         writeText(patchRoot, THREAD_JS, patchThreadRuntime(readText(jarPath, THREAD_JS)));
+        writePatchedKeepFrames(patchRoot, WASM_GC_VISITOR,
+                patchWasmGcCatchBranch(readClass(jarPath, WASM_GC_VISITOR)));
+        writePatchedKeepFrames(patchRoot, WASM_GC_METHOD_GENERATOR,
+                patchWasmGcFunctionSeal(readClass(jarPath, WASM_GC_METHOD_GENERATOR)));
+        writePatchedKeepFrames(patchRoot, WASM_GC_RESOURCES,
+                patchWasmGcResourceRead(readClass(jarPath, WASM_GC_RESOURCES)));
+        writePatchedKeepFrames(patchRoot, WASM_GC_RESOURCE_STREAM,
+                patchWasmGcResourceStreamRead(readClass(jarPath, WASM_GC_RESOURCE_STREAM)));
+        ClassNode heap = readClass(jarPath, HEAP_CLASS);
+        if (patchHeapAllocGrowth(heap)) {
+            writePatched(patchRoot, HEAP_CLASS, heap);
+        }
         copyRuntimeHelpers(patchRoot);
     }
 
@@ -294,6 +336,200 @@ public final class TeaVMCoreBrowserPatcher {
         Path output = patchRoot.resolve(internalName + ".class");
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());
+    }
+
+    /**
+     * For patches that keep the stack shape at every instruction (a call replaced by a call with
+     * the same stack effect, stack-neutral insertions): the original stack map frames stay valid,
+     * so they are kept instead of recomputed (recomputing would load TeaVM classes).
+     */
+    private static void writePatchedKeepFrames(Path patchRoot, String internalName, ClassNode node)
+            throws IOException {
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        node.accept(writer);
+        Path output = patchRoot.resolve(internalName + ".class");
+        Files.createDirectories(output.getParent());
+        Files.write(output, writer.toByteArray());
+    }
+
+    /**
+     * WebAssembly GC (TeaVM 0.15): the {@code br_on_cast} of each catch clause in
+     * {@code visit(TryCatchStatement)} goes through {@link GaiusTeaVMOptions#wasmCatchBranch},
+     * which drops the clauses of classes the dependency analysis never reached (their struct
+     * type has no supertype chain, so the cast from Throwable would not validate) and fails the
+     * build when the class is reachable. The call also passes the visitor (its generation context
+     * holds the reachable class source) and the local that holds the clause's class name: the
+     * one {@code getExceptionType()} is stored to (java.lang.Throwable when null), which is also
+     * the argument of the {@code getClassInfo} call that yields the cast target type.
+     */
+    static ClassNode patchWasmGcCatchBranch(ClassNode node) {
+        MethodNode visit = method(node, "visit", "(Lorg/teavm/ast/TryCatchStatement;)V");
+        String builder = "org/teavm/backend/wasm/model/instruction/WasmInstructionBuilder";
+        String desc = "(Lorg/teavm/backend/wasm/model/instruction/WasmCastCondition;"
+                + "Lorg/teavm/backend/wasm/model/WasmType$Reference;"
+                + "Lorg/teavm/backend/wasm/model/WasmType$Reference;"
+                + "Lorg/teavm/backend/wasm/model/instruction/WasmInstructionList;)"
+                + "Lorg/teavm/backend/wasm/model/instruction/WasmInstructionBuilder;";
+        MethodInsnNode castBranch = null;
+        for (AbstractInsnNode instruction : visit.instructions) {
+            if (instruction instanceof MethodInsnNode call && call.owner.equals(builder)
+                    && call.name.equals("castBranch") && call.desc.equals(desc)) {
+                if (castBranch != null) {
+                    throw new IllegalStateException("TeaVM try/catch castBranch found twice");
+                }
+                castBranch = call;
+            }
+        }
+        if (castBranch == null || !(castBranch.getNext() instanceof InsnNode pop)
+                || pop.getOpcode() != Opcodes.POP) {
+            throw new IllegalStateException("TeaVM try/catch castBranch patch point not found");
+        }
+        int exceptionType = catchTypeLocal(visit, castBranch);
+        InsnList context = new InsnList();
+        context.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        context.add(new VarInsnNode(Opcodes.ALOAD, exceptionType));
+        visit.instructions.insertBefore(castBranch, context);
+        visit.instructions.set(castBranch, options("wasmCatchBranch",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;"
+                        + "Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;"));
+        return node;
+    }
+
+    /**
+     * The local that holds the catch clause's class name at {@code castBranch}: the single
+     * {@code TryCatchStatement.getExceptionType()} result stored by the next ASTORE, read by the
+     * single {@code WasmGCClassInfoProvider.getClassInfo(String)} call between that store and
+     * {@code castBranch}; the only other store to it in between is the java.lang.Throwable
+     * default.
+     */
+    private static int catchTypeLocal(MethodNode visit, AbstractInsnNode castBranch) {
+        AbstractInsnNode typeCall = single(visit, "TryCatchStatement.getExceptionType call",
+                insn -> insn instanceof MethodInsnNode call && call.owner.equals("org/teavm/ast/TryCatchStatement")
+                        && call.name.equals("getExceptionType"));
+        if (!(nextReal(typeCall) instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE) {
+            throw new IllegalStateException("TeaVM try/catch exception type store not found");
+        }
+        int local = store.var;
+        boolean typeLookup = false;
+        for (AbstractInsnNode insn = store.getNext(); insn != castBranch; insn = insn.getNext()) {
+            if (insn == null) {
+                throw new IllegalStateException("TeaVM try/catch castBranch precedes the exception type");
+            }
+            if (insn instanceof VarInsnNode other && other.var == local && other.getOpcode() == Opcodes.ASTORE
+                    && !(previousReal(other) instanceof LdcInsnNode constant
+                            && "java.lang.Throwable".equals(constant.cst))) {
+                throw new IllegalStateException("TeaVM try/catch exception type local is reassigned");
+            }
+            if (insn instanceof MethodInsnNode call
+                    && call.owner.equals("org/teavm/backend/wasm/generate/classes/WasmGCClassInfoProvider")
+                    && call.name.equals("getClassInfo") && call.desc.equals(
+                            "(Ljava/lang/String;)Lorg/teavm/backend/wasm/generate/classes/WasmGCClassInfo;")) {
+                if (typeLookup || !(previousReal(call) instanceof VarInsnNode argument)
+                        || argument.getOpcode() != Opcodes.ALOAD || argument.var != local) {
+                    throw new IllegalStateException("TeaVM try/catch class info lookup does not match");
+                }
+                typeLookup = true;
+            }
+        }
+        if (!typeLookup) {
+            throw new IllegalStateException("TeaVM try/catch class info lookup not found");
+        }
+        return local;
+    }
+
+    /**
+     * WebAssembly GC (TeaVM 0.15), {@code generateRegularMethodBody}: first
+     * {@link GaiusTeaVMOptions#wasmDropUnreachableCatches} removes the catch clauses of classes
+     * the dependency analysis never reached (their handlers do not validate); after the body is
+     * generated, {@link GaiusTeaVMOptions#wasmSealFunctionBody} appends {@code unreachable} when
+     * a value-returning body ends with a block without a result (invalid wasm otherwise).
+     */
+    static ClassNode patchWasmGcFunctionSeal(ClassNode node) {
+        MethodNode generate = method(node, "generateRegularMethodBody",
+                "(Lorg/teavm/model/MethodHolder;Lorg/teavm/backend/wasm/model/WasmFunction;)V");
+        MethodInsnNode wrap = null;
+        for (AbstractInsnNode instruction : generate.instructions) {
+            if (instruction instanceof MethodInsnNode call && call.owner.equals(WASM_GC_METHOD_GENERATOR)
+                    && call.name.equals("wrapSynchronizedMethod")) {
+                if (wrap != null) {
+                    throw new IllegalStateException("TeaVM wrapSynchronizedMethod call found twice");
+                }
+                wrap = call;
+            }
+        }
+        if (wrap == null) {
+            throw new IllegalStateException("TeaVM generateRegularMethodBody patch point not found");
+        }
+        InsnList seal = new InsnList();
+        seal.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        seal.add(options("wasmSealFunctionBody", "(Ljava/lang/Object;)V"));
+        generate.instructions.insert(wrap, seal);
+        // Before anything reads the program: drop the catch clauses of unreachable classes.
+        InsnList prune = new InsnList();
+        prune.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prune.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        prune.add(options("wasmDropUnreachableCatches", "(Ljava/lang/Object;Ljava/lang/Object;)V"));
+        generate.instructions.insert(prune);
+        return node;
+    }
+
+    /**
+     * WebAssembly GC runtime (TeaVM 0.15): {@code WasmGCResources.readBytes} stores byte
+     * {@code i} at {@code bytes[i]} instead of {@code bytes[off + i]}, so every
+     * {@code read(byte[], off, len)} with {@code off > 0} on a class-path resource overwrote the
+     * start of the buffer (ICU data files: "Not an ICU data file"). The array index gets
+     * {@code + off}.
+     */
+    static ClassNode patchWasmGcResourceRead(ClassNode node) {
+        MethodNode read = method(node, "readBytes", "([BIII)V");
+        for (AbstractInsnNode instruction : read.instructions) {
+            if (instruction instanceof VarInsnNode array && array.getOpcode() == Opcodes.ALOAD
+                    && array.var == 0 && array.getNext() instanceof VarInsnNode index
+                    && index.getOpcode() == Opcodes.ILOAD && index.var == 4) {
+                InsnList offset = new InsnList();
+                offset.add(new VarInsnNode(Opcodes.ILOAD, 1));
+                offset.add(new InsnNode(Opcodes.IADD));
+                read.instructions.insert(index, offset);
+                return node;
+            }
+        }
+        throw new IllegalStateException("TeaVM WasmGCResources.readBytes patch point not found");
+    }
+
+    /**
+     * WebAssembly GC runtime (TeaVM 0.15): {@code ResourceInputStream.read(byte[], off, len)}
+     * returns -1 for {@code len == 0} at the end of the resource (InputStream returns 0) and
+     * checks no range, so {@code off + len > b.length} wrote past the array: a wasm trap
+     * instead of IndexOutOfBoundsException. The method gets the JDK's prologue:
+     * {@code Objects.checkFromIndexSize(off, len, b.length); if (len == 0) return 0;} (a null
+     * array fails at {@code b.length}, as every null dereference does in the build's null-check
+     * mode). The new branch target carries a frame equal to the entry frame.
+     */
+    static ClassNode patchWasmGcResourceStreamRead(ClassNode node) {
+        MethodNode read = method(node, "read", "([BII)I");
+        for (AbstractInsnNode insn = read.instructions.getFirst(); insn != null && insn.getOpcode() < 0;
+                insn = insn.getNext()) {
+            if (insn instanceof FrameNode) {
+                throw new IllegalStateException("ResourceInputStream.read starts at a branch target");
+            }
+        }
+        InsnList prologue = new InsnList();
+        prologue.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        prologue.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        prologue.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        prologue.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        prologue.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Objects", "checkFromIndexSize",
+                "(III)I", false));
+        prologue.add(new InsnNode(Opcodes.POP));
+        LabelNode nonEmpty = new LabelNode();
+        prologue.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        prologue.add(new JumpInsnNode(Opcodes.IFNE, nonEmpty));
+        prologue.add(new InsnNode(Opcodes.ICONST_0));
+        prologue.add(new InsnNode(Opcodes.IRETURN));
+        prologue.add(nonEmpty);
+        prologue.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        read.instructions.insert(prologue);
+        return node;
     }
 
     private static void writeText(Path patchRoot, String name, String text) throws IOException {
@@ -367,6 +603,15 @@ public final class TeaVMCoreBrowserPatcher {
         return next;
     }
 
+    /** The previous instruction that is not a label, line number or frame. */
+    private static AbstractInsnNode previousReal(AbstractInsnNode insn) {
+        AbstractInsnNode previous = insn.getPrevious();
+        while (previous != null && previous.getOpcode() < 0) {
+            previous = previous.getPrevious();
+        }
+        return previous;
+    }
+
     private static MethodInsnNode options(String name, String desc) {
         return new MethodInsnNode(Opcodes.INVOKESTATIC, OPTIONS, name, desc, false);
     }
@@ -388,7 +633,29 @@ public final class TeaVMCoreBrowserPatcher {
         AbstractInsnNode findReturn = single(find, "RETURN",
                 insn -> insn.getOpcode() == Opcodes.RETURN);
         find.instructions.insertBefore(findReturn, options("reportCuts", "()V"));
+        InsnList census = new InsnList();
+        census.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        census.add(options("dumpAsync", "(Ljava/lang/Object;)V"));
+        find.instructions.insertBefore(findReturn, census);
         find.instructions.insert(options("beginAsyncAnalysis", "()V"));
+        // JSPI mode (gaius.teavm.jspi): stop with an empty async set, so no method becomes a
+        // coroutine. The class source is stored first, as find() does, for later queries.
+        requireField(node, "dependency", "Lorg/teavm/dependency/DependencyInfo;");
+        LabelNode analyse = new LabelNode();
+        InsnList jspi = new InsnList();
+        jspi.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        jspi.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        jspi.add(new FieldInsnNode(Opcodes.PUTFIELD, ASYNC_FINDER_CLASS, "classSource",
+                "Lorg/teavm/model/ListableClassReaderSource;"));
+        jspi.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        jspi.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        jspi.add(new FieldInsnNode(Opcodes.GETFIELD, ASYNC_FINDER_CLASS, "dependency",
+                "Lorg/teavm/dependency/DependencyInfo;"));
+        jspi.add(options("jspiSkipAsyncAnalysis", "(Ljava/lang/Object;Ljava/lang/Object;)Z"));
+        jspi.add(new JumpInsnNode(Opcodes.IFEQ, analyse));
+        jspi.add(new InsnNode(Opcodes.RETURN));
+        jspi.add(analyse);
+        find.instructions.insert(jspi);
 
         MethodNode add = method(node, "add",
                 "(Lorg/teavm/model/MethodReference;Lorg/teavm/model/util/AsyncMethodFinder$CallStack;)V");
@@ -412,6 +679,11 @@ public final class TeaVMCoreBrowserPatcher {
         barrier.add(new InsnNode(Opcodes.RETURN));
         barrier.add(propagate);
         add.instructions.insert(added, barrier);
+        InsnList record = new InsnList();
+        record.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        record.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        record.add(options("recordAsync", "(Ljava/lang/Object;Ljava/lang/Object;)V"));
+        add.instructions.insert(added, record);
 
         LabelNode notCut = new LabelNode();
         InsnList cut = new InsnList();
@@ -751,6 +1023,40 @@ public final class TeaVMCoreBrowserPatcher {
         redirect.add(regular);
         functionAlias.instructions.insert(redirect);
         return node;
+    }
+
+    /**
+     * Heap.alloc (the Wasm GC off-heap allocator) grows the memory by {@code bytes} when the
+     * last heap record is allocated, but the new free record also needs a HeapRecord header,
+     * so a request of a multiple of the wasm page size made while the heap is full fails and
+     * returns null. TeaVM 0.16 grows by {@code bytes + sizeof(HeapRecord)} instead; the patch
+     * applies the same fix to TeaVM 0.15: the allocated branch of
+     * {@code bytes - (allocated ? 0 : size(last))} becomes {@code -sizeof(HeapRecord)}.
+     *
+     * @return false when the TeaVM version already grows by the header size
+     */
+    static boolean patchHeapAllocGrowth(ClassNode node) {
+        MethodNode alloc = method(node, "alloc", "(I)Lorg/teavm/interop/Address;");
+        for (AbstractInsnNode insn = alloc.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof MethodInsnNode call && call.owner.equals(STRUCTURE)
+                    && call.name.equals("sizeOf")) {
+                return false;
+            }
+        }
+        single(alloc, "HeapRecord.isAllocated call",
+                insn -> insn instanceof MethodInsnNode call && call.owner.equals(HEAP_RECORD)
+                        && call.name.equals("isAllocated"));
+        AbstractInsnNode zero = single(alloc, "allocated-branch ICONST_0 before ISUB",
+                insn -> insn.getOpcode() == Opcodes.ICONST_0
+                        && nextReal(insn) != null && nextReal(insn).getOpcode() == Opcodes.ISUB);
+        InsnList header = new InsnList();
+        header.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(HEAP_RECORD)));
+        header.add(new MethodInsnNode(Opcodes.INVOKESTATIC, STRUCTURE, "sizeOf",
+                "(Ljava/lang/Class;)I", false));
+        header.add(new InsnNode(Opcodes.INEG));
+        alloc.instructions.insert(zero, header);
+        alloc.instructions.remove(zero);
+        return true;
     }
 
     /** thread.js: the suspension guard for methods the options compiled synchronously. */
