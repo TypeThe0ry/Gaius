@@ -4,7 +4,6 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.Executor;
 import org.teavm.jso.JSBody;
-import org.teavm.platform.Platform;
 
 /**
  * Turns the integrated server's browser executor into a cooperative FIFO.
@@ -73,7 +72,7 @@ public final class BrowserCooperativeExecutor implements Executor {
         // resource pack, and that raw callback has no current TeaVM thread to suspend. The
         // startThread path uses the same deferred browser turn while installing the continuation
         // context required by suspendable CompletableFuture tasks.
-        Platform.startThread(this::runAfterYield);
+        HostLoop.startThread(this::runAfterYield);
     }
 
     private void runAfterYield() {

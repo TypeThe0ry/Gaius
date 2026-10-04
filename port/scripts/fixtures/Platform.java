@@ -16,6 +16,15 @@ public final class Platform {
         startedThreads++;
     }
 
+    /** HostLoop.schedule compiles against this; the dispatcher never uses a raw timer. */
+    public static int schedule(PlatformRunnable command, int delayMillis) {
+        throw new AssertionError("the worldgen dispatcher must not use Platform.schedule");
+    }
+
+    public static void killSchedule(int id) {
+        throw new AssertionError("the worldgen dispatcher must not use Platform.killSchedule");
+    }
+
     public static int pendingThreads() {
         return THREADS.size();
     }

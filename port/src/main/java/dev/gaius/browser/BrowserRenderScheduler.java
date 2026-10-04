@@ -10,7 +10,6 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
-import org.teavm.platform.Platform;
 
 /**
  * Defers expensive renderer work so one client frame cannot drain the whole compile queue.
@@ -834,7 +833,7 @@ public final class BrowserRenderScheduler {
         pumpScheduled = true;
         // A TeaVM thread, not a plain timeout callback: the pump yields between slices and
         // queued tasks may suspend (upload retries), which needs a coroutine context.
-        Platform.startThread(BrowserRenderScheduler::runPump);
+        HostLoop.startThread(BrowserRenderScheduler::runPump);
     }
 
     /**
@@ -940,7 +939,7 @@ public final class BrowserRenderScheduler {
         }
         frameWatchdogArmed = true;
         long framesAtArm = renderFrames;
-        Platform.schedule(() -> {
+        HostLoop.schedule(() -> {
             frameWatchdogArmed = false;
             if (renderFrames != framesAtArm) {
                 // A rendered frame reset the install budget and installed what fit.
@@ -1011,78 +1010,83 @@ public final class BrowserRenderScheduler {
         long activeHighWaterNanos = highWaterActive
                 ? Math.max(0L, System.nanoTime() - highWaterStartedAt)
                 : 0L;
-        publishTelemetryJs(
-                pendingTasks(),
-                effectiveQueueHighWater(),
-                runningTask,
-                peakQueuedTasks,
-                compileBacklog,
-                peakCompileBacklog,
-                uploadBacklog,
-                peakUploadBacklog,
-                enqueuedTasks,
-                completedTasks,
-                backpressureEvents,
-                overBudgetTasks,
-                nanosToMillis(lastTaskNanos),
-                nanosToMillis(longestTaskNanos),
-                nanosToMillis(totalTaskNanos),
-                uploadPasses,
-                nanosToMillis(lastUploadPassNanos),
-                nanosToMillis(longestUploadPassNanos),
-                nanosToMillis(totalUploadPassNanos),
-                uploadAllocationsQueued,
-                uploadAllocationsDrained,
-                highWaterActive,
-                nanosToMillis(activeHighWaterNanos),
-                nanosToMillis(totalHighWaterNanos + activeHighWaterNanos),
-                nanosToMillis(Math.max(longestHighWaterNanos, activeHighWaterNanos)),
-                renderFrames,
-                lastTaskDrainCount,
-                peakTaskDrainCount,
-                lastTaskBudgetExhausted,
-                taskBudgetExhaustions,
-                currentUploadDrainCount,
-                lastUploadDrainCount,
-                peakUploadDrainCount,
-                effectiveMaxUploadAllocationsPerFrame(),
-                nanosToMillis(effectiveUploadWorkBudgetNanos()),
-                uploadBudgetExhaustedThisFrame,
-                uploadBudgetExhaustions,
-                uploadEntryBudgetExhaustions,
-                uploadTimeBudgetExhaustions,
-                dispatcherRunnerRequests,
-                dispatcherRunnerEnqueued,
-                dispatcherRunnerCoalesced,
-                dispatcherRunnerDisposals,
-                dispatcherUploadDeferrals,
-                DISPATCHER_STATES.size(),
-                uploadAllocationsDiscarded,
-                compileRunsDuringUploadThisFrame,
-                compileRunsDuringUpload,
-                uploadFairShareDeferrals,
-                UPLOAD_FRAME_DRAIN_COUNTS.size(),
-                emergencyUploadRequests,
-                emergencyUploadDrains,
-                emergencyUploadDeferrals,
-                uploadRetryYields,
-                uploadRetryNoProgressResumes,
-                uploadRetryCancellations,
-                uploadRetryExpiredStates,
-                UPLOAD_RETRY_STATES.size(),
-                MAX_UPLOAD_RETRY_YIELDS,
-                nanosToMillis(MAX_UPLOAD_RETRY_NANOS),
-                uploadProgressEpoch,
-                currentUberNodeCleanupScans,
-                lastUberNodeCleanupScans,
-                peakUberNodeCleanupScans,
-                MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME,
-                nanosToMillis(UBER_NODE_CLEANUP_BUDGET_NANOS),
-                uberNodeCleanupPasses,
-                uberNodeCleanupNodesScanned,
-                uberNodeCleanupNodesReleased,
-                uberNodeCleanupDeferrals,
-                UBER_NODE_CLEANUP_CURSORS.size());
+        // TeaVM's WebAssembly GC backend limits JSBody natives to 32 parameters; the
+        // WebAssembly GC build does not publish the chunk pipeline counters yet
+        // (constant-folded).
+        if (!HostLoop.isWasmGc()) {
+            publishTelemetryJs(
+                    pendingTasks(),
+                    effectiveQueueHighWater(),
+                    runningTask,
+                    peakQueuedTasks,
+                    compileBacklog,
+                    peakCompileBacklog,
+                    uploadBacklog,
+                    peakUploadBacklog,
+                    enqueuedTasks,
+                    completedTasks,
+                    backpressureEvents,
+                    overBudgetTasks,
+                    nanosToMillis(lastTaskNanos),
+                    nanosToMillis(longestTaskNanos),
+                    nanosToMillis(totalTaskNanos),
+                    uploadPasses,
+                    nanosToMillis(lastUploadPassNanos),
+                    nanosToMillis(longestUploadPassNanos),
+                    nanosToMillis(totalUploadPassNanos),
+                    uploadAllocationsQueued,
+                    uploadAllocationsDrained,
+                    highWaterActive,
+                    nanosToMillis(activeHighWaterNanos),
+                    nanosToMillis(totalHighWaterNanos + activeHighWaterNanos),
+                    nanosToMillis(Math.max(longestHighWaterNanos, activeHighWaterNanos)),
+                    renderFrames,
+                    lastTaskDrainCount,
+                    peakTaskDrainCount,
+                    lastTaskBudgetExhausted,
+                    taskBudgetExhaustions,
+                    currentUploadDrainCount,
+                    lastUploadDrainCount,
+                    peakUploadDrainCount,
+                    effectiveMaxUploadAllocationsPerFrame(),
+                    nanosToMillis(effectiveUploadWorkBudgetNanos()),
+                    uploadBudgetExhaustedThisFrame,
+                    uploadBudgetExhaustions,
+                    uploadEntryBudgetExhaustions,
+                    uploadTimeBudgetExhaustions,
+                    dispatcherRunnerRequests,
+                    dispatcherRunnerEnqueued,
+                    dispatcherRunnerCoalesced,
+                    dispatcherRunnerDisposals,
+                    dispatcherUploadDeferrals,
+                    DISPATCHER_STATES.size(),
+                    uploadAllocationsDiscarded,
+                    compileRunsDuringUploadThisFrame,
+                    compileRunsDuringUpload,
+                    uploadFairShareDeferrals,
+                    UPLOAD_FRAME_DRAIN_COUNTS.size(),
+                    emergencyUploadRequests,
+                    emergencyUploadDrains,
+                    emergencyUploadDeferrals,
+                    uploadRetryYields,
+                    uploadRetryNoProgressResumes,
+                    uploadRetryCancellations,
+                    uploadRetryExpiredStates,
+                    UPLOAD_RETRY_STATES.size(),
+                    MAX_UPLOAD_RETRY_YIELDS,
+                    nanosToMillis(MAX_UPLOAD_RETRY_NANOS),
+                    uploadProgressEpoch,
+                    currentUberNodeCleanupScans,
+                    lastUberNodeCleanupScans,
+                    peakUberNodeCleanupScans,
+                    MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME,
+                    nanosToMillis(UBER_NODE_CLEANUP_BUDGET_NANOS),
+                    uberNodeCleanupPasses,
+                    uberNodeCleanupNodesScanned,
+                    uberNodeCleanupNodesReleased,
+                    uberNodeCleanupDeferrals,
+                    UBER_NODE_CLEANUP_CURSORS.size());
+        }
         Budget budget = budget();
         publishFrameBudgetJs(
                 frameTasks,

@@ -3,7 +3,6 @@ package dev.gaius.browser;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.Executor;
-import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
 
 /**
@@ -63,7 +62,7 @@ public final class BrowserResourceReloadScheduler {
     private static native boolean isWorkerRuntime();
 
     private static void scheduleMacrotask(Runnable command) {
-        TModernRuntimeSupport.postRunnableMacrotask(command);
+        HostLoop.postMacrotask(command);
     }
 
     private static void runAfterYield() {

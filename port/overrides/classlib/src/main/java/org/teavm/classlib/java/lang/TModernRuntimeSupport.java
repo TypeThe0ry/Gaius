@@ -1,17 +1,14 @@
 package org.teavm.classlib.java.lang;
 
 import com.ibm.icu.lang.UCharacter;
+import dev.gaius.browser.HostLoop;
+import dev.gaius.browser.TargetMath;
 import java.time.Duration;
 import org.teavm.classlib.java.util.TCollections;
 import org.teavm.classlib.java.util.TMap;
 import org.teavm.classlib.java.lang.reflect.TType;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
-import org.teavm.jso.JSBody;
-import org.teavm.jso.JSFunctor;
-import org.teavm.jso.JSObject;
-import org.teavm.platform.Platform;
-import org.teavm.platform.PlatformRunnable;
 
 public final class TModernRuntimeSupport {
     private TModernRuntimeSupport() {
@@ -61,15 +58,18 @@ public final class TModernRuntimeSupport {
         return result;
     }
 
-    @JSBody(
-            params = {"left", "right", "addend"},
-            script = "return Math.fround(left * right + addend);")
-    public static native float fma(float left, float right, float addend);
+    // One double multiply and add, then rounding to float. The rounding needs Math.fround in the
+    // JavaScript build (TeaVM emits none for a double-to-float cast there) and is the cast itself
+    // in the WebAssembly GC build, whose class library may not hold JSBody natives: TargetMath
+    // has one implementation per backend.
+    public static float fma(float left, float right, float addend) {
+        return TargetMath.fma(left, right, addend);
+    }
 
-    @JSBody(
-            params = {"left", "right", "addend"},
-            script = "return left * right + addend;")
-    public static native double fma(double left, double right, double addend);
+    // Same arithmetic as the former JavaScript body (left * right + addend in doubles).
+    public static double fma(double left, double right, double addend) {
+        return left * right + addend;
+    }
 
     public static long maxMemory(TRuntime runtime) {
         // Conservative heap budget used by vanilla render-buffer sizing.
@@ -106,7 +106,13 @@ public final class TModernRuntimeSupport {
      * skipping it there is correct where suspending would throw.
      */
     public static void yieldToEventLoop(int delayMillis) {
-        if (inClassInitializer()) {
+        if (HostLoop.jspi()) {
+            // JSPI parks the thread's whole stack; the @Async path below is constant-folded
+            // away, so no method becomes a coroutine.
+            HostLoop.yieldToEventLoop(delayMillis);
+            return;
+        }
+        if (inClassInitializer() || !HostLoop.canSuspend()) {
             return;
         }
         try {
@@ -131,77 +137,28 @@ public final class TModernRuntimeSupport {
      * optional, so their callers skip them while either counter is positive instead of
      * suspending. Builds without those options never set the counters.
      */
-    @JSBody(script = """
-            return (globalThis.__gaiusClinitDepth | 0) > 0
-              || (globalThis.__gaiusNoSuspendDepth | 0) > 0;
-            """)
-    public static native boolean inClassInitializer();
+    public static boolean inClassInitializer() {
+        return HostLoop.inNoSuspendFrame();
+    }
 
     @Async
     private static native void suspendToEventLoop(int delayMillis);
 
     private static void suspendToEventLoop(int delayMillis, AsyncCallback<Void> callback) {
         TThread thread = TThread.currentThread();
-        PlatformRunnable resume = () -> {
+        Runnable resume = () -> {
             TThread.setCurrentThread(thread);
             callback.complete(null);
         };
         if (delayMillis > 0) {
-            Platform.schedule(resume, delayMillis);
+            HostLoop.schedule(resume, delayMillis);
         } else {
-            postMacrotask(() -> resume.run());
+            HostLoop.postMacrotask(resume);
         }
     }
 
-    @JSFunctor
-    private interface ResumeCallback extends JSObject {
-        void run();
-    }
-
-    // Platform.postpone uses setTimeout(0), which is still subject to nested
-    // timer clamping. A MessagePort turn gives other Worker messages a chance
-    // to run without imposing that delay on every cooperative work slice.
-    @JSBody(params = "callback", script = """
-            let state = globalThis.__gaiusMacrotaskScheduler;
-            if (!state) {
-              state = {channel: null, pending: new Map(), sequence: 0, failed: false};
-              globalThis.__gaiusMacrotaskScheduler = state;
-              try {
-                state.channel = new MessageChannel();
-                state.channel.port1.onmessage = function(event) {
-                  const resume = state.pending.get(event.data);
-                  if (!resume) return;
-                  state.pending.delete(event.data);
-                  resume();
-                };
-              } catch (_) {
-                state.failed = true;
-              }
-            }
-            if (state.failed) {
-              setTimeout(callback, 0);
-              return;
-            }
-            const id = ++state.sequence;
-            state.pending.set(id, callback);
-            try {
-              state.channel.port2.postMessage(id);
-            } catch (_) {
-              state.failed = true;
-              try { state.channel.port1.close(); } catch (ignored) {}
-              try { state.channel.port2.close(); } catch (ignored) {}
-              const callbacks = Array.from(state.pending.values());
-              state.pending.clear();
-              for (let index = 0; index < callbacks.length; index++) {
-                setTimeout(callbacks[index], 0);
-              }
-            }
-            """)
-    private static native void postMacrotask(ResumeCallback callback);
-
     public static void postRunnableMacrotask(Runnable callback) {
-        ResumeCallback jsCallback = callback::run;
-        postMacrotask(jsCallback);
+        HostLoop.postMacrotask(callback);
     }
 
     public static TType genericSuperclass(TClass<?> type) {

@@ -1,7 +1,8 @@
 package org.lwjgl.util.shaderc;
 
+import dev.gaius.browser.JsArrays;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
+import org.teavm.jso.typedarrays.Int8Array;
 
 /**
  * The browser {@link BrowserShadercToolchain}: shaderc compiled to WebAssembly,
@@ -23,20 +24,25 @@ final class BrowserShadercWasm implements BrowserShadercToolchain {
         try {
             for (BrowserShadercJob.Op op : job.ops) {
                 if (op.code == BrowserShadercJob.OP_MACRO) {
-                    // A @JSByRef array must not be null; the flag says "no value".
-                    macro(id, op.name, op.value == null ? NO_BYTES : op.value, op.value != null);
+                    // The value view must not be null; the flag says "no value".
+                    macro(id, JsArrays.int8(op.name),
+                            JsArrays.int8(op.value == null ? NO_BYTES : op.value), op.value != null);
                 } else {
                     option(id, op.code, op.a, op.b);
                 }
             }
             for (BrowserShadercJob.Include include : job.includes) {
-                include(id, include.type, include.requested, include.requesting, include.sourceName,
-                        include.content);
+                include(id, include.type, JsArrays.int8(include.requested),
+                        JsArrays.int8(include.requesting), JsArrays.int8(include.sourceName),
+                        JsArrays.int8(include.content));
             }
-            int status = compile(id, job.source, job.kind, job.inputFileName, job.entryPointName);
+            int status = compile(id, JsArrays.int8(job.source), job.kind,
+                    JsArrays.int8(job.inputFileName), JsArrays.int8(job.entryPointName));
             byte[] spirv = new byte[outputLength(id)];
             if (spirv.length > 0) {
-                outputCopy(id, spirv);
+                Int8Array view = JsArrays.int8(spirv);
+                outputCopy(id, view);
+                JsArrays.readBack(view, spirv);
             }
             return new BrowserShadercJob.Output(status, spirv, errorMessage(id), warnings(id), errors(id));
         } finally {
@@ -59,25 +65,25 @@ final class BrowserShadercWasm implements BrowserShadercToolchain {
 
     @JSBody(params = {"id", "name", "value", "hasValue"},
             script = "window.__gaiusShaderToolchain.shadercMacro(id, name, hasValue ? value : null);")
-    private static native void macro(int id, @JSByRef byte[] name, @JSByRef byte[] value, boolean hasValue);
+    private static native void macro(int id, Int8Array name, Int8Array value, boolean hasValue);
 
     @JSBody(params = {"id", "type", "requested", "requesting", "sourceName", "content"},
             script = "window.__gaiusShaderToolchain.shadercInclude(id, type, requested, requesting,"
                     + " sourceName, content);")
-    private static native void include(int id, int type, @JSByRef byte[] requested, @JSByRef byte[] requesting,
-            @JSByRef byte[] sourceName, @JSByRef byte[] content);
+    private static native void include(int id, int type, Int8Array requested, Int8Array requesting,
+            Int8Array sourceName, Int8Array content);
 
     @JSBody(params = {"id", "source", "kind", "fileName", "entryPoint"},
             script = "return window.__gaiusShaderToolchain.shadercCompile(id, source, kind, fileName,"
                     + " entryPoint);")
-    private static native int compile(int id, @JSByRef byte[] source, int kind, @JSByRef byte[] fileName,
-            @JSByRef byte[] entryPoint);
+    private static native int compile(int id, Int8Array source, int kind, Int8Array fileName,
+            Int8Array entryPoint);
 
     @JSBody(params = "id", script = "return window.__gaiusShaderToolchain.shadercOutputLength(id);")
     private static native int outputLength(int id);
 
     @JSBody(params = {"id", "out"}, script = "window.__gaiusShaderToolchain.shadercOutputCopy(id, out);")
-    private static native void outputCopy(int id, @JSByRef byte[] out);
+    private static native void outputCopy(int id, Int8Array out);
 
     @JSBody(params = "id", script = "return window.__gaiusShaderToolchain.shadercErrorMessage(id);")
     private static native String errorMessage(int id);

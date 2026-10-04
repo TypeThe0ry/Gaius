@@ -1,5 +1,6 @@
 package net.minecraft.server.packs;
 
+import dev.gaius.browser.JsArrays;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -20,7 +21,7 @@ import net.minecraft.server.packs.resources.IoSupplier;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceProvider;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
+import org.teavm.jso.typedarrays.Int8Array;
 
 /**
  * Browser resource-pack implementation for the official vanilla pack.
@@ -256,7 +257,16 @@ public class VanillaPackResources implements PackResources {
             target.set(root.bytes.subarray(start, end));
             return true;
             """)
-    private static native boolean copyExternalResource(String resource, @JSByRef byte[] output);
+    private static native boolean copyExternalResourceJs(String resource, Int8Array output);
+
+    private static boolean copyExternalResource(String resource, byte[] output) {
+        Int8Array view = JsArrays.int8(output);
+        boolean copied = copyExternalResourceJs(resource, view);
+        if (copied) {
+            JsArrays.readBack(view, output);
+        }
+        return copied;
+    }
 
     private static String[] loadResourceList() {
         try (InputStream input = VanillaPackResources.class.getClassLoader()

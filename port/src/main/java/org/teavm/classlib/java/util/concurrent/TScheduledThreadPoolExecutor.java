@@ -4,7 +4,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import org.teavm.classlib.java.lang.TRunnable;
-import org.teavm.platform.Platform;
+import dev.gaius.browser.HostLoop;
 
 public class TScheduledThreadPoolExecutor extends TAbstractExecutorService
         implements TScheduledExecutorService {
@@ -70,7 +70,7 @@ public class TScheduledThreadPoolExecutor extends TAbstractExecutorService
             return;
         }
         int chunkMillis = (int) Math.min(remainingMillis, Integer.MAX_VALUE);
-        int scheduleId = Platform.schedule(() -> {
+        int scheduleId = HostLoop.schedule(() -> {
             future.clearScheduleId();
             if (future.isCancelled()) {
                 return;

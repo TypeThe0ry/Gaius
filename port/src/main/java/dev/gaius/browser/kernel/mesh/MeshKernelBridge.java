@@ -1,12 +1,16 @@
 package dev.gaius.browser.kernel.mesh;
 
+import org.teavm.jso.typedarrays.Int8Array;
+import org.teavm.jso.typedarrays.Int32Array;
+import org.teavm.jso.typedarrays.Int16Array;
+import org.teavm.jso.typedarrays.Float32Array;
+import dev.gaius.browser.JsArrays;
+import dev.gaius.browser.HostLoop;
 import dev.gaius.browser.BrowserRenderScheduler;
 import dev.gaius.browser.render.BrowserMeshInstallQueue;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
 import org.teavm.jso.JSFunctor;
 import org.teavm.jso.JSObject;
-import org.teavm.platform.Platform;
 
 /**
  * Java side of the page's mesh kernel facade ({@code port/web/kernels/mesh-kernel-job.js},
@@ -203,7 +207,7 @@ public final class MeshKernelBridge {
     }
 
     private static void onWake() {
-        Platform.startThread(MeshKernelBridge::deliverResults);
+        HostLoop.startThread(MeshKernelBridge::deliverResults);
     }
 
     /** Wake path: results into the install queue, then install what this frame's budget allows. */
@@ -288,7 +292,14 @@ public final class MeshKernelBridge {
             + "if (offset < 0 || offset + v.byteLength > target.length) return -1;"
             + "target.set(new Int8Array(v.buffer, v.byteOffset, v.byteLength), offset);"
             + "return v.byteLength;")
-    public static native int copyVertices(JSObject record, int layer, @JSByRef byte[] target, int offset);
+    private static native int copyVerticesJs(JSObject record, int layer, Int8Array target, int offset);
+
+    public static int copyVertices(JSObject record, int layer, byte[] target, int offset) {
+        Int8Array targetView = JsArrays.int8(target);
+        int result = copyVerticesJs(record, layer, targetView, offset);
+        JsArrays.readBack(targetView, target);
+        return result;
+    }
 
     /** Bytes of vanilla BLOCK vertices the record holds for {@code layer}; -1 when absent. */
     @JSBody(params = {"record", "layer"}, script = ""
@@ -305,7 +316,14 @@ public final class MeshKernelBridge {
             + "if (!o || o.length > target.length) return -1;"
             + "target.set(new Int32Array(o.buffer, o.byteOffset, o.length));"
             + "return o.length;")
-    public static native int copyTranslucentOrder(JSObject record, @JSByRef int[] target);
+    private static native int copyTranslucentOrderJs(JSObject record, Int32Array target);
+
+    public static int copyTranslucentOrder(JSObject record, int[] target) {
+        Int32Array targetView = JsArrays.int32(target);
+        int result = copyTranslucentOrderJs(record, targetView);
+        JsArrays.readBack(targetView, target);
+        return result;
+    }
 
     // --- facade ---------------------------------------------------------------------------------
 
@@ -333,21 +351,31 @@ public final class MeshKernelBridge {
             + "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
             + "var k = g.__gaiusMeshKernel;"
             + "return !!k && k.setTable(bytes, length, epoch) === true;")
-    private static native boolean facadeSetTable(@JSByRef byte[] bytes, int length, int epoch);
+    private static native boolean facadeSetTableJs(Int8Array bytes, int length, int epoch);
+
+    private static boolean facadeSetTable(byte[] bytes, int length, int epoch) {
+        return facadeSetTableJs(JsArrays.int8(bytes), length, epoch);
+    }
 
     @JSBody(params = {"header", "ids", "light", "quarts", "palette", "swamp", "floats"}, script = ""
             + "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
             + "var k = g.__gaiusMeshKernel;"
             + "return !!k && k.submitJob(header, ids, light, quarts, palette, swamp, floats) === true;")
-    private static native boolean facadeSubmit(@JSByRef int[] header, @JSByRef short[] ids, @JSByRef byte[] light,
-            @JSByRef byte[] quarts, @JSByRef int[] palette, @JSByRef byte[] swamp, @JSByRef float[] floats);
+    private static native boolean facadeSubmitJs(Int32Array header, Int16Array ids, Int8Array light, Int8Array quarts, Int32Array palette, Int8Array swamp, Float32Array floats);
+
+    private static boolean facadeSubmit(int[] header, short[] ids, byte[] light, byte[] quarts, int[] palette, byte[] swamp, float[] floats) {
+        return facadeSubmitJs(JsArrays.int32(header), JsArrays.int16(ids), JsArrays.int8(light), JsArrays.int8(quarts), JsArrays.int32(palette), JsArrays.int8(swamp), JsArrays.float32(floats));
+    }
 
     @JSBody(params = {"header", "ids", "light", "quarts", "palette", "swamp", "floats"}, script = ""
             + "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
             + "var k = g.__gaiusMeshKernel;"
             + "return !!k && k.submitJob(header, ids, light, quarts, palette, swamp, floats) === true;")
-    private static native boolean facadeSubmitWide(@JSByRef int[] header, @JSByRef int[] ids, @JSByRef byte[] light,
-            @JSByRef byte[] quarts, @JSByRef int[] palette, @JSByRef byte[] swamp, @JSByRef float[] floats);
+    private static native boolean facadeSubmitWideJs(Int32Array header, Int32Array ids, Int8Array light, Int8Array quarts, Int32Array palette, Int8Array swamp, Float32Array floats);
+
+    private static boolean facadeSubmitWide(int[] header, int[] ids, byte[] light, byte[] quarts, int[] palette, byte[] swamp, float[] floats) {
+        return facadeSubmitWideJs(JsArrays.int32(header), JsArrays.int32(ids), JsArrays.int8(light), JsArrays.int8(quarts), JsArrays.int32(palette), JsArrays.int8(swamp), JsArrays.float32(floats));
+    }
 
     @JSBody(script = "var g = typeof globalThis !== 'undefined' ? globalThis : self;"
             + "var k = g.__gaiusMeshKernel;"

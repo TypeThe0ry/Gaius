@@ -35,6 +35,10 @@ const rawClient = nativePath(process.env.GAIUS_CLIENT_NAMED_JAR)
 const toolsSource = path.join(repositoryRoot, "port/tools/src/main/java");
 const helperSource = path.join(repositoryRoot,
   "port/src/versions/26.3/java/dev/gaius/browser/BrowserGpuBufferPoolCache.java");
+// The helper asks dev.gaius.browser.HostLoop (classlib overlay) for the TeaVM target; it
+// compiles with the JavaScript implementation, which needs teavm-platform.
+const hostLoopSource = path.join(repositoryRoot,
+  "port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java");
 const patcherSource = path.join(toolsSource, "dev/gaius/tools/MinecraftClientPatcher.java");
 
 function selectJdk() {
@@ -56,9 +60,10 @@ const tools = selectJdk();
 const maven = path.join(homedir(), ".m2/repository");
 const asm = ["asm", "asm-tree", "asm-analysis"].map((artifact) =>
   path.join(maven, `org/ow2/asm/${artifact}/9.8/${artifact}-9.8.jar`));
-const teaVm = ["teavm-interop", "teavm-jso", "teavm-jso-apis"].map((artifact) =>
+const teaVm = ["teavm-interop", "teavm-jso", "teavm-jso-apis", "teavm-platform"].map((artifact) =>
   path.join(maven, `org/teavm/${artifact}/0.15.0/${artifact}-0.15.0.jar`));
-await Promise.all([rawClient, helperSource, patcherSource, ...asm, ...teaVm].map((file) => access(file)));
+await Promise.all([rawClient, helperSource, hostLoopSource, patcherSource, ...asm, ...teaVm]
+  .map((file) => access(file)));
 
 const [patcherText, helperText] = await Promise.all([
   readFile(patcherSource, "utf8"), readFile(helperSource, "utf8")]);
@@ -443,7 +448,7 @@ try {
 
   const helperClasspath = [rawClient, ...teaVm].join(path.delimiter);
   run(tools.javac, ["--release", "21", "-proc:none", "-classpath", helperClasspath,
-    "-d", directories.helper, helperSource]);
+    "-d", directories.helper, helperSource, hostLoopSource]);
   const harnessDirectory = path.join(directories.src, "dev/gaius/browser");
   await mkdir(harnessDirectory, {recursive: true});
   const harnessFile = path.join(harnessDirectory, "Pool263Harness.java");

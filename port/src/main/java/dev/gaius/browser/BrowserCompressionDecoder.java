@@ -11,7 +11,6 @@ import java.util.List;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 import net.minecraft.network.CompressionDecoder;
-import org.teavm.platform.Platform;
 
 /** Browser replacement for Minecraft's synchronous zlib decoder. */
 public final class BrowserCompressionDecoder extends CompressionDecoder {
@@ -88,7 +87,7 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
         // delivers one complete network frame per invocation.  Keep the compressed frame
         // synchronous so ByteToMessageDecoder can finish its callDecode/readComplete cycle
         // before PacketDecoder observes the next frame; deferring fireChannelRead through
-        // Platform.schedule reorders packet boundaries under multiplayer bursts.
+        // HostLoop.schedule (Platform.schedule) reorders packet boundaries under multiplayer bursts.
         byte[] payload = new byte[payloadLength];
         input.readBytes(payload);
         byte[] decoded = new byte[declaredLength];
@@ -181,7 +180,7 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
             return;
         }
         scheduled = true;
-        Platform.schedule(() -> {
+        HostLoop.schedule(() -> {
             scheduled = false;
             if (closed || failed || expectedGeneration != generation) {
                 return;

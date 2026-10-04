@@ -94,6 +94,7 @@ public final class WorldgenPatches263 {
             "dev/gaius/browser/BrowserIntegratedServerMain",
             "dev/gaius/browser/BrowserCooperativeExecutor",
             "org/teavm/platform/Platform",
+            "dev/gaius/browser/HostLoop",
             "java/util/concurrent/locks/LockSupport");
 
     /** Package prefixes that are guarded as a whole. */

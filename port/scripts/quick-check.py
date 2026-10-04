@@ -449,6 +449,12 @@ VANILLA_PACK_RESOURCES_262 = PORT / "overrides" / "client" / "src" / "versions" 
 SYSTEM_REPORT = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "SystemReport.java"
 BROWSER_FILE_PERSISTENCE = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserFilePersistence.java"
 MODERN_RUNTIME_SUPPORT = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "lang" / "TModernRuntimeSupport.java"
+# Backend-dependent float arithmetic (Math.fma): JSBody for JavaScript, plain Java for wasmgc.
+TARGET_MATH_JS = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "TargetMath.java"
+TARGET_MATH_WASMGC = PORT / "overrides" / "classlib" / "src" / "target-wasmgc" / "java" / "dev" / "gaius" / "browser" / "TargetMath.java"
+# JavaScript host event loop facade (Platform scheduling, the MessagePort macrotask helper and the
+# no-suspend frame check that TModernRuntimeSupport delegates to).
+HOST_LOOP_JS = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "HostLoop.java"
 TEAVM_LOCK_SUPPORT = PORT / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "util" / "concurrent" / "locks" / "TLockSupport.java"
 FILE_OUTPUT_STREAM = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "io" / "TFileOutputStream.java"
 FILE_CHANNEL = PORT / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "nio" / "channels" / "TFileChannel.java"
@@ -2380,6 +2386,9 @@ def check_source_patches() -> None:
     )
     browser_file_persistence = BROWSER_FILE_PERSISTENCE.read_text(errors="replace") if BROWSER_FILE_PERSISTENCE.exists() else ""
     modern_runtime_support = MODERN_RUNTIME_SUPPORT.read_text(errors="replace") if MODERN_RUNTIME_SUPPORT.exists() else ""
+    target_math_js = TARGET_MATH_JS.read_text(errors="replace") if TARGET_MATH_JS.exists() else ""
+    target_math_wasmgc = TARGET_MATH_WASMGC.read_text(errors="replace") if TARGET_MATH_WASMGC.exists() else ""
+    host_loop_js = HOST_LOOP_JS.read_text(errors="replace") if HOST_LOOP_JS.exists() else ""
     teavm_lock_support = TEAVM_LOCK_SUPPORT.read_text(errors="replace") if TEAVM_LOCK_SUPPORT.exists() else ""
     file_output_stream = FILE_OUTPUT_STREAM.read_text(errors="replace") if FILE_OUTPUT_STREAM.exists() else ""
     file_channel = FILE_CHANNEL.read_text(errors="replace") if FILE_CHANNEL.exists() else ""
@@ -5196,7 +5205,7 @@ def check_source_patches() -> None:
         (
             "Browser scheduled executor honors delays instead of retry-spinning",
             "unit.toMillis" in scheduled_thread_pool_executor
-            and "Platform.schedule" in scheduled_thread_pool_executor
+            and "HostLoop.schedule" in scheduled_thread_pool_executor
             and "scheduleChunk" in scheduled_thread_pool_executor
             and "remainingMillis" in scheduled_thread_pool_executor,
         ),
@@ -5559,10 +5568,13 @@ def check_source_patches() -> None:
         ),
         (
             "Browser Math.fma uses a native numeric implementation",
-            "public static native float fma(float left, float right, float addend);" in modern_runtime_support
-            and "public static native double fma(double left, double right, double addend);" in modern_runtime_support
-            and "return Math.fround(left * right + addend);" in modern_runtime_support
+            "return TargetMath.fma(left, right, addend);" in modern_runtime_support
+            and "public static double fma(double left, double right, double addend)" in modern_runtime_support
             and "return left * right + addend;" in modern_runtime_support
+            and "public static native float fma(float left, float right, float addend);" in target_math_js
+            and "return Math.fround(left * right + addend);" in target_math_js
+            and "return (float) ((double) left * (double) right + (double) addend);" in target_math_wasmgc
+            and "@JSBody" not in target_math_wasmgc
             and "testFloatingPointFma" in platform_smoke
             and "Browser float fma lost non-finite semantics" in platform_smoke
             and "Browser float fma lost negative zero" in platform_smoke,
@@ -5667,7 +5679,8 @@ def check_source_patches() -> None:
             and "return hidden" in glfw_text
             and "__gaiusBackgroundFrameThrottles" in glfw_text
             and "boolean hidden = swapBuffersJs()" in glfw_text
-            and "yieldAfterPresent(hidden, swapInterval)" in glfw_text
+            and "presentYield(hidden, swapInterval)" in glfw_text
+            and "yieldAfterPresent(hidden, interval);" in glfw_text
             and "scheduleFrameYield(hidden, interval" in glfw_text
             and "synchronizedToDisplay && typeof requestAnimationFrame==='function'" in glfw_text
             and "uncappedYieldCount" in glfw_text
@@ -5906,7 +5919,7 @@ def check_source_patches() -> None:
             and "BrowserRenderScheduler" in client_patcher
             and "BROWSER_SECTION_UPLOAD_BUDGET = 8" in client_patcher
             and "BROWSER_SECTION_CLOSE_BUDGET = 16" in client_patcher
-            and "Platform.startThread(BrowserRenderScheduler::runPump)" in browser_render_scheduler
+            and "HostLoop.startThread(BrowserRenderScheduler::runPump)" in browser_render_scheduler
             and "FRAME_WATCHDOG_MILLIS = 50" in browser_render_scheduler
             and "SLICE_NANOS = 2_000_000L" in browser_render_scheduler
             and "TModernRuntimeSupport.yieldToEventLoop(0)" in browser_render_scheduler
@@ -6297,7 +6310,7 @@ def check_source_patches() -> None:
             and "FRAME_WORK_BUDGET_NANOS = 25_000_000L" in browser_resource_reload_scheduler
             and "scheduleMacrotask(BrowserResourceReloadScheduler::runAfterYield)"
                 in browser_resource_reload_scheduler
-            and "TModernRuntimeSupport.postRunnableMacrotask" in browser_resource_reload_scheduler
+            and "HostLoop.postMacrotask(command)" in browser_resource_reload_scheduler
             and "requestAnimationFrame" not in browser_resource_reload_scheduler
             and "MAX_SUBMISSIONS_PER_BATCH" in browser_resource_reload_scheduler
             and "delegate.execute(command)" in browser_resource_reload_scheduler,
@@ -6542,21 +6555,23 @@ def check_source_patches() -> None:
             and "MAX_NETWORK_WAIT_PULSES = 2" in browser_worldgen_scheduler
             and "MAX_PULSES_PER_TURN = 4096" in browser_worldgen_scheduler
             and "public static void yieldToEventLoop(int delayMillis) {" in modern_runtime_support
-            and "if (inClassInitializer()) {" in modern_runtime_support
+            and "if (inClassInitializer() || !HostLoop.canSuspend()) {" in modern_runtime_support
             and "private static native void suspendToEventLoop(int delayMillis);"
                 in modern_runtime_support
-            and "return (globalThis.__gaiusClinitDepth | 0) > 0" in modern_runtime_support
-            and "|| (globalThis.__gaiusNoSuspendDepth | 0) > 0;" in modern_runtime_support
+            and "return HostLoop.inNoSuspendFrame();" in modern_runtime_support
+            and "return (globalThis.__gaiusClinitDepth | 0) > 0" in host_loop_js
+            and "|| (globalThis.__gaiusNoSuspendDepth | 0) > 0;" in host_loop_js
             and "TThread.setCurrentThread(thread)" in modern_runtime_support
-            and "Platform.schedule(resume, delayMillis)" in modern_runtime_support
-            and "postMacrotask(() -> resume.run())" in modern_runtime_support
-            and "private static native void postMacrotask(ResumeCallback callback);"
-                in modern_runtime_support
-            and "new MessageChannel()" in modern_runtime_support
-            and "pending: new Map()" in modern_runtime_support
-            and "state.channel.port1.onmessage" in modern_runtime_support
-            and "state.pending.delete(event.data)" in modern_runtime_support
-            and "setTimeout(callback, 0)" in modern_runtime_support
+            and "HostLoop.schedule(resume, delayMillis)" in modern_runtime_support
+            and "return Platform.schedule(task::run, delayMillis);" in host_loop_js
+            and "HostLoop.postMacrotask(resume)" in modern_runtime_support
+            and "private static native void postMacrotask(MacrotaskCallback callback);"
+                in host_loop_js
+            and "new MessageChannel()" in host_loop_js
+            and "pending: new Map()" in host_loop_js
+            and "state.channel.port1.onmessage" in host_loop_js
+            and "state.pending.delete(event.data)" in host_loop_js
+            and "setTimeout(callback, 0)" in host_loop_js
             and "Thread.sleep(" not in browser_worldgen_scheduler
             and "patchChunkGenerationTaskBrowserYield" not in client_patcher
             and "browserWorldgenBeginServerWorkTurn()" in client_patcher

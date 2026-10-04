@@ -1,5 +1,6 @@
 package org.lwjgl.opengl;
 
+import dev.gaius.browser.JsArrays;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -3506,7 +3507,7 @@ public final class BrowserOpenGL {
         if (drawCount <= 0 || data == null || data.length < drawCount * 8) {
             return 0;
         }
-        return terrainMultiDrawJs(kind, Int32Array.fromJavaArray(data), drawCount, leadSerial,
+        return terrainMultiDrawJs(kind, JsArrays.int32(data), drawCount, leadSerial,
                 leadIndexCount, leadBaseVertex);
     }
 
@@ -4499,7 +4500,7 @@ public final class BrowserOpenGL {
     }
 
     public static void clearBufferfv(int buffer, int drawBuffer, float[] values) {
-        clearBufferfvJs(buffer, drawBuffer, Float32Array.fromJavaArray(values));
+        clearBufferfvJs(buffer, drawBuffer, JsArrays.float32(values));
     }
 
     public static void clearBufferfv(int buffer, int drawBuffer, long address) {
@@ -4603,13 +4604,13 @@ public final class BrowserOpenGL {
     }
 
     public static void drawBuffers(int[] buffers) {
-        drawBuffersJs(Int32Array.fromJavaArray(buffers));
+        drawBuffersJs(JsArrays.int32(buffers));
     }
 
     public static void drawBuffers(int buffer) {
         int[] values = UNIFORM_SCRATCH.get().ints(1);
         values[0] = buffer;
-        drawBuffersJs(Int32Array.fromJavaArray(values));
+        drawBuffersJs(JsArrays.int32(values));
     }
 
     public static void drawBuffer(int buffer) {
@@ -6404,47 +6405,47 @@ public final class BrowserOpenGL {
     }
 
     public static void uniform1fv(int location, float[] values) {
-        uniform1fvJs(location, Float32Array.fromJavaArray(values));
+        uniform1fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform2fv(int location, float[] values) {
-        uniform2fvJs(location, Float32Array.fromJavaArray(values));
+        uniform2fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform3fv(int location, float[] values) {
-        uniform3fvJs(location, Float32Array.fromJavaArray(values));
+        uniform3fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform4fv(int location, float[] values) {
-        uniform4fvJs(location, Float32Array.fromJavaArray(values));
+        uniform4fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform1iv(int location, int[] values) {
-        uniform1ivJs(location, Int32Array.fromJavaArray(values));
+        uniform1ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniform2iv(int location, int[] values) {
-        uniform2ivJs(location, Int32Array.fromJavaArray(values));
+        uniform2ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniform3iv(int location, int[] values) {
-        uniform3ivJs(location, Int32Array.fromJavaArray(values));
+        uniform3ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniform4iv(int location, int[] values) {
-        uniform4ivJs(location, Int32Array.fromJavaArray(values));
+        uniform4ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniformMatrix2fv(int location, boolean transpose, float[] values) {
-        uniformMatrix2fvJs(location, transpose, Float32Array.fromJavaArray(values));
+        uniformMatrix2fvJs(location, transpose, JsArrays.float32(values));
     }
 
     public static void uniformMatrix3fv(int location, boolean transpose, float[] values) {
-        uniformMatrix3fvJs(location, transpose, Float32Array.fromJavaArray(values));
+        uniformMatrix3fvJs(location, transpose, JsArrays.float32(values));
     }
 
     public static void uniformMatrix4fv(int location, boolean transpose, float[] values) {
-        uniformMatrix4fvJs(location, transpose, Float32Array.fromJavaArray(values));
+        uniformMatrix4fvJs(location, transpose, JsArrays.float32(values));
     }
 
     public static void uniform1fv(int location, int count, long values) {
@@ -8107,12 +8108,15 @@ public final class BrowserOpenGL {
         } else {
             MINECRAFT_STATE_DETAILS.clearHit();
         }
+        // Two calls: TeaVM's WebAssembly GC backend limits JSBody natives to 32 parameters.
+        stageMinecraftPlayerStateJs(
+                className(player), playerX, playerY, playerZ, playerYaw, playerPitch,
+                playerCollisionKnown, playerCollisionFree,
+                playerMode, selectedSlot, selectedItem, selectedCount);
         reportMinecraftStateJs(
                 className(screen), screenTitle, screenWidth, screenHeight, screenWidgetsJson,
-                className(overlay), className(level), className(player),
-                playerX, playerY, playerZ, playerYaw, playerPitch,
-                loadedChunkCount, playerCollisionKnown, playerCollisionFree,
-                playerMode, selectedSlot, selectedItem, selectedCount,
+                className(overlay), className(level),
+                loadedChunkCount, playerMode,
                 hitClass, hitType, hitBlockPos, hitDirection, hitBlockState, hitEntity,
                 rawRenderDistance, effectiveRenderDistance, rawSimulationDistance,
                 serverSimulationDistance,
@@ -8222,15 +8226,10 @@ public final class BrowserOpenGL {
     }
 
     @JSBody(params = {
-            "screen", "screenTitle", "screenWidth", "screenHeight", "screenWidgetsJson",
-            "overlay", "level", "playerClass",
+            "playerClass",
             "playerX", "playerY", "playerZ", "playerYaw", "playerPitch",
-            "loadedChunkCount", "playerCollisionKnown", "playerCollisionFree",
-            "playerMode", "selectedSlot", "selectedItem", "selectedCount",
-            "hitClass", "hitType", "hitBlockPos", "hitDirection", "hitBlockState", "hitEntity",
-            "rawRenderDistance", "effectiveRenderDistance", "rawSimulationDistance",
-            "serverSimulationDistance",
-            "noRender", "running", "pause"
+            "playerCollisionKnown", "playerCollisionFree",
+            "playerMode", "selectedSlot", "selectedItem", "selectedCount"
     }, script = """
             var playerState = null;
             if (playerClass !== null) {
@@ -8250,6 +8249,25 @@ public final class BrowserOpenGL {
                 } : null
               };
             }
+            window.__gaiusMinecraftPlayerStateStage = playerState;
+            """)
+    private static native void stageMinecraftPlayerStateJs(
+            String playerClass,
+            double playerX, double playerY, double playerZ, float playerYaw, float playerPitch,
+            boolean playerCollisionKnown, boolean playerCollisionFree,
+            String playerMode, int selectedSlot, String selectedItem, int selectedCount);
+
+    @JSBody(params = {
+            "screen", "screenTitle", "screenWidth", "screenHeight", "screenWidgetsJson",
+            "overlay", "level",
+            "loadedChunkCount", "playerMode",
+            "hitClass", "hitType", "hitBlockPos", "hitDirection", "hitBlockState", "hitEntity",
+            "rawRenderDistance", "effectiveRenderDistance", "rawSimulationDistance",
+            "serverSimulationDistance",
+            "noRender", "running", "pause"
+    }, script = """
+            var playerState = window.__gaiusMinecraftPlayerStateStage || null;
+            window.__gaiusMinecraftPlayerStateStage = null;
             var hitState = null;
             if (hitClass !== null || hitType !== null) {
               hitState = {
@@ -8300,10 +8318,8 @@ public final class BrowserOpenGL {
             """)
     private static native void reportMinecraftStateJs(
             String screen, String screenTitle, int screenWidth, int screenHeight, String screenWidgetsJson,
-            String overlay, String level, String playerClass,
-            double playerX, double playerY, double playerZ, float playerYaw, float playerPitch,
-            int loadedChunkCount, boolean playerCollisionKnown, boolean playerCollisionFree,
-            String playerMode, int selectedSlot, String selectedItem, int selectedCount,
+            String overlay, String level,
+            int loadedChunkCount, String playerMode,
             String hitClass, String hitType, String hitBlockPos, String hitDirection, String hitBlockState,
             String hitEntity,
             int rawRenderDistance, int effectiveRenderDistance,
@@ -8703,7 +8719,7 @@ public final class BrowserOpenGL {
             return null;
         }
         if (length <= 0) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         ByteBuffer bytes = MemoryUtil.memByteBuffer(address, length);
         return Int8Array.fromJavaBuffer(bytes);
@@ -8716,7 +8732,7 @@ public final class BrowserOpenGL {
         for (int i = 0; i < length; i++) {
             data[i] = buffer.get(position + i);
         }
-        return Float32Array.fromJavaArray(data);
+        return JsArrays.float32(data);
     }
 
     private static Int32Array ints(IntBuffer buffer) {
@@ -8726,7 +8742,7 @@ public final class BrowserOpenGL {
         for (int i = 0; i < length; i++) {
             data[i] = buffer.get(position + i);
         }
-        return Int32Array.fromJavaArray(data);
+        return JsArrays.int32(data);
     }
 
     private static Float32Array pointerFloats(long address, int count) {
@@ -8734,12 +8750,12 @@ public final class BrowserOpenGL {
             return null;
         }
         if (count <= 0) {
-            return Float32Array.fromJavaArray(UNIFORM_SCRATCH.get().floats(0));
+            return JsArrays.float32(UNIFORM_SCRATCH.get().floats(0));
         }
         FloatBuffer floats = MemoryUtil.memByteBuffer(address, count * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         float[] data = UNIFORM_SCRATCH.get().floats(count);
         floats.get(data);
-        return Float32Array.fromJavaArray(data);
+        return JsArrays.float32(data);
     }
 
     private static Int32Array pointerInts(long address, int count) {
@@ -8747,12 +8763,12 @@ public final class BrowserOpenGL {
             return null;
         }
         if (count <= 0) {
-            return Int32Array.fromJavaArray(UNIFORM_SCRATCH.get().ints(0));
+            return JsArrays.int32(UNIFORM_SCRATCH.get().ints(0));
         }
         IntBuffer ints = MemoryUtil.memByteBuffer(address, count * 4).order(ByteOrder.nativeOrder()).asIntBuffer();
         int[] data = UNIFORM_SCRATCH.get().ints(count);
         ints.get(data);
-        return Int32Array.fromJavaArray(data);
+        return JsArrays.int32(data);
     }
 
     private static int textureUploadLength(int width, int height, int format, int type) {

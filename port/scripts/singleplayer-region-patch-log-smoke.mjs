@@ -22,10 +22,15 @@ const persistenceUrl = new URL(
   "../overrides/classlib/src/main/java/dev/gaius/browser/BrowserFilePersistence.java",
   import.meta.url,
 );
-const [bootstrap, channel, persistence] = await Promise.all([
+const jsArraysUrl = new URL(
+  "../overrides/classlib/src/main/java/dev/gaius/browser/JsArrays.java",
+  import.meta.url,
+);
+const [bootstrap, channel, persistence, jsArrays] = await Promise.all([
   readFile(bootstrapUrl, "utf8"),
   readFile(channelUrl, "utf8"),
   readFile(persistenceUrl, "utf8"),
+  readFile(jsArraysUrl, "utf8"),
 ]);
 
 assert.match(channel, /MAX_DIRTY_RANGES = 64/,
@@ -47,8 +52,14 @@ assert.match(persistence, /public static boolean persistRanges\(/,
   "BrowserFilePersistence range bridge is missing");
 assert.match(persistence, /__gaiusFsCanPatchBytes/,
   "range persistence cannot fall back when OPFS patches are unavailable");
-assert.match(persistence, /@JSByRef int\[\] offsets/,
-  "range offsets are not passed to JavaScript by reference");
+// The JSBody takes typed arrays; JsArrays.int32 is the Java array itself (zero copy) in the
+// JavaScript build and a copy in the WebAssembly GC build.
+assert.match(persistence, /private static native boolean patchBytesJs\(\s*String path,\s*int logicalSize,\s*Int32Array offsets,\s*Int32Array lengths,\s*Int8Array payload\);/,
+  "range offsets are not passed to JavaScript as typed arrays");
+assert.match(persistence, /JsArrays\.int32\(offsets\)/,
+  "range offsets are not passed to JavaScript through JsArrays");
+assert.match(jsArrays, /public static Int32Array int32\(int\[\] array\) \{\s*return array == null \? null : Int32Array\.fromJavaArray\(array\);\s*\}/,
+  "range offsets are not passed to JavaScript by reference in the JavaScript build");
 assert.match(bootstrap, /!indexed \|\| indexed\.backend === "opfs"/,
   "range writes can bypass the full v1 migration of a non-OPFS region");
 for (const contract of [

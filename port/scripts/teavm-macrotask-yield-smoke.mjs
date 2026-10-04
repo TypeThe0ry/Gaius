@@ -5,12 +5,16 @@ import {homedir, tmpdir} from 'node:os';
 import {delimiter, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-// Compile and run the real TeaVM continuation implementation.  The only Java
-// source used for the scheduler is extracted verbatim from TModernRuntimeSupport;
-// the fixture removes unrelated ICU/time methods so this smoke stays small.
+// Compile and run the real TeaVM continuation implementation.  The yield methods are
+// extracted verbatim from TModernRuntimeSupport (the fixture removes unrelated ICU/time
+// methods so this smoke stays small); they resume through the JavaScript HostLoop, whose
+// MessageChannel helper compiles unchanged.
+//   node port/scripts/teavm-macrotask-yield-smoke.mjs [TModernRuntimeSupport.java [HostLoop.java]]
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const input = resolve(process.argv[2] || join(root,
   'port/overrides/classlib/src/main/java/org/teavm/classlib/java/lang/TModernRuntimeSupport.java'));
+const hostLoopInput = resolve(process.argv[3] || join(root,
+  'port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java'));
 const repository = process.env.M2_REPO || join(homedir(), '.m2', 'repository');
 const jars = [];
 for (const artifact of await readdir(join(repository, 'org', 'teavm'))) {
@@ -51,30 +55,26 @@ assert.ok(callbackAt >= 0, 'real suspendToEventLoop callback overload not found'
 const asyncMethod = production.slice(asyncStart, callbackAt);
 const callbackStart = callbackAt + 2;
 const callbackMethod = balancedMethod(production, callbackStart);
-const functorStart = production.indexOf('    @JSFunctor', callbackStart);
-const functor = balancedMethod(production, functorStart);
-const bodyStart = production.indexOf('    @JSBody(', functorStart);
-const bodyEnd = production.indexOf('\n\n    public static TType genericSuperclass', bodyStart);
-assert.ok(bodyStart >= 0 && bodyEnd >= 0, 'real postMacrotask helper not found');
-const postMacrotask = production.slice(bodyStart, bodyEnd);
+// The MessageChannel helper and the host timer live in dev.gaius.browser.HostLoop.
+const hostLoop = await readFile(hostLoopInput, 'utf8');
+const helperStart = hostLoop.indexOf('    @JSBody(params = "callback"');
+const helperEnd = hostLoop.indexOf('private static native void postMacrotask(MacrotaskCallback callback);', helperStart);
+assert.ok(helperStart >= 0 && helperEnd >= 0
+    && hostLoop.slice(helperStart, helperEnd).includes('new MessageChannel()'),
+  'real postMacrotask helper not found');
 
 try {
   const sources = {
     'org/teavm/classlib/java/lang/TModernRuntimeSupport.java': `package org.teavm.classlib.java.lang;
+import dev.gaius.browser.HostLoop;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
-import org.teavm.jso.JSBody;
-import org.teavm.jso.JSFunctor;
-import org.teavm.jso.JSObject;
-import org.teavm.platform.Platform;
-import org.teavm.platform.PlatformRunnable;
 public final class TModernRuntimeSupport {
     private TModernRuntimeSupport() {}
 ${asyncMethod}
 ${callbackMethod}
-${functor}
-${postMacrotask}
 }`,
+    'dev/gaius/browser/HostLoop.java': hostLoop,
     'YieldFixture.java': `
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;

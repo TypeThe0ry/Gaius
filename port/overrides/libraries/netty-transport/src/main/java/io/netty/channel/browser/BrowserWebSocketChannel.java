@@ -1,5 +1,7 @@
 package io.netty.channel.browser;
 
+import dev.gaius.browser.HostLoop;
+import dev.gaius.browser.JsArrays;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.AbstractChannel;
@@ -19,7 +21,6 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.NotYetConnectedException;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.typedarrays.Int8Array;
-import org.teavm.platform.Platform;
 
 /** Netty channel backed by Gaius' WebSocket-to-TCP browser bridge. */
 public final class BrowserWebSocketChannel extends AbstractChannel {
@@ -488,7 +489,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     private static Int8Array copyBytes(ByteBuf buffer, int index, int length) {
         byte[] bytes = new byte[length];
         buffer.getBytes(index, bytes);
-        return Int8Array.fromJavaArray(bytes);
+        return JsArrays.int8(bytes);
     }
 
     private void scheduleOutboundContinuation() {
@@ -504,7 +505,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             return;
         }
         outboundRetryScheduled = true;
-        Platform.schedule(() -> {
+        HostLoop.schedule(() -> {
             outboundRetryScheduled = false;
             if (open && active) {
                 unsafe().flush();

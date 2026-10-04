@@ -4,6 +4,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryUtil;
+import dev.gaius.browser.HostLoop;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
 import org.teavm.jso.JSBody;
@@ -482,6 +483,22 @@ public final class BrowserGlfw {
             """)
     private static native boolean swapBuffersJs();
 
+    /**
+     * The per-frame yield after a present. In the JSPI WebAssembly GC build (HostLoop.jspi(),
+     * constant-folded) the thread parks until the same frame-yield callback fires, without
+     * TeaVM's coroutines; a present from a JS callback (no thread to suspend) skips the yield,
+     * as the coroutine build does.
+     */
+    private static void presentYield(boolean hidden, int interval) {
+        if (HostLoop.jspi()) {
+            if (HostLoop.canSuspend()) {
+                HostLoop.awaitHost(resume -> scheduleFrameYield(hidden, interval, resume::run));
+            }
+            return;
+        }
+        yieldAfterPresent(hidden, interval);
+    }
+
     @Async
     private static native void yieldAfterPresent(boolean hidden, int interval);
 
@@ -696,7 +713,7 @@ public final class BrowserGlfw {
     public static void swapBuffers(long window) {
         boolean hidden = swapBuffersJs();
         try {
-            yieldAfterPresent(hidden, swapInterval);
+            presentYield(hidden, swapInterval);
         } catch (RuntimeException e) {
             // A frame presented from a JavaScript callback cannot suspend: on 1.21.11 the login
             // packet runs Minecraft.setLevel -> updateScreenAndTick -> runTick(false) inside the

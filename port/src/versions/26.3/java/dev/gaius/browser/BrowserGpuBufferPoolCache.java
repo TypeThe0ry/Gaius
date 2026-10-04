@@ -781,6 +781,9 @@ public final class BrowserGpuBufferPoolCache {
         telemetryPublishes++;
         framesSinceTelemetry = 0;
         if (!telemetryBridgeAvailable) return;
+        // TeaVM's WebAssembly GC backend limits JSBody natives to 32 parameters; the
+        // WebAssembly GC build does not publish this telemetry yet (constant-folded).
+        if (HostLoop.isWasmGc()) return;
         String label = labelForPublish();
         try {
             publishTelemetryBrowser(

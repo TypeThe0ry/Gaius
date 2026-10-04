@@ -164,10 +164,16 @@ function stageHarness() {
     join(root, "port/tools/src/main/java/dev/gaius/tools/LwjglShadercBrowserPatcher.java"),
     join(root, "port/tools/src/main/java/dev/gaius/tools/LwjglSpvcBrowserPatcher.java"),
     join(root, "port/tools/src/main/java/dev/gaius/tools/LwjglBrowserShimRedirect.java")], join(classes, "tools"));
+  // The library overlays pass Java arrays to JavaScript through dev.gaius.browser.JsArrays of the
+  // classlib overlay, which build-overlays.sh puts on their class path; its JavaScript
+  // implementation is compiled once here and stays outside the library jars.
+  const classlib = join(classes, "classlib");
+  javac("classlib JsArrays", teavmJars,
+    [join(root, "port/overrides/classlib/src/main/java/dev/gaius/browser/JsArrays.java")], classlib);
   const shimSources = (module) => listJava(join(root, "port/overrides/libraries", module, "src/main/java"));
-  javac("lwjgl-shaderc overlay", [lwjgl("lwjgl-shaderc"), lwjgl("lwjgl"), ...teavmJars],
+  javac("lwjgl-shaderc overlay", [lwjgl("lwjgl-shaderc"), lwjgl("lwjgl"), classlib, ...teavmJars],
     shimSources("lwjgl-shaderc"), join(classes, "shaderc"));
-  javac("lwjgl-spvc overlay", [lwjgl("lwjgl-spvc"), lwjgl("lwjgl"), ...teavmJars],
+  javac("lwjgl-spvc overlay", [lwjgl("lwjgl-spvc"), lwjgl("lwjgl"), classlib, ...teavmJars],
     shimSources("lwjgl-spvc"), join(classes, "spvc"));
 
   // The patchers read the vanilla binding plus the compiled shim from one jar, as
@@ -194,7 +200,7 @@ function stageHarness() {
 
   // BrowserOpenGL.translateShaderSource, compiled from the unchanged overlay source.
   const openglClasses = join(classes, "opengl");
-  javac("lwjgl-opengl overlay", [lwjgl("lwjgl-opengl"), clientJar, ...libs, ...teavmJars],
+  javac("lwjgl-opengl overlay", [lwjgl("lwjgl-opengl"), clientJar, ...libs, classlib, ...teavmJars],
     listJava(join(root, "port/overrides/libraries/lwjgl-opengl/src/main/java")), openglClasses);
   const browserOpenGl = join(classes, "browser-opengl/org/lwjgl/opengl");
   rmSync(join(classes, "browser-opengl"), {recursive: true, force: true});
@@ -204,7 +210,7 @@ function stageHarness() {
   }
 
   javac("harness", [clientJar, ...libs, join(classes, "shaderc"), join(classes, "spvc"), join(classes, "nat"),
-    ...teavmJars, ...asmJars], listJava(harnessSources).filter((file) => !file.endsWith("ShaderCorpusRelocate.java")),
+    classlib, ...teavmJars, ...asmJars], listJava(harnessSources).filter((file) => !file.endsWith("ShaderCorpusRelocate.java")),
   join(classes, "harness"));
 
   const javaArgs = ["--enable-native-access=ALL-UNNAMED"];
@@ -212,9 +218,9 @@ function stageHarness() {
   // The native run keeps the vanilla Shaderc/Spvc; the shim and relocated classes are
   // only there so the harness class verifies (it installs the shim backends in shim modes).
   const nativeClasspath = [join(classes, "harness"), join(classes, "shaderc"), join(classes, "spvc"),
-    join(classes, "nat"), ...teavmJars, clientJar, ...libs];
+    join(classes, "nat"), classlib, ...teavmJars, clientJar, ...libs];
   const shimClasspath = [join(classes, "harness"), patched, join(classes, "shaderc"), join(classes, "spvc"),
-    join(classes, "nat"), join(classes, "browser-opengl"), ...teavmJars, clientJar, ...libs];
+    join(classes, "nat"), join(classes, "browser-opengl"), classlib, ...teavmJars, clientJar, ...libs];
   for (const [mode, classpath, extra] of [["native", nativeClasspath, []],
     ["shim", shimClasspath, ["-Dgaius.translate.check=true"]], ["shim-raw", shimClasspath, []]]) {
     const directory = join(out, mode);

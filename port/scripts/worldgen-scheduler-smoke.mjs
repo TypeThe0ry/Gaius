@@ -682,14 +682,18 @@ const classifierOrder = [
 ].map(fragment => continueTurn.indexOf(fragment));
 assert.ok(classifierOrder.every((at, index) => at >= 0 && (index === 0 || at > classifierOrder[index - 1])),
   "a generation poll must end its turn and never run after bookkeeping in the same turn");
-assert.equal(dispatcherScheduler.split("Platform.startThread(").length - 1, 1,
+// HostLoop.startThread is Platform.startThread in the JavaScript build.
+assert.equal(dispatcherScheduler.split("HostLoop.startThread(").length - 1, 1,
   "only a new dispatcher chain may pay Platform.startThread's clamped setTimeout");
+assert.ok(!dispatcherScheduler.includes("Platform.startThread("),
+  "the dispatcher must start its pump through HostLoop, which both TeaVM targets provide");
 assert.ok(dispatcherScheduler.includes("TModernRuntimeSupport.yieldToEventLoop(0);")
     && dispatcherScheduler.includes("pump.resumeRequested = true;")
     && dispatcherScheduler.includes("new IdentityHashMap<>()"),
   "dispatcher continuation hops must resume the per-dispatcher pump through MessageChannel");
 assert.ok(!dispatcherScheduler.includes("setTimeout(")
     && !dispatcherScheduler.includes("Platform.schedule(")
+    && !dispatcherScheduler.includes("HostLoop.schedule(")
     && !dispatcherScheduler.includes("postRunnableMacrotask"),
   "raw JavaScript callbacks have no TeaVM thread for a suspending generation poll");
 assert.ok(dispatcherScheduler.includes("if (!completed && resumeRequested)"),

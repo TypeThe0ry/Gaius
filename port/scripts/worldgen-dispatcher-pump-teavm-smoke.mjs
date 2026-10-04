@@ -7,14 +7,17 @@ import {fileURLToPath} from 'node:url';
 
 // Compile the production BrowserWorldgenDispatcherScheduler (pump, turn budget and JSBody
 // telemetry) with TeaVM 0.15 and run it in Node. The scheduler's continuation hop must be a
-// suspended TeaVM thread resumed through TModernRuntimeSupport's MessageChannel path: only the
-// first hop of a dispatcher chain may use Platform.startThread's clamped setTimeout(0).
+// suspended TeaVM thread resumed through TModernRuntimeSupport's MessageChannel path (the
+// JavaScript HostLoop): only the first hop of a dispatcher chain may pay the clamped
+// setTimeout(0) of HostLoop.startThread (Platform.startThread in the JavaScript build).
 // The dispatcher below models the patched AbstractConsecutiveExecutor.run() turn protocol;
 // worldgen-priority-jvm-smoke.mjs checks the real patched bytecode against it.
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const scheduler = resolve(root, 'port/src/main/java/dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java');
 const runtimeSupport = resolve(root,
   'port/overrides/classlib/src/main/java/org/teavm/classlib/java/lang/TModernRuntimeSupport.java');
+const hostLoopSource = resolve(root,
+  'port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java');
 const repository = process.env.M2_REPO || join(homedir(), '.m2', 'repository');
 const jars = [];
 for (const artifact of await readdir(join(repository, 'org', 'teavm'))) {
@@ -58,31 +61,28 @@ assert.ok(callbackAt >= 0, 'real suspendToEventLoop callback overload not found'
 const asyncMethod = production.slice(asyncStart, callbackAt);
 const callbackStart = callbackAt + 2;
 const callbackMethod = balancedMethod(production, callbackStart);
-const functorStart = production.indexOf('    @JSFunctor', callbackStart);
-const functor = balancedMethod(production, functorStart);
-const bodyStart = production.indexOf('    @JSBody(', functorStart);
-const bodyEnd = production.indexOf('\n\n    public static TType genericSuperclass', bodyStart);
-assert.ok(bodyStart >= 0 && bodyEnd >= 0, 'real postMacrotask helper not found');
-const postMacrotask = production.slice(bodyStart, bodyEnd);
+// The MessageChannel helper and Platform.startThread live in the JavaScript HostLoop
+// (dev.gaius.browser, classlib overlay), which compiles verbatim.
+const hostLoop = await readFile(hostLoopSource, 'utf8');
+const helperStart = hostLoop.indexOf('    @JSBody(params = "callback"');
+const helperEnd = hostLoop.indexOf('private static native void postMacrotask(MacrotaskCallback callback);', helperStart);
+assert.ok(helperStart >= 0 && helperEnd >= 0
+    && hostLoop.slice(helperStart, helperEnd).includes('new MessageChannel()'),
+  'real postMacrotask helper not found');
 
 const bookkeepingCount = 3000;
 try {
   const sources = {
     'org/teavm/classlib/java/lang/TModernRuntimeSupport.java': `package org.teavm.classlib.java.lang;
+import dev.gaius.browser.HostLoop;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
-import org.teavm.jso.JSBody;
-import org.teavm.jso.JSFunctor;
-import org.teavm.jso.JSObject;
-import org.teavm.platform.Platform;
-import org.teavm.platform.PlatformRunnable;
 public final class TModernRuntimeSupport {
     private TModernRuntimeSupport() {}
 ${asyncMethod}
 ${callbackMethod}
-${functor}
-${postMacrotask}
 }`,
+    'dev/gaius/browser/HostLoop.java': hostLoop,
     'dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java': await readFile(scheduler, 'utf8'),
     'DispatcherPumpFixture.java': `
 import dev.gaius.browser.BrowserWorldgenDispatcherScheduler;

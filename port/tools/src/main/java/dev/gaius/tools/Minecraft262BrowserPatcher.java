@@ -947,9 +947,7 @@ public final class Minecraft262BrowserPatcher {
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL, CHUNK_GENERATION_YIELD, "<init>",
                 "(Ljava/util/concurrent/CompletableFuture;)V", false));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "startThread",
-                "(Lorg/teavm/platform/PlatformRunnable;)V", false));
+        code.add(startThreadCall());
         code.add(new JumpInsnNode(Opcodes.GOTO, normalReturn));
 
         code.add(normalReturn);
@@ -975,13 +973,30 @@ public final class Minecraft262BrowserPatcher {
                 start, tryEnd, handler, "java/lang/Throwable"));
     }
 
+    /**
+     * Starts the batch continuation on a new cooperative thread: TeaVM's
+     * {@code Platform.startThread} for the JavaScript target, which the WebAssembly GC target
+     * does not support, and {@code HostLoop.startThread} (a daemon fiber) there.
+     */
+    private static MethodInsnNode startThreadCall() {
+        if (BuildTarget.wasmGc()) {
+            return new MethodInsnNode(
+                    Opcodes.INVOKESTATIC, "dev/gaius/browser/HostLoop", "startThread",
+                    "(Ljava/lang/Runnable;)V", false);
+        }
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "startThread",
+                "(Lorg/teavm/platform/PlatformRunnable;)V", false);
+    }
+
     private static void writeChunkGenerationYieldHelper(Path root) throws IOException {
         ClassNode node = new ClassNode();
         node.version = Opcodes.V21;
         node.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER;
         node.name = CHUNK_GENERATION_YIELD;
         node.superName = "java/lang/Object";
-        node.interfaces.add("org/teavm/platform/PlatformRunnable");
+        node.interfaces.add(BuildTarget.wasmGc()
+                ? "java/lang/Runnable" : "org/teavm/platform/PlatformRunnable");
         node.fields.add(new FieldNode(
                 Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
                 "future",

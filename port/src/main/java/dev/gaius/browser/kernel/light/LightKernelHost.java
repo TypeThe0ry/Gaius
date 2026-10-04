@@ -1,7 +1,8 @@
 package dev.gaius.browser.kernel.light;
 
+import org.teavm.jso.typedarrays.Int8Array;
+import dev.gaius.browser.JsArrays;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
 import org.teavm.jso.JSFunctor;
 import org.teavm.jso.JSObject;
 
@@ -234,8 +235,11 @@ public final class LightKernelHost {
             + " bad('no-host', error);"
             + "}"
             + "return true;")
-    private static native boolean submitNative(@JSByRef byte[] bytes, int length, @JSByRef byte[] table, int chunkX,
-            int chunkZ, int jobId, int timeoutMs, ResultCallback done, FailureCallback fail);
+    private static native boolean submitNativeJs(Int8Array bytes, int length, Int8Array table, int chunkX, int chunkZ, int jobId, int timeoutMs, ResultCallback done, FailureCallback fail);
+
+    private static boolean submitNative(byte[] bytes, int length, byte[] table, int chunkX, int chunkZ, int jobId, int timeoutMs, ResultCallback done, FailureCallback fail) {
+        return submitNativeJs(JsArrays.int8(bytes), length, JsArrays.int8(table), chunkX, chunkZ, jobId, timeoutMs, done, fail);
+    }
 
     @JSBody(params = "result", script = "return result ? (result.byteLength | 0) : 0;")
     private static native int resultLengthNative(JSObject result);
@@ -243,7 +247,13 @@ public final class LightKernelHost {
     @JSBody(params = {"result", "out"}, script = "var view = result instanceof ArrayBuffer"
             + " ? new Int8Array(result) : new Int8Array(result.buffer, result.byteOffset, result.byteLength);"
             + "out.set(view.subarray(0, out.length));")
-    private static native void copyResultNative(JSObject result, @JSByRef byte[] out);
+    private static native void copyResultNativeJs(JSObject result, Int8Array out);
+
+    private static void copyResultNative(JSObject result, byte[] out) {
+        Int8Array outView = JsArrays.int8(out);
+        copyResultNativeJs(result, outView);
+        JsArrays.readBack(outView, out);
+    }
 
     @JSBody(params = "message", script = "if (typeof console !== 'undefined') { console.log(message); }")
     private static native void logNative(String message);

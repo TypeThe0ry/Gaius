@@ -5,8 +5,6 @@ import java.util.Map;
 import java.util.concurrent.Executor;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
-import org.teavm.platform.Platform;
-import org.teavm.platform.PlatformRunnable;
 
 /**
  * Bounds and resumes integrated-server worldgen dispatcher turns in the browser Worker.
@@ -90,7 +88,7 @@ public final class BrowserWorldgenDispatcherScheduler {
         pump = new Pump(executor, dispatcher);
         PUMPS.put(dispatcher, pump);
         recordHopTelemetry(HOP_THREAD);
-        Platform.startThread(pump);
+        HostLoop.startThread(pump);
     }
 
     private static long nowNanos() {
@@ -101,7 +99,7 @@ public final class BrowserWorldgenDispatcherScheduler {
      * One TeaVM thread per active dispatcher chain. Suspension inside {@code execute} only
      * parks this dispatcher's chain; other dispatchers start their own pumps.
      */
-    private static final class Pump implements PlatformRunnable {
+    private static final class Pump implements Runnable {
         private final Executor executor;
         private final Runnable dispatcher;
         private boolean resumeRequested;

@@ -83,6 +83,7 @@ const libraries263 = (await readdir(join(work263, "libraries"), {recursive: true
 
 const overlaySources = join(repositoryRoot, "port/overrides/libraries/lwjgl-sdl/src/main/java/org/lwjgl/sdl");
 const overlayTestSources = join(repositoryRoot, "port/overrides/libraries/lwjgl-sdl/src/test/java/org/lwjgl/sdl");
+const hostLoopSource = join(repositoryRoot, "port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java");
 const toolsRoot = join(repositoryRoot, "port/tools/src/main/java");
 const patcherSource = await readFile(join(toolsRoot, "dev/gaius/tools/LwjglSdlBrowserPatcher.java"), "utf8");
 const entries = [...patcherSource.matchAll(/\{"(SDL\w+)",\s*"(SDL_\w+)",\s*"([^"]+)"\}/g)]
@@ -163,8 +164,11 @@ try {
 
   // ---------------------------------------------------------------- 1. overlay + patcher
   const overlayClasses = join(work, "overlay");
+  // BrowserSdlDom reaches the host event loop through dev.gaius.browser.HostLoop of the
+  // classlib overlay (its JavaScript implementation; build-overlays.sh puts the classlib overlay
+  // classes on the library overlay class path).
   await javacArgfile("overlay", [sdlJar, client263, ...classpath263, ...teavmApiJars], overlayClasses,
-    await javaFiles(overlaySources), ["--release", "21", "-proc:none"]);
+    [...await javaFiles(overlaySources), hostLoopSource], ["--release", "21", "-proc:none"]);
   const patchedJar = join(work, "lwjgl-sdl-3.4.3.jar");
   await copyFile(sdlJar, patchedJar);
   mustRun(jarTool, ["--update", "--file", patchedJar, "-C", overlayClasses, "."]);

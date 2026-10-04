@@ -1,5 +1,6 @@
 package org.lwjgl.openal;
 
+import dev.gaius.browser.JsArrays;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
@@ -1587,17 +1588,17 @@ public final class BrowserOpenAL {
 
     private static Int8Array bytes(ByteBuffer buffer) {
         if (buffer == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         ByteBuffer copy = buffer.duplicate();
         byte[] data = new byte[copy.remaining()];
         copy.get(data);
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 
     private static Int8Array shorts(ShortBuffer buffer) {
         if (buffer == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         ShortBuffer copy = buffer.duplicate();
         byte[] data = new byte[copy.remaining() * 2];
@@ -1607,12 +1608,12 @@ public final class BrowserOpenAL {
             data[offset++] = (byte) value;
             data[offset++] = (byte) (value >>> 8);
         }
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 
     private static Int8Array shorts(short[] values) {
         if (values == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         byte[] data = new byte[values.length * 2];
         int offset = 0;
@@ -1620,12 +1621,12 @@ public final class BrowserOpenAL {
             data[offset++] = (byte) value;
             data[offset++] = (byte) (value >>> 8);
         }
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 
     private static Int8Array ints(IntBuffer buffer) {
         if (buffer == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         IntBuffer copy = buffer.duplicate();
         byte[] data = new byte[copy.remaining() * 4];
@@ -1637,12 +1638,12 @@ public final class BrowserOpenAL {
             data[offset++] = (byte) (value >>> 16);
             data[offset++] = (byte) (value >>> 24);
         }
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 
     private static Int8Array ints(int[] values) {
         if (values == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         byte[] data = new byte[values.length * 4];
         int offset = 0;
@@ -1652,12 +1653,12 @@ public final class BrowserOpenAL {
             data[offset++] = (byte) (value >>> 16);
             data[offset++] = (byte) (value >>> 24);
         }
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 
     private static Int8Array floats(FloatBuffer buffer) {
         if (buffer == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         FloatBuffer copy = buffer.duplicate();
         byte[] data = new byte[copy.remaining() * 4];
@@ -1669,12 +1670,12 @@ public final class BrowserOpenAL {
             data[offset++] = (byte) (value >>> 16);
             data[offset++] = (byte) (value >>> 24);
         }
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 
     private static Int8Array floats(float[] values) {
         if (values == null) {
-            return Int8Array.fromJavaArray(new byte[0]);
+            return JsArrays.int8(new byte[0]);
         }
         byte[] data = new byte[values.length * 4];
         int offset = 0;
@@ -1685,6 +1686,6 @@ public final class BrowserOpenAL {
             data[offset++] = (byte) (value >>> 16);
             data[offset++] = (byte) (value >>> 24);
         }
-        return Int8Array.fromJavaArray(data);
+        return JsArrays.int8(data);
     }
 }

@@ -10,7 +10,6 @@ import net.minecraft.server.WorldStem;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import org.teavm.jso.JSBody;
-import org.teavm.platform.Platform;
 
 /** Launches the official Minecraft server in a Web Worker for browser singleplayer. */
 public final class BrowserSingleplayerClient {
@@ -116,8 +115,8 @@ public final class BrowserSingleplayerClient {
                             : effectiveDetail)));
             return;
         }
-        Platform.schedule(
-                () -> Platform.startThread(
+        HostLoop.schedule(
+                () -> HostLoop.startThread(
                         () -> connectWhenWorkerReady(
                                 minecraft, sessionId, launchGeneration, pollCount + 1)),
                 READY_POLL_MILLIS);

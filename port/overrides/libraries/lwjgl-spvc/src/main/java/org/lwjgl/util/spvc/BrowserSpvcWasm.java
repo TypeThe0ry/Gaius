@@ -1,7 +1,9 @@
 package org.lwjgl.util.spvc;
 
+import dev.gaius.browser.JsArrays;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
+import org.teavm.jso.typedarrays.Int32Array;
+import org.teavm.jso.typedarrays.Int8Array;
 
 /**
  * The browser {@link BrowserSpvcToolchain}: SPIRV-Cross compiled to
@@ -34,7 +36,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @Override
     public int parseSpirv(int generation, long context, int[] words, long[] parsedIr) {
-        int result = parseSpirvJs(generation, (int) context, words, words.length);
+        int result = parseSpirvJs(generation, (int) context, JsArrays.int32(words), words.length);
         parsedIr[0] = out();
         return result;
     }
@@ -86,7 +88,9 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
         list.allocate(count);
         if (count > 0) {
             int[] triples = new int[count * 3];
-            resourceFillJs(generation, triples);
+            Int32Array view = JsArrays.int32(triples);
+            resourceFillJs(generation, view);
+            JsArrays.readBack(view, triples);
             for (int i = 0; i < count; i++) {
                 list.ids[i] = triples[i * 3];
                 list.baseTypeIds[i] = triples[i * 3 + 1];
@@ -111,7 +115,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @Override
     public void setName(int generation, long compiler, int id, byte[] name) {
-        setNameJs(generation, (int) compiler, id, name);
+        setNameJs(generation, (int) compiler, id, JsArrays.int8(name));
     }
 
     @Override
@@ -121,7 +125,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @Override
     public int setEntryPoint(int generation, long compiler, byte[] name, int executionModel) {
-        return setEntryPointJs(generation, (int) compiler, name, executionModel);
+        return setEntryPointJs(generation, (int) compiler, JsArrays.int8(name), executionModel);
     }
 
     @Override
@@ -190,7 +194,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @JSBody(params = {"gen", "context", "words", "wordCount"},
             script = "return window.__gaiusShaderToolchain.spvcParseSpirv(gen, context, words, wordCount);")
-    private static native int parseSpirvJs(int gen, int context, @JSByRef int[] words, int wordCount);
+    private static native int parseSpirvJs(int gen, int context, Int32Array words, int wordCount);
 
     @JSBody(params = {"gen", "context", "backend", "ir", "mode"},
             script = "return window.__gaiusShaderToolchain.spvcCreateCompiler(gen, context, backend, ir, mode);")
@@ -222,7 +226,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @JSBody(params = {"gen", "target"},
             script = "window.__gaiusShaderToolchain.spvcResourceFill(gen, target);")
-    private static native void resourceFillJs(int gen, @JSByRef int[] target);
+    private static native void resourceFillJs(int gen, Int32Array target);
 
     @JSBody(params = {"gen", "index"},
             script = "return window.__gaiusShaderToolchain.spvcResourceName(gen, index);")
@@ -239,7 +243,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @JSBody(params = {"gen", "compiler", "id", "name"},
             script = "window.__gaiusShaderToolchain.spvcSetName(gen, compiler, id, name);")
-    private static native void setNameJs(int gen, int compiler, int id, @JSByRef byte[] name);
+    private static native void setNameJs(int gen, int compiler, int id, Int8Array name);
 
     @JSBody(params = {"gen", "compiler", "id"},
             script = "return window.__gaiusShaderToolchain.spvcGetName(gen, compiler, id);")
@@ -247,7 +251,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @JSBody(params = {"gen", "compiler", "name", "model"},
             script = "return window.__gaiusShaderToolchain.spvcSetEntryPoint(gen, compiler, name, model);")
-    private static native int setEntryPointJs(int gen, int compiler, @JSByRef byte[] name, int model);
+    private static native int setEntryPointJs(int gen, int compiler, Int8Array name, int model);
 
     @JSBody(params = {"gen", "compiler"},
             script = "return window.__gaiusShaderToolchain.spvcCompile(gen, compiler);")

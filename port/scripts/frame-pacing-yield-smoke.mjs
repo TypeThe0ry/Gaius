@@ -35,7 +35,7 @@ if (sdl) {
     "SDL_GL_SetSwapInterval does not store the interval");
   assert.match(video, /private static int swapInterval;/,
     "SDL swap interval is not retained for the asynchronous present boundary");
-  assert.match(source, /static void swapWindow\(int swapInterval\) \{\s*boolean hidden = swapBuffersJs\(\);\s*yieldAfterPresent\(hidden, swapInterval\);\s*\}/,
+  assert.match(source, /static void swapWindow\(int swapInterval\) \{\s*boolean hidden = swapBuffersJs\(\);\s*presentYield\(hidden, swapInterval\);\s*\}/,
     "BrowserSdlDom.swapWindow is not present bookkeeping followed by the yield");
 }
 function jsBodyBefore(marker) {
@@ -53,6 +53,12 @@ function jsBodyBefore(marker) {
 
 assert.match(source, /@Async\s+private static native void yieldAfterPresent\(boolean hidden, int interval\)/,
   "swapBuffers yield is not a TeaVM async continuation boundary");
+// The present yields through presentYield: the JSPI WebAssembly GC build parks the thread on the
+// same frame-yield callback (HostLoop.jspi() is constant-folded), every other build takes the
+// TeaVM async boundary above.
+assert.match(source,
+  /private static void presentYield\(boolean hidden, int interval\) \{\s*if \(HostLoop\.jspi\(\)\) \{[^}]*\}\s*return;\s*\}\s*yieldAfterPresent\(hidden, interval\);\s*\}/,
+  "presentYield does not fall back to the TeaVM async yield outside the JSPI build");
 if (!sdl) {
   assert.match(source, /private static int swapInterval;/,
     "GLFW swap interval is not retained for the asynchronous present boundary");

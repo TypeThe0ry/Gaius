@@ -143,17 +143,39 @@ try {
     "queue head priority must not mutate the StrictQueue");
 
   mkdirSync(join(sources, "org/teavm/jso"), { recursive: true });
+  mkdirSync(join(sources, "org/teavm/interop"), { recursive: true });
   mkdirSync(join(sources, "dev/gaius/browser"), { recursive: true });
   writeFileSync(join(sources, "org/teavm/jso/JSBody.java"), `package org.teavm.jso;
 import java.lang.annotation.*;
 @Retention(RetentionPolicy.CLASS) @Target(ElementType.METHOD)
 public @interface JSBody { String[] params() default {}; String script(); }
 `);
+  // The scheduler starts its pump through the JavaScript HostLoop of the classlib overlay,
+  // which compiles unchanged against these annotation stubs and the fixture Platform.
+  writeFileSync(join(sources, "org/teavm/jso/JSFunctor.java"), `package org.teavm.jso;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.CLASS) @Target(ElementType.TYPE)
+public @interface JSFunctor { }
+`);
+  writeFileSync(join(sources, "org/teavm/jso/JSObject.java"), `package org.teavm.jso;
+public interface JSObject { }
+`);
+  writeFileSync(join(sources, "org/teavm/interop/PlatformMarker.java"), `package org.teavm.interop;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.CLASS) @Target(ElementType.METHOD)
+public @interface PlatformMarker { String[] value() default {}; }
+`);
+  const hostLoopSource = join(repositoryRoot,
+    "port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java");
   const schedulerSource = join(sources, "dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java");
   writeFileSync(schedulerSource, schedulerSourceForJvm());
   const compileCp = [jar, ...dependencyClasspath].join(delimiter);
   run(javac, ["--release", "21", "-proc:none", "-classpath", compileCp, "-d", classes,
     join(sources, "org/teavm/jso/JSBody.java"),
+    join(sources, "org/teavm/jso/JSFunctor.java"),
+    join(sources, "org/teavm/jso/JSObject.java"),
+    join(sources, "org/teavm/interop/PlatformMarker.java"),
+    hostLoopSource,
     join(fixtureDir, "PlatformRunnable.java"),
     join(fixtureDir, "Platform.java"),
     join(fixtureDir, "TModernRuntimeSupport.java"),

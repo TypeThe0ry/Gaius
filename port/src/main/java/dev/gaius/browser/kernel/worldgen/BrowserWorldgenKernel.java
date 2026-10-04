@@ -1,7 +1,10 @@
 package dev.gaius.browser.kernel.worldgen;
 
+import org.teavm.jso.typedarrays.Int8Array;
+import org.teavm.jso.typedarrays.Int32Array;
+import org.teavm.jso.typedarrays.Int16Array;
+import dev.gaius.browser.JsArrays;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
 import org.teavm.jso.JSFunctor;
 import org.teavm.jso.JSObject;
 
@@ -223,7 +226,11 @@ public final class BrowserWorldgenKernel {
     @JSBody(params = {"key", "ir"}, script = "var k = globalThis.GaiusWorldgenKernel;"
             + "if (!k) { return false; }"
             + "return k.registerGenerator(key, new Uint8Array(ir.buffer, ir.byteOffset, ir.length).slice());")
-    private static native boolean registerGeneratorNative(int key, @JSByRef byte[] ir);
+    private static native boolean registerGeneratorNativeJs(int key, Int8Array ir);
+
+    private static boolean registerGeneratorNative(int key, byte[] ir) {
+        return registerGeneratorNativeJs(key, JsArrays.int8(ir));
+    }
 
     @JSBody(params = "key", script = "var k = globalThis.GaiusWorldgenKernel;"
             + "return !!k && k.generatorUsable(key);")
@@ -235,8 +242,11 @@ public final class BrowserWorldgenKernel {
             + "k.submitTerrain(key, chunkX, chunkZ, flags, new Int32Array(beard),"
             + " function (chunk) { onResult(chunk); }, function (message) { onError(String(message)); },"
             + " ring.length > 0 ? new Int32Array(ring) : null);")
-    private static native void submitTerrainNative(int key, int chunkX, int chunkZ, int flags, @JSByRef int[] beard,
-            @JSByRef int[] ring, ChunkCallback onResult, ErrorCallback onError);
+    private static native void submitTerrainNativeJs(int key, int chunkX, int chunkZ, int flags, Int32Array beard, Int32Array ring, ChunkCallback onResult, ErrorCallback onError);
+
+    private static void submitTerrainNative(int key, int chunkX, int chunkZ, int flags, int[] beard, int[] ring, ChunkCallback onResult, ErrorCallback onError) {
+        submitTerrainNativeJs(key, chunkX, chunkZ, flags, JsArrays.int32(beard), JsArrays.int32(ring), onResult, onError);
+    }
 
     @JSBody(params = {"key", "chunkX", "chunkZ", "onResult", "onError"},
             script = "var k = globalThis.GaiusWorldgenKernel;"
@@ -256,8 +266,11 @@ public final class BrowserWorldgenKernel {
             + "k.submitSurfaceStored(key, token, chunkX, chunkZ, new Int32Array(beard),"
             + " function (diff) { onResult(diff); }, function (message) { onError(String(message)); },"
             + " ring.length > 0 ? new Int32Array(ring) : null);")
-    private static native void submitSurfaceNative(int key, int token, int chunkX, int chunkZ, @JSByRef int[] beard,
-            @JSByRef int[] ring, ChunkCallback onResult, ErrorCallback onError);
+    private static native void submitSurfaceNativeJs(int key, int token, int chunkX, int chunkZ, Int32Array beard, Int32Array ring, ChunkCallback onResult, ErrorCallback onError);
+
+    private static void submitSurfaceNative(int key, int token, int chunkX, int chunkZ, int[] beard, int[] ring, ChunkCallback onResult, ErrorCallback onError) {
+        submitSurfaceNativeJs(key, token, chunkX, chunkZ, JsArrays.int32(beard), JsArrays.int32(ring), onResult, onError);
+    }
 
     @JSBody(params = "token", script = "var k = globalThis.GaiusWorldgenKernel;"
             + "if (k && k.dropStored) { k.dropStored(token); }")
@@ -274,19 +287,43 @@ public final class BrowserWorldgenKernel {
     private static native int arrayLength(KernelChunk chunk, String field);
 
     @JSBody(params = {"chunk", "field", "out"}, script = "out.set(chunk[field]);")
-    private static native void copyInts(KernelChunk chunk, String field, @JSByRef int[] out);
+    private static native void copyIntsJs(KernelChunk chunk, String field, Int32Array out);
+
+    private static void copyInts(KernelChunk chunk, String field, int[] out) {
+        Int32Array outView = JsArrays.int32(out);
+        copyIntsJs(chunk, field, outView);
+        JsArrays.readBack(outView, out);
+    }
 
     @JSBody(params = {"chunk", "field", "out"}, script = "out.set(chunk[field]);")
-    private static native void copyShorts(KernelChunk chunk, String field, @JSByRef short[] out);
+    private static native void copyShortsJs(KernelChunk chunk, String field, Int16Array out);
+
+    private static void copyShorts(KernelChunk chunk, String field, short[] out) {
+        Int16Array outView = JsArrays.int16(out);
+        copyShortsJs(chunk, field, outView);
+        JsArrays.readBack(outView, out);
+    }
 
     @JSBody(params = {"chunk", "field", "out"}, script = "out.set(chunk[field]);")
-    private static native void copyBytes(KernelChunk chunk, String field, @JSByRef byte[] out);
+    private static native void copyBytesJs(KernelChunk chunk, String field, Int8Array out);
+
+    private static void copyBytes(KernelChunk chunk, String field, byte[] out) {
+        Int8Array outView = JsArrays.int8(out);
+        copyBytesJs(chunk, field, outView);
+        JsArrays.readBack(outView, out);
+    }
 
     @JSBody(params = "a", script = "return a ? a.length : -1;")
     private static native int typedLength(JSObject a);
 
     @JSBody(params = {"a", "out"}, script = "out.set(a);")
-    private static native void copyTypedInts(JSObject a, @JSByRef int[] out);
+    private static native void copyTypedIntsJs(JSObject a, Int32Array out);
+
+    private static void copyTypedInts(JSObject a, int[] out) {
+        Int32Array outView = JsArrays.int32(out);
+        copyTypedIntsJs(a, outView);
+        JsArrays.readBack(outView, out);
+    }
 
     @JSBody(params = "message", script = "if (typeof console !== 'undefined') { console.warn(message); }")
     private static native void logOnce(String message);

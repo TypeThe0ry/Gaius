@@ -71,6 +71,12 @@ const browserTerrainShadersSource = path.join(
   repositoryRoot,
   "port/overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserTerrainShaders.java",
 );
+// BrowserOpenGL passes Java arrays to its JSBody calls through dev.gaius.browser.JsArrays of the
+// classlib overlay; it compiles with the JavaScript implementation (typed-array views).
+const jsArraysSource = path.join(
+  repositoryRoot,
+  "port/overrides/classlib/src/main/java/dev/gaius/browser/JsArrays.java",
+);
 const lwjglOpenGl = path.join(
   overlayRoot,
   `libraries/org/lwjgl/lwjgl-opengl/${shape.lwjglVersion}/lwjgl-opengl-${shape.lwjglVersion}.jar`,
@@ -330,6 +336,7 @@ try {
     "-d", browserClasses,
     browserOpenGlSource,
     browserTerrainShadersSource,
+    jsArraysSource,
     ...(shape.lwjglVersion === "3.4.3" ? [browserOpenGlIndexedSource] : []),
   ], {stdio: ["ignore", "pipe", "pipe"]});
 

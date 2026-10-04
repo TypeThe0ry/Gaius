@@ -9,6 +9,12 @@ const source = await readFile(
   `${root}/port/src/main/java/dev/gaius/browser/BrowserCooperativeExecutor.java`,
   "utf8",
 );
+// The JavaScript build's HostLoop (classlib overlay); the WebAssembly GC build replaces it from
+// src/target-wasmgc with the same API.
+const hostLoop = await readFile(
+  `${root}/port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java`,
+  "utf8",
+);
 
 assert.match(source, /import org\.teavm\.jso\.JSBody;/,
   "executor must be able to detect the integrated-server Worker");
@@ -19,9 +25,12 @@ assert.match(source,
   "Worker runtime probe is missing");
 assert.match(source, /return new BrowserCooperativeExecutor\(delegate\);/,
   "foreground callers must retain the cooperative executor");
-assert.match(source, /Platform\.startThread\(this::runAfterYield\);/,
+assert.match(source, /HostLoop\.startThread\(this::runAfterYield\);/,
   "cooperative pump must enter a TeaVM native thread before suspendable work");
-assert.doesNotMatch(source, /Platform\.schedule\(this::runAfterYield,\s*0\);/,
+assert.match(hostLoop,
+  /public static void startThread\(Runnable task\) \{\s*Platform\.startThread\(task::run\);\s*\}/,
+  "the JavaScript HostLoop.startThread must delegate to TeaVM's Platform.startThread");
+assert.doesNotMatch(source, /(?:Platform|HostLoop)\.schedule\(this::runAfterYield,\s*0\);/,
   "raw Platform.schedule callbacks cannot suspend resource-pack downloads");
 
 console.log(JSON.stringify({

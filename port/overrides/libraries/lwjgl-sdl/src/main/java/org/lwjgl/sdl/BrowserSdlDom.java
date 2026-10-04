@@ -1,5 +1,6 @@
 package org.lwjgl.sdl;
 
+import dev.gaius.browser.HostLoop;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
 import org.teavm.jso.JSBody;
@@ -1156,6 +1157,22 @@ final class BrowserSdlDom {
             """)
     private static native boolean swapBuffersJs();
 
+    /**
+     * The per-frame yield after a present. In the JSPI WebAssembly GC build (HostLoop.jspi(),
+     * constant-folded) the thread parks until the same frame-yield callback fires, without
+     * TeaVM's coroutines; a present from a JS callback (no thread to suspend) skips the yield,
+     * as the coroutine build does.
+     */
+    private static void presentYield(boolean hidden, int interval) {
+        if (HostLoop.jspi()) {
+            if (HostLoop.canSuspend()) {
+                HostLoop.awaitHost(resume -> scheduleFrameYield(hidden, interval, resume::run));
+            }
+            return;
+        }
+        yieldAfterPresent(hidden, interval);
+    }
+
     @Async
     private static native void yieldAfterPresent(boolean hidden, int interval);
 
@@ -1373,7 +1390,7 @@ final class BrowserSdlDom {
      */
     static void swapWindow(int swapInterval) {
         boolean hidden = swapBuffersJs();
-        yieldAfterPresent(hidden, swapInterval);
+        presentYield(hidden, swapInterval);
     }
 
     @JSFunctor

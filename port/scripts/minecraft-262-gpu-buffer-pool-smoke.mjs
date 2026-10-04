@@ -58,6 +58,12 @@ const helperSource = path.join(
   repositoryRoot,
   "port/src/main/java/dev/gaius/browser/BrowserGpuBufferPoolCache.java",
 );
+// The helper asks dev.gaius.browser.HostLoop (classlib overlay) for the TeaVM target; it
+// compiles with the JavaScript implementation, which needs teavm-platform.
+const hostLoopSource = path.join(
+  repositoryRoot,
+  "port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java",
+);
 
 function run(command, args, options = {}) {
   return execFileSync(command, args, {
@@ -102,7 +108,7 @@ const asmAnalysis = path.join(
   mavenRoot,
   "org/ow2/asm/asm-analysis/9.8/asm-analysis-9.8.jar",
 );
-const teaVmJars = ["teavm-interop", "teavm-jso", "teavm-jso-apis"].map(
+const teaVmJars = ["teavm-interop", "teavm-jso", "teavm-jso-apis", "teavm-platform"].map(
   artifact => path.join(
     mavenRoot,
     `org/teavm/${artifact}/0.15.0/${artifact}-0.15.0.jar`,
@@ -112,6 +118,7 @@ await Promise.all([
   access(rawClient),
   access(patcherSource),
   access(helperSource),
+  access(hostLoopSource),
   access(asm),
   access(asmTree),
   access(asmAnalysis),
@@ -1449,6 +1456,7 @@ try {
     "-classpath", helperClasspath,
     "-d", helperClasses,
     helperSource,
+    hostLoopSource,
   ], {stdio: ["ignore", "pipe", "pipe"]});
 
   const bytecodeVerifierFile = path.join(sourceRoot, "GpuBufferPoolBytecodeVerifier.java");

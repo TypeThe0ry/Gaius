@@ -21,7 +21,7 @@ for (const contract of [
   "message.type === 'runtime-ready'",
   "message.type === 'server-listener-ready'",
   "connectWhenWorkerReady(minecraft, sessionId, launchGeneration, 0)",
-  "Platform.startThread(",
+  "HostLoop.startThread(",
   "profileId: globalThis.__gaiusProfileId || null",
   "worldVersion: globalThis.__gaiusWorldVersion || null",
   "storageSchema: globalThis.__gaiusStorageSchema || null",
@@ -101,7 +101,8 @@ assert.equal(
   "singleplayer storage refresh still opens the legacy IndexedDB name",
 );
 const readyPollEnd = source.indexOf("READY_POLL_MILLIS);");
-const readyPollStart = source.lastIndexOf("Platform.schedule(", readyPollEnd);
+// HostLoop.schedule/startThread are TeaVM's Platform.schedule/startThread in the JavaScript build.
+const readyPollStart = source.lastIndexOf("HostLoop.schedule(", readyPollEnd);
 assert.ok(readyPollStart >= 0 && readyPollEnd > readyPollStart,
   "singleplayer readiness poll could not be located");
 const readyPoll = source
@@ -109,8 +110,8 @@ const readyPoll = source
   .replace(/\s+/g, "");
 assert.equal(
   readyPoll,
-  "Platform.schedule(()->Platform.startThread(()->connectWhenWorkerReady(minecraft,sessionId,launchGeneration,pollCount+1)),READY_POLL_MILLIS);",
-  "singleplayer readiness poll must enter through TeaVM Platform.startThread",
+  "HostLoop.schedule(()->HostLoop.startThread(()->connectWhenWorkerReady(minecraft,sessionId,launchGeneration,pollCount+1)),READY_POLL_MILLIS);",
+  "singleplayer readiness poll must enter through HostLoop.startThread (TeaVM Platform.startThread)",
 );
 assert.equal(source.includes(".getAll()"), false,
   "singleplayer shutdown still performs an IndexedDB full-store read");

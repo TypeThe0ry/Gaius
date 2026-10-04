@@ -1,6 +1,6 @@
 package org.teavm.classlib.java.util.concurrent;
 
-import org.teavm.platform.Platform;
+import dev.gaius.browser.HostLoop;
 
 final class TSimpleScheduledFuture<V> extends TCompletableFuture<V>
         implements TScheduledFuture<V> {
@@ -34,7 +34,7 @@ final class TSimpleScheduledFuture<V> extends TCompletableFuture<V>
             return false;
         }
         if (scheduleId >= 0) {
-            Platform.killSchedule(scheduleId);
+            HostLoop.killSchedule(scheduleId);
             scheduleId = -1;
         }
         return true;

@@ -9,7 +9,8 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.JSByRef;
+import org.teavm.jso.typedarrays.Int32Array;
+import org.teavm.jso.typedarrays.Int8Array;
 import org.teavm.runtime.fs.VirtualFile;
 import org.teavm.runtime.fs.VirtualFileAccessor;
 import org.teavm.runtime.fs.VirtualFileSystem;
@@ -898,7 +899,11 @@ public final class BrowserFilePersistence {
               return false;
             }
             """)
-    private static native boolean setBytes(String path, @JSByRef byte[] bytes);
+    private static native boolean setBytesJs(String path, Int8Array bytes);
+
+    private static boolean setBytes(String path, byte[] bytes) {
+        return setBytesJs(path, JsArrays.int8(bytes));
+    }
 
     @JSBody(params = {"path"}, script = """
             try {
@@ -919,12 +924,18 @@ public final class BrowserFilePersistence {
               return false;
             }
             """)
-    private static native boolean patchBytes(
+    private static native boolean patchBytesJs(
             String path,
             int logicalSize,
-            @JSByRef int[] offsets,
-            @JSByRef int[] lengths,
-            @JSByRef byte[] payload);
+            Int32Array offsets,
+            Int32Array lengths,
+            Int8Array payload);
+
+    private static boolean patchBytes(
+            String path, int logicalSize, int[] offsets, int[] lengths, byte[] payload) {
+        return patchBytesJs(path, logicalSize, JsArrays.int32(offsets), JsArrays.int32(lengths),
+                JsArrays.int8(payload));
+    }
 
     @JSBody(params = {"path", "byteLength"}, script = """
             try {
@@ -998,7 +1009,16 @@ public final class BrowserFilePersistence {
               return -1;
             }
             """)
-    private static native int copyStoredBytes(String path, @JSByRef byte[] output);
+    private static native int copyStoredBytesJs(String path, Int8Array output);
+
+    private static int copyStoredBytes(String path, byte[] output) {
+        Int8Array view = JsArrays.int8(output);
+        int copied = copyStoredBytesJs(path, view);
+        if (copied > 0) {
+            JsArrays.readBack(view, output);
+        }
+        return copied;
+    }
 
     @JSBody(params = {"path"}, script = """
             try {

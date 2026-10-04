@@ -1,5 +1,6 @@
 package dev.gaius.browser.kernel.mesh;
 
+import dev.gaius.browser.HostLoop;
 import com.mojang.blaze3d.vertex.ByteBufferBuilder;
 import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.blaze3d.vertex.VertexSorting;
@@ -31,7 +32,6 @@ import net.minecraft.world.phys.Vec3;
 import org.lwjgl.system.BrowserMemory;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSObject;
-import org.teavm.platform.Platform;
 
 /**
  * Section compiles through the Rust mesher kernel (26.2 copy; 26.3 differs only in the render
@@ -388,7 +388,7 @@ public final class MeshKernelHooks {
             // About 0.6 s of work for every block state: run it in slices separated by one
             // event-loop turn on a thread of its own, so the kernel is ready for the first chunks
             // of a world instead of advancing a few milliseconds per compile request.
-            Platform.startThread(() -> runExport(job, models));
+            HostLoop.startThread(() -> runExport(job, models));
         }
         return null;
     }

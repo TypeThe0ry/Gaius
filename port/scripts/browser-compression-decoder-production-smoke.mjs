@@ -19,7 +19,7 @@ for (const marker of [
   "SOFT_QUEUE_BYTES = 8 * 1024 * 1024",
   "MAX_QUEUE_FRAMES = 64",
   "MAX_QUEUE_BYTES = 32 * 1024 * 1024",
-  "Platform.schedule(() ->",
+  "HostLoop.schedule(() ->",
   "expectedGeneration != generation",
   "inflater made no progress",
   "declared output length reached before zlib end",
