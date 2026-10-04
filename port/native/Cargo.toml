@@ -8,6 +8,8 @@ members = [
     "crates/gaius-mesher-wasm",
     "crates/gaius-noise",
     "crates/gaius-noise-wasm",
+    "crates/gaius-shaderxlat",
+    "crates/gaius-shaderxlat/wasm",
     "crates/gaius-worldgen",
     "crates/gaius-worldgen-wasm",
 ]
@@ -36,3 +38,10 @@ strip = true
 # Tests run the golden fixtures; keep them fast without changing semantics.
 [profile.test]
 opt-level = 2
+
+# gaius-shaderxlat ships naga to the browser: "s" is 12% smaller than 3 there
+# (golden/shaders/README.md). Per-package opt-level overrides do not survive fat LTO,
+# so its wasm build selects this profile (cargo build --profile release-size).
+[profile.release-size]
+inherits = "release"
+opt-level = "s"

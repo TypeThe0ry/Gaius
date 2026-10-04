@@ -63,6 +63,10 @@ pub mod kind {
     pub const TERRAIN: u16 = WORLDGEN_FAMILY | 0x03;
     /// `run_surface`: surface rules over a filled chunk.
     pub const SURFACE: u16 = WORLDGEN_FAMILY | 0x04;
+    /// Shader translation.
+    pub const SHADER_FAMILY: u16 = 0x0500;
+    /// `run_shader_xlat`: one SPIR-V module to WGSL.
+    pub const SHADER_XLAT: u16 = SHADER_FAMILY | 0x01;
 }
 
 /// Run status, stored in [`RunDescriptor`] and [`ResultHeader`].
