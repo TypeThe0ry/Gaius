@@ -148,5 +148,19 @@ export function loadConfig() {
         proxyKeepAlives,
         relayName: parseName("GAIUS_RELAY_NODE_NAME", "Gaius Translator Node"),
         registration: parseRegistration(),
+        serverDrainFrames: parseInteger("GAIUS_SERVER_DRAIN_FRAMES", 32, 1, 128),
+        serverDrainBytes: parseInteger(
+            "GAIUS_SERVER_DRAIN_BYTES", 512 * 1024, 64 * 1024, 4 * 1024 * 1024),
+        serverDrainMillis: parseInteger("GAIUS_SERVER_DRAIN_MILLIS", 2, 1, 16),
+        clientDrainFrames: parseInteger("GAIUS_CLIENT_DRAIN_FRAMES", 32, 1, 128),
+        clientDrainBytes: parseInteger(
+            "GAIUS_CLIENT_DRAIN_BYTES", 512 * 1024, 64 * 1024, 4 * 1024 * 1024),
+        clientDrainMillis: parseInteger("GAIUS_CLIENT_DRAIN_MILLIS", 2, 1, 16),
+        wsBufferedBytes: parseInteger(
+            "GAIUS_WS_BUFFERED_BYTES", 4 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024),
+        wsLowWaterBytes: parseInteger(
+            "GAIUS_WS_LOW_WATER_BYTES", 2 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+        batchBytes: parseInteger(
+            "GAIUS_BATCH_BYTES", 16 * 1024, 4 * 1024, 64 * 1024),
     };
 }

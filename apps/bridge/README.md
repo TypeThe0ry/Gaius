@@ -29,6 +29,31 @@ GAIUS_RELAY_NODE_NAME='Example RelayNode' \
 npm start
 ```
 
+Drain/backpressure tuning (all optional, defaults preserve the tested
+behavior). Lower per-turn slices for fairness under many-player load;
+raise the batch window to coalesce more PLAY packets per WebSocket
+message on chunk bursts:
+
+```sh
+GAIUS_SERVER_DRAIN_FRAMES=32 \
+GAIUS_SERVER_DRAIN_BYTES=524288 \
+GAIUS_SERVER_DRAIN_MILLIS=2 \
+GAIUS_CLIENT_DRAIN_FRAMES=32 \
+GAIUS_CLIENT_DRAIN_BYTES=524288 \
+GAIUS_CLIENT_DRAIN_MILLIS=2 \
+GAIUS_WS_BUFFERED_BYTES=4194304 \
+GAIUS_WS_LOW_WATER_BYTES=2097152 \
+GAIUS_BATCH_BYTES=16384 \
+npm start
+```
+
+TCP reads pause when a tunnel's WebSocket buffer reaches
+`GAIUS_WS_BUFFERED_BYTES` and resume only after it drains to
+`GAIUS_WS_LOW_WATER_BYTES`; the gap between them avoids pause/resume
+flapping during bursts. Per-turn server slices stay clamped to 16
+frames / 256 KiB for event-loop fairness regardless of the configured
+ceiling.
+
 Use a TLS reverse proxy for public nodes so the browser endpoint is
 `wss://relay.example/tunnel`. A node also exposes
 `https://relay.example/relay-node/v1` and `/health`, which report the RelayNode

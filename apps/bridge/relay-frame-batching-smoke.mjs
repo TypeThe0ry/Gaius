@@ -134,7 +134,7 @@ function testSourceBoundaries() {
         "paused parser remainder ownership guard missing");
     assert.match(mainSource, /result === serverFrameForwardResult\.ENQUEUED/,
         "send acceptance result boundary missing");
-    assert.match(mainSource, /serverFrameBuffer\.peekBatch\(\s*16 \* 1024/u,
+    assert.match(mainSource, /serverFrameBuffer\.peekBatch\(\s*batchByteBudget/u,
         "PLAY batch parser is not connected to the real server drain");
     assert.match(mainSource, /sourceKind: "parsed-batch"/u,
         "batched timeline source metadata is missing");

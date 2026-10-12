@@ -60,6 +60,25 @@ const maximumClientFrameDrainFrames = 32;
 const maximumClientFrameDrainBytes = 512 * 1024;
 const maximumClientFrameDrainMillis = 2;
 const maximumClientFrameParserBytes = 16 * 1024 * 1024 + 5;
+// Env-tunable drain/backpressure budgets. The `maximum*` constants above are
+// the fail-closed defaults and stay as the static contract; the effective
+// values below let operators tune a deployed node without a code change.
+// Defaults are identical to the constants, so unit smokes are unaffected.
+const serverDrainFrames = config.serverDrainFrames ?? maximumServerFrameDrainFrames;
+const serverDrainBytes = config.serverDrainBytes ?? maximumServerFrameDrainBytes;
+const serverDrainMillis = config.serverDrainMillis ?? maximumServerFrameDrainMillis;
+const clientDrainFrames = config.clientDrainFrames ?? maximumClientFrameDrainFrames;
+const clientDrainBytes = config.clientDrainBytes ?? maximumClientFrameDrainBytes;
+const clientDrainMillis = config.clientDrainMillis ?? maximumClientFrameDrainMillis;
+const wsHighWaterBytes = config.wsBufferedBytes ?? maximumWebSocketBufferedBytes;
+// Low-water hysteresis: once TCP reads pause at the high-water mark, they
+// resume only after the socket drains to this level. Without it the relay
+// flaps pause/resume on every send while a chunk burst is in flight.
+const wsLowWaterBytes = Math.min(
+    config.wsLowWaterBytes ?? Math.floor(wsHighWaterBytes / 2),
+    wsHighWaterBytes,
+);
+const batchByteBudget = config.batchBytes ?? 16 * 1024;
 // Handshakes are tiny (the host field is capped at 255 bytes), but a generic
 // TCP tunnel can arrive one WebSocket message at a time. Keep only a bounded
 // sniffing buffer and fall back to opaque forwarding once it is exceeded.
@@ -1685,9 +1704,9 @@ webSocketServer.on("connection", (webSocket) => {
             while (packetFramingEnabled && clientFrameBuffer.byteLength > 0 &&
                 !tunnelCancelled) {
                 if (drainFrames > 0 &&
-                    (drainFrames >= maximumClientFrameDrainFrames ||
-                        drainBytes >= maximumClientFrameDrainBytes ||
-                        performance.now() - startedAt >= maximumClientFrameDrainMillis)) {
+                    (drainFrames >= clientDrainFrames ||
+                        drainBytes >= clientDrainBytes ||
+                        performance.now() - startedAt >= clientDrainMillis)) {
                     drainBudgetYielded = true;
                     clientFrameTelemetry.drainBudgetYields++;
                     break;
@@ -1849,7 +1868,7 @@ webSocketServer.on("connection", (webSocket) => {
             return false;
         }
         const bufferedAmount = observeWebSocketBufferedAmount();
-        if (bufferedAmount >= maximumWebSocketBufferedBytes) {
+        if (bufferedAmount > wsLowWaterBytes) {
             return false;
         }
         // Clear only the WebSocket high-water flag. If a parser remainder is
@@ -2009,7 +2028,7 @@ webSocketServer.on("connection", (webSocket) => {
             timelineRecord.bufferedAmountAfter = bufferedAmount;
         }
         let pausedByThisSend = false;
-        if (bufferedAmount >= maximumWebSocketBufferedBytes) {
+        if (bufferedAmount >= wsHighWaterBytes) {
             pauseTcpForWebSocket();
             pausedByThisSend = true;
         }
@@ -2102,12 +2121,14 @@ webSocketServer.on("connection", (webSocket) => {
                     // the deployed node observed ~3 ms drains against the
                     // 2 ms fairness budget.  The effective per-turn slice is
                     // deliberately smaller; the setImmediate continuation
-                    // still drains the remainder in order.
+                    // still drains the remainder in order. Operators may tune
+                    // the slice down further via GAIUS_SERVER_DRAIN_*; raising
+                    // it above the safety caps has no effect.
                     const effectiveDrainFrameBudget = Math.min(
-                        maximumServerFrameDrainFrames, 16,
+                        serverDrainFrames, 16,
                     );
                     const effectiveDrainByteBudget = Math.min(
-                        maximumServerFrameDrainBytes, 256 * 1024,
+                        serverDrainBytes, 256 * 1024,
                     );
                     let drainFrames = 0;
                     let drainBytes = 0;
@@ -2127,7 +2148,7 @@ webSocketServer.on("connection", (webSocket) => {
                                 (drainFrames >= effectiveDrainFrameBudget ||
                                     drainBytes >= effectiveDrainByteBudget ||
                                     performance.now() - drainStartedAt >=
-                                        maximumServerFrameDrainMillis)) {
+                                        serverDrainMillis)) {
                                 drainBudgetYielded = true;
                                 serverFrameTelemetry.drainBudgetYields++;
                                 break;
@@ -2192,7 +2213,7 @@ webSocketServer.on("connection", (webSocket) => {
                             // the one WebSocket send accepts the complete batch.
                             if (protocolPhase === "play" && minecraftProfile !== undefined) {
                                 const batch = serverFrameBuffer.peekBatch(
-                                    16 * 1024,
+                                    batchByteBudget,
                                     effectiveDrainFrameBudget - drainFrames);
                                 if (batch.length > 1) {
                                     let safe = true;
@@ -3167,12 +3188,12 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
                 return;
             }
             if (endpoint.backpressurePaused &&
-                peer.webSocket.bufferedAmount < maximumWebSocketBufferedBytes) {
+                peer.webSocket.bufferedAmount < wsLowWaterBytes) {
                 endpoint.backpressurePaused = false;
                 updateLocalReadState(endpoint);
             }
         });
-        if (peer.webSocket.bufferedAmount >= maximumWebSocketBufferedBytes) {
+        if (peer.webSocket.bufferedAmount >= wsHighWaterBytes) {
             endpoint.backpressurePaused = true;
             updateLocalReadState(endpoint);
         }
