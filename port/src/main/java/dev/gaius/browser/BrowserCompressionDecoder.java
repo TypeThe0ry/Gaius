@@ -37,6 +37,13 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
     private boolean validateDecompressed;
     private int retainedBytes;
     private long generation = 1L;
+    /**
+     * Reusable inflate state. Chunk bursts decode thousands of small packets per second and
+     * allocating + destroying a native inflate context per packet churns the browser heap.
+     * The pooled instance is only ever touched synchronously on the decode path below, so no
+     * ordering or reentrancy hazard exists; reset() returns it to a clean state after each use.
+     */
+    private Inflater pooledInflater;
 
     public BrowserCompressionDecoder(int threshold, boolean validateDecompressed) {
         super(threshold, validateDecompressed);
@@ -92,7 +99,13 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
         byte[] payload = new byte[payloadLength];
         input.readBytes(payload);
         byte[] decoded = new byte[declaredLength];
-        Inflater inflater = new Inflater();
+        Inflater inflater = pooledInflater;
+        if (inflater == null) {
+            inflater = new Inflater();
+            pooledInflater = inflater;
+        } else {
+            inflater.reset();
+        }
         try {
             inflater.setInput(payload);
             int produced = 0;
@@ -116,7 +129,13 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
             fail(context, "malformed zlib payload: " + exception.getMessage());
             return;
         } finally {
-            inflater.end();
+            // Success keeps the pooled context alive (reset on next use). Failure already
+            // went through fail() -> cleanupFrames(), which ended and detached it; the
+            // guard below only covers a future fail-less path and never double-ends.
+            if (failed && pooledInflater == inflater) {
+                inflater.end();
+                pooledInflater = null;
+            }
         }
         output.add(Unpooled.wrappedBuffer(decoded));
         return;
@@ -296,6 +315,10 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
     }
 
     private void cleanupFrames() {
+        if (pooledInflater != null) {
+            pooledInflater.end();
+            pooledInflater = null;
+        }
         if (active != null && active.inflater != null) {
             active.inflater.end();
         }
