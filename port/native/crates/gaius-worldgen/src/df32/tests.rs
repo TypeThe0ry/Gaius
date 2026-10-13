@@ -4,12 +4,16 @@
 
 use super::*;
 use crate::ir::example::overworld;
-use gaius_noise::Profile;
+use gaius_noise::Semantics;
 
 fn program() -> (Program32, crate::ir::Ir, PositionalRandomFactory) {
-    let ir = overworld(Profile::V26_3, 42);
+    let semantics = *Semantics::all()
+        .iter()
+        .find(|s| s.uses_sampler32())
+        .expect("sampler semantics");
+    let ir = overworld(semantics, 42);
     let factory = crate::noises::positional_factory(ir.settings.seed, false);
-    let noises = crate::noises::instantiate(ir.profile, ir.settings.seed, &factory, &ir.noises).unwrap();
+    let noises = crate::noises::instantiate(ir.semantics, ir.settings.seed, &factory, &ir.noises).unwrap();
     (Program32::new(noises, ir.nodes.len()), ir, factory)
 }
 

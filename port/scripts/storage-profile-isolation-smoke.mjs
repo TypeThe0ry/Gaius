@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE, RENDERPEARL_PROFILE, profileIdPattern} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {dirname, resolve} from "node:path";
@@ -18,7 +19,7 @@ const integratedServerPath = resolve(
   repositoryRoot,
   "port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java",
 );
-const profileIds = ["1.21.11", "26.2", "26.3"];
+const profileIds = [LEGACY_PROFILE.id, CANONICAL_PROFILE.id, RENDERPEARL_PROFILE.id];
 const profilePaths = profileIds.map(id => resolve(
   repositoryRoot,
   "port/versions/" + id + ".json",
@@ -35,9 +36,9 @@ assert.match(persistence, /private static String storagePrefix\(\)/);
 assert.match(persistence, /runtimeWorldVersion\(\)/);
 assert.match(persistence, /runtimeStoragePrefix\(\)/);
 assert.match(persistence, /runtimeStorageConfigurationSignature\(\)/);
-assert.match(persistence, /gaius-fs-v2-1\.21\.11/);
-assert.match(persistence, /gaius-fs-v2-26\.2/);
-assert.match(persistence, /gaius-fs-v2-26\.3/);
+assert.match(persistence, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(LEGACY_PROFILE)}`));
+assert.match(persistence, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(CANONICAL_PROFILE)}`));
+assert.match(persistence, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(RENDERPEARL_PROFILE)}`));
 assert.match(persistence, /LEGACY_DATA_VERSION = 4671/);
 assert.match(
   persistence,
@@ -64,9 +65,9 @@ assert.match(worker, /storage configuration does not match profile/);
 assert.match(worker, /worldVersion: 4671/);
 assert.match(worker, /worldVersion: 4903/);
 assert.match(worker, /worldVersion: 5023/);
-assert.match(worker, /gaius-fs-v2-1\.21\.11/);
-assert.match(worker, /gaius-fs-v2-26\.2/);
-assert.match(worker, /gaius-fs-v2-26\.3/);
+assert.match(worker, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(LEGACY_PROFILE)}`));
+assert.match(worker, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(CANONICAL_PROFILE)}`));
+assert.match(worker, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(RENDERPEARL_PROFILE)}`));
 assert.match(worker, /indexedDB\.open\(databaseName, schema\)/);
 assert.match(worker, /__gaiusStorageDatabaseName/);
 assert.match(worker, /__gaiusStorageOpfsDirectory/);
@@ -77,9 +78,9 @@ assert.doesNotMatch(worker, /(?:migrat|import)[\s\S]{0,160}(?:gaius-fs-v1|gaius\
 
 assert.match(integratedServer, /__gaiusStorageDatabaseName/);
 assert.match(integratedServer, /storageMatchesProfile/);
-assert.match(integratedServer, /gaius-fs-v2-1\.21\.11/);
-assert.match(integratedServer, /gaius-fs-v2-26\.2/);
-assert.match(integratedServer, /gaius-fs-v2-26\.3/);
+assert.match(integratedServer, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(LEGACY_PROFILE)}`));
+assert.match(integratedServer, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(CANONICAL_PROFILE)}`));
+assert.match(integratedServer, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(RENDERPEARL_PROFILE)}`));
 assert.match(integratedServer, /indexedDB\.open\(storageDatabaseName, storageSchema\)/);
 assert.doesNotMatch(integratedServer, /indexedDB\.open\(\s*["']gaius-fs-v1/);
 assert.doesNotMatch(integratedServer, /deleteDatabase\s*\(/);
@@ -91,14 +92,14 @@ const clientPath = resolve(
 const client = await readFile(clientPath, "utf8");
 assert.match(client, /storageConfigurationValid\(\)/);
 assert.match(client, /storageMatchesProfile/);
-assert.match(client, /gaius-fs-v2-1\.21\.11/);
-assert.match(client, /gaius-fs-v2-26\.2/);
-assert.match(client, /gaius-fs-v2-26\.3/);
+assert.match(client, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(LEGACY_PROFILE)}`));
+assert.match(client, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(CANONICAL_PROFILE)}`));
+assert.match(client, new RegExp(String.raw`gaius-fs-v2-${profileIdPattern(RENDERPEARL_PROFILE)}`));
 
 const expectedWorldVersions = new Map([
-  ["1.21.11", 4671],
-  ["26.2", 4903],
-  ["26.3", 5023],
+  [LEGACY_PROFILE.id, 4671],
+  [CANONICAL_PROFILE.id, 4903],
+  [RENDERPEARL_PROFILE.id, 5023],
 ]);
 
 const profiles = profileSources.map((source, index) => {

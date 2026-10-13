@@ -6,10 +6,6 @@ libraries/
 versions/
 !port/versions/
 !port/versions/*.json
-!port/overrides/client/src/versions/
-!port/overrides/client/src/versions/**
-!port/src/versions/
-!port/src/versions/**
 port/work/
 
 # Rebuildable Maven data and diagnostic output. The checked-in browser release

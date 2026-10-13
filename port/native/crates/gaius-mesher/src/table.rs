@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! header
-//!   @0  u32 magic "GMTB"          @4  u16 version (1)   @6 u16 profile (0 1.21.11, 1 26.2, 2 26.3)
+//!   @0  u32 magic "GMTB"          @4  u16 version (1)   @6 u16 semantics (kernelSemantics.code)
 //!   @8  u32 epoch                 resource-reload epoch; jobs name the epoch they were built for
 //!   @12 u32 state_count           global block state ids are 0..state_count
 //!   @16 u32 group_count   @20 u32 entry_count   @24 u32 part_count   @28 u32 quad_ref_count
@@ -300,7 +300,8 @@ pub const MASK_ALL: Mask = [u64::MAX; 4];
 /// The parsed table. Masks are indexed by face id (0 empty, 1 full, then the stored masks).
 #[derive(Clone, Debug, Default)]
 pub struct ModelTable {
-    pub profile: u16,
+    /// The writing profile's kernelSemantics.code (`port/versions/<id>.json`); informational.
+    pub semantics: u16,
     pub epoch: u32,
     pub states: Vec<StateInfo>,
     pub groups: Vec<Group>,
@@ -367,7 +368,7 @@ impl ModelTable {
         if r.u16().map_err(t)? != TABLE_VERSION {
             return Err(KernelError::new(Status::BadVersion, "unsupported model table version"));
         }
-        let profile = r.u16().map_err(t)?;
+        let semantics = r.u16().map_err(t)?;
         let epoch = r.u32().map_err(t)?;
         // Twelve counts and the reserved word end the 64-byte header.
         let mut counts = [0u32; 13];
@@ -544,7 +545,7 @@ impl ModelTable {
         let air_ids = section(&mut r, air_count, 4, |r| r.u32())?;
 
         let table = ModelTable {
-            profile,
+            semantics,
             epoch,
             states,
             groups,
@@ -675,7 +676,7 @@ impl TableWriter {
         let mut o = Vec::new();
         o.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
         o.extend_from_slice(&TABLE_VERSION.to_le_bytes());
-        o.extend_from_slice(&t.profile.to_le_bytes());
+        o.extend_from_slice(&t.semantics.to_le_bytes());
         o.extend_from_slice(&t.epoch.to_le_bytes());
         let stored_masks = t.masks.len().saturating_sub(2);
         for c in [

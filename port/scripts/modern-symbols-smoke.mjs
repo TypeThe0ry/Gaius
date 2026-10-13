@@ -8,6 +8,7 @@
 //
 // Inputs: port/work/26.2 and port/work/26.3 (client-named.jar plus classpath.txt/libraries for
 // the authlib jar), ASM 9.8 in ~/.m2, a JDK >= 21 (GAIUS_JAVA_HOME or JAVA_HOME).
+import {CANONICAL_PROFILE, LEGACY_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync, spawnSync} from "node:child_process";
 import {access, mkdir, mkdtemp, readdir, rm, writeFile} from "node:fs/promises";
@@ -29,8 +30,8 @@ const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
 const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
 const asmTree = join(asmRoot, "asm-tree/9.8/asm-tree-9.8.jar");
 const jars = {
-  "26.2": join(repositoryRoot, "port/work/26.2/client-named.jar"),
-  "26.3": join(repositoryRoot, "port/work/26.3/client-named.jar"),
+  [CANONICAL_PROFILE.id]: join(repositoryRoot, "port/work/" + CANONICAL_PROFILE.id + "/client-named.jar"),
+  [RENDERPEARL_PROFILE.id]: join(repositoryRoot, "port/work/" + RENDERPEARL_PROFILE.id + "/client-named.jar"),
 };
 
 function jdkTool(name) {
@@ -78,42 +79,42 @@ public final class ModernSymbolsSmokeDriver {
         Path work = Path.of(args[2]);
 
         String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
-        check(s262.renderType(buffer).equals(buffer), "26.2 GpuBuffer renamed");
+        check(s262.renderType(buffer).equals(buffer), "${CANONICAL_PROFILE.id} GpuBuffer renamed");
         check(s263.renderType(buffer).equals("com/mojang/renderpearl/api/buffers/GpuBuffer"),
-                "26.3 GpuBuffer");
-        check(s262.invokeOpcode(buffer) == Opcodes.INVOKEVIRTUAL, "26.2 GpuBuffer opcode");
-        check(s263.invokeOpcode(buffer) == Opcodes.INVOKEINTERFACE, "26.3 GpuBuffer opcode");
-        check(!s262.isInterface("com/mojang/blaze3d/systems/GpuDevice"), "26.2 GpuDevice kind");
-        check(s263.isInterface("com/mojang/blaze3d/systems/GpuDevice"), "26.3 GpuDevice kind");
+                "${RENDERPEARL_PROFILE.id} GpuBuffer");
+        check(s262.invokeOpcode(buffer) == Opcodes.INVOKEVIRTUAL, "${CANONICAL_PROFILE.id} GpuBuffer opcode");
+        check(s263.invokeOpcode(buffer) == Opcodes.INVOKEINTERFACE, "${RENDERPEARL_PROFILE.id} GpuBuffer opcode");
+        check(!s262.isInterface("com/mojang/blaze3d/systems/GpuDevice"), "${CANONICAL_PROFILE.id} GpuDevice kind");
+        check(s263.isInterface("com/mojang/blaze3d/systems/GpuDevice"), "${RENDERPEARL_PROFILE.id} GpuDevice kind");
         // Nested classes follow their outer class.
         check(s263.renderType("com/mojang/blaze3d/opengl/GlBuffer$Direct$1")
                 .equals("com/mojang/renderpearl/backend/opengl/GlBuffer$Direct$1"), "nested rename");
         check(s262.renderType("com/mojang/blaze3d/opengl/GlBuffer$Direct$1")
-                .equals("com/mojang/blaze3d/opengl/GlBuffer$Direct$1"), "nested 26.2");
+                .equals("com/mojang/blaze3d/opengl/GlBuffer$Direct$1"), "nested ${CANONICAL_PROFILE.id}");
         check(!s263.renderTypePresent("com/mojang/blaze3d/opengl/GlDevice$ShaderCompilationKey"),
-                "26.3 has no GlDevice$ShaderCompilationKey");
+                "${RENDERPEARL_PROFILE.id} has no GlDevice$ShaderCompilationKey");
         // Descriptors: moved classes are renamed, blaze3d classes kept in place are not.
         String desc = "(Lcom/mojang/blaze3d/systems/CommandEncoder;Lcom/mojang/blaze3d/buffers/GpuBuffer;"
                 + "Lcom/mojang/blaze3d/systems/RenderSystem;[Lcom/mojang/blaze3d/vertex/VertexFormatElement;"
                 + "Ljava/util/List<Lcom/mojang/blaze3d/buffers/GpuBuffer;>;J)V";
-        check(s262.renderDesc(desc).equals(desc), "26.2 descriptor must be unchanged");
+        check(s262.renderDesc(desc).equals(desc), "${CANONICAL_PROFILE.id} descriptor must be unchanged");
         String mapped = s263.renderDesc(desc);
         check(mapped.equals("(Lcom/mojang/renderpearl/api/commands/CommandEncoder;"
                 + "Lcom/mojang/renderpearl/api/buffers/GpuBuffer;Lcom/mojang/blaze3d/systems/RenderSystem;"
                 + "[Lcom/mojang/renderpearl/api/vertex/VertexFormatElement;"
                 + "Ljava/util/List<Lcom/mojang/renderpearl/api/buffers/GpuBuffer;>;J)V"), mapped);
         // Removed classes.
-        check(s263.renderTypeRemoved("com/mojang/blaze3d/platform/GLX"), "GLX removed on 26.3");
-        check(!s262.renderTypeRemoved("com/mojang/blaze3d/platform/GLX"), "GLX kept on 26.2");
+        check(s263.renderTypeRemoved("com/mojang/blaze3d/platform/GLX"), "GLX removed on ${RENDERPEARL_PROFILE.id}");
+        check(!s262.renderTypeRemoved("com/mojang/blaze3d/platform/GLX"), "GLX kept on ${CANONICAL_PROFILE.id}");
         expectThrows(IllegalStateException.class, "removed",
                 () -> s263.renderType("com/mojang/blaze3d/platform/GLX"));
         expectThrows(IllegalStateException.class, "removed",
                 () -> s263.renderDesc("Lcom/mojang/blaze3d/preprocessor/GlslPreprocessor;"));
-        expectThrows(IllegalArgumentException.class, "Not a moved 26.2 render class",
+        expectThrows(IllegalArgumentException.class, "Not a moved ${CANONICAL_PROFILE.id} render class",
                 () -> s263.renderType("com/mojang/blaze3d/systems/RenderSystem"));
         // authlib.
         String session = "com/mojang/authlib/yggdrasil/YggdrasilMinecraftSessionService";
-        check(s262.authlibType(session).equals(session), "26.2 authlib");
+        check(s262.authlibType(session).equals(session), "${CANONICAL_PROFILE.id} authlib");
         check(s263.authlibType(session + "$1").equals(
                 "com/mojang/authlib/services/MinecraftServicesSessionService$1"), "nested authlib");
         check(s263.authlibType("com/mojang/authlib/GameProfile").equals("com/mojang/authlib/GameProfile"),
@@ -133,7 +134,7 @@ public final class ModernSymbolsSmokeDriver {
         check(ModernSymbols.cached(args[1]) == ModernSymbols.cached(args[1]), "cached() memoizes");
         System.out.println("API_OK");
 
-        // A 26.3 jar with a 26.2 render class and a GLFW input class is a mixed state.
+        // A ${RENDERPEARL_PROFILE.id} jar with a ${CANONICAL_PROFILE.id} render class and a GLFW input class is a mixed state.
         Path mixed = work.resolve("mixed.jar");
         try (ZipFile source = new ZipFile(args[1]); ZipFile old = new ZipFile(args[0]);
                 ZipOutputStream out = new ZipOutputStream(java.nio.file.Files.newOutputStream(mixed))) {
@@ -201,12 +202,12 @@ public final class ModernSymbolsSmokeDriver {
         }
         System.out.println("CLASS_INTERFACE_MIX_REJECTED");
 
-        // A 26.3 client with an authlib 9 jar is a mixed state as well.
+        // A ${RENDERPEARL_PROFILE.id} client with an authlib 9 jar is a mixed state as well.
         String authlib9 = s262.authlibJar;
-        check(authlib9 != null, "26.2 authlib jar not located");
+        check(authlib9 != null, "${CANONICAL_PROFILE.id} authlib jar not located");
         try {
             ModernSymbols.probe(args[1], authlib9);
-            throw new AssertionError("26.3 client with authlib 9 was accepted");
+            throw new AssertionError("${RENDERPEARL_PROFILE.id} client with authlib 9 was accepted");
         } catch (IllegalStateException expected) {
             check(expected.getMessage().contains("references authlib SERVICES but"), expected.getMessage());
         }
@@ -226,8 +227,6 @@ try {
   const sources = [
     ...(await readdir(toolsPackage)).filter((name) => name.endsWith(".java"))
       .map((name) => join(toolsPackage, name)),
-    ...(await readdir(join(toolsPackage, "m263"))).filter((name) => name.endsWith(".java"))
-      .map((name) => join(toolsPackage, "m263", name)),
   ];
   const driverSource = join(work, "ModernSymbolsSmokeDriver.java");
   await writeFile(driverSource, DRIVER);
@@ -249,8 +248,8 @@ try {
     assert.equal(result.status, 0, `${profile} probe failed:\n${result.stderr}`);
     probes[profile] = JSON.parse(result.stdout);
   }
-  const p262 = probes["26.2"];
-  const p263 = probes["26.3"];
+  const p262 = probes[CANONICAL_PROFILE.id];
+  const p263 = probes[RENDERPEARL_PROFILE.id];
 
   // Render API and the rename table.
   assert.equal(p262.renderApi, "BLAZE3D");
@@ -258,12 +257,12 @@ try {
   assert.equal(p262.uncheckedAutoCloseable, false);
   assert.equal(p263.uncheckedAutoCloseable, true);
   const keys = Object.keys(p262.renderTypes);
-  assert.equal(keys.length, 119, "rename table must cover the 119 top-level classes 26.3 moved or removed");
+  assert.equal(keys.length, 119, "rename table must cover the 119 top-level classes " + RENDERPEARL_PROFILE.id + " moved or removed");
   assert.deepEqual(Object.keys(p263.renderTypes), keys);
   for (const key of keys) {
     const entry = p262.renderTypes[key];
-    assert.equal(entry.name, key, `26.2 probe must return ${key} unchanged`);
-    assert.ok(!entry.removed && !entry.absent, `26.2 jar must contain ${key}`);
+    assert.equal(entry.name, key, `${CANONICAL_PROFILE.id} probe must return ${key} unchanged`);
+    assert.ok(!entry.removed && !entry.absent, `${CANONICAL_PROFILE.id} jar must contain ${key}`);
   }
   const removed263 = keys.filter((key) => p263.renderTypes[key].removed);
   assert.deepEqual(removed263.sort(), [
@@ -282,7 +281,7 @@ try {
   for (const key of keys) {
     const entry = p263.renderTypes[key];
     if (entry.removed) continue;
-    assert.ok(!entry.absent, `26.3 jar lacks ${entry.name} for ${key}`);
+    assert.ok(!entry.absent, `${RENDERPEARL_PROFILE.id} jar lacks ${entry.name} for ${key}`);
     assert.ok(entry.name.startsWith("com/mojang/renderpearl/"), `${key} -> ${entry.name}`);
   }
   for (const [key, expected] of Object.entries({
@@ -348,11 +347,11 @@ try {
     ["KEY_A", 65, 4], ["KEY_R", 82, 21], ["KEY_LCONTROL", 341, 224], ["KEY_ESCAPE", 256, 41],
     ["KEY_SPACE", 32, 44],
   ]) {
-    assert.equal(p262.inputKeys[name], glfw, `26.2 InputConstants.${name}`);
-    assert.equal(p263.inputKeys[name], sdl, `26.3 InputConstants.${name}`);
+    assert.equal(p262.inputKeys[name], glfw, `${CANONICAL_PROFILE.id} InputConstants.${name}`);
+    assert.equal(p263.inputKeys[name], sdl, `${RENDERPEARL_PROFILE.id} InputConstants.${name}`);
   }
-  assert.ok(Object.keys(p262.inputKeys).length > 100, "26.2 KEY_* constants were not read");
-  assert.ok(Object.keys(p263.inputKeys).length > 100, "26.3 KEY_* constants were not read");
+  assert.ok(Object.keys(p262.inputKeys).length > 100, "" + CANONICAL_PROFILE.id + " KEY_* constants were not read");
+  assert.ok(Object.keys(p263.inputKeys).length > 100, "" + RENDERPEARL_PROFILE.id + " KEY_* constants were not read");
   assert.equal(p262.inputConstants.MOUSE_BUTTON_LEFT, 0);
   assert.equal(p263.inputConstants.MOUSE_BUTTON_LEFT, 1);
 
@@ -363,7 +362,7 @@ try {
     {POSITION: 0, COLOR: 1, UV0: 2, UV1: 3, UV2: 4, UV3: 5, NORMAL: 6, LINE_WIDTH: 7});
 
   // Java API behaviour and mixed-state rejection.
-  const driver = runJava(["ModernSymbolsSmokeDriver", jars["26.2"], jars["26.3"], work]);
+  const driver = runJava(["ModernSymbolsSmokeDriver", jars[CANONICAL_PROFILE.id], jars[RENDERPEARL_PROFILE.id], work]);
   assert.equal(driver.status, 0, `API driver failed:\n${driver.stdout}\n${driver.stderr}`);
   assert.match(driver.stdout, /^API_OK$/m);
   assert.match(driver.stdout, /^MIXED_REJECTED$/m);
@@ -373,10 +372,10 @@ try {
   // Older blaze3d generations probe as they are: 1.21.11 already declared CommandEncoder,
   // GpuDevice and RenderPass as interfaces, so the class-to-interface assertion applies only to
   // renderpearl jars.  Optional: needs port/work/1.21.11.
-  const jar1211 = join(repositoryRoot, "port/work/1.21.11/client-named.jar");
+  const jar1211 = join(repositoryRoot, "port/work/" + LEGACY_PROFILE.id + "/client-named.jar");
   if (existsSync(jar1211)) {
     const result = runJava(["dev.gaius.tools.ModernSymbols", jar1211]);
-    assert.equal(result.status, 0, `1.21.11 probe failed:\n${result.stderr}`);
+    assert.equal(result.status, 0, `${LEGACY_PROFILE.id} probe failed:\n${result.stderr}`);
     const p1211 = JSON.parse(result.stdout);
     assert.equal(p1211.renderApi, "BLAZE3D");
     assert.deepEqual(Object.keys(p1211.renderTypes).filter((key) => p1211.renderTypes[key].interface)
@@ -391,9 +390,9 @@ try {
       "com/mojang/blaze3d/systems/RenderPass",
     ]);
   } else {
-    console.log("modern-symbols-smoke: port/work/1.21.11 is absent; 1.21.11 probe skipped");
+    console.log("modern-symbols-smoke: port/work/" + LEGACY_PROFILE.id + " is absent; " + LEGACY_PROFILE.id + " probe skipped");
   }
-  console.log("modern-symbols-smoke: OK (26.2 blaze3d/yggdrasil/GLFW, 26.3 "
+  console.log("modern-symbols-smoke: OK (" + CANONICAL_PROFILE.id + " blaze3d/yggdrasil/GLFW, " + RENDERPEARL_PROFILE.id + " "
     + "renderpearl/services/SDL, 119 render keys, 8 class->interface, mixed jars rejected)");
 } finally {
   await rm(work, {recursive: true, force: true});

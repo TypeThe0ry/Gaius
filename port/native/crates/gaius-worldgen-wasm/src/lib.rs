@@ -16,13 +16,22 @@
 //! baseline without it; the page picks one by feature detection.
 
 pub mod job;
+pub mod ore_job;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native-host"))]
 mod exports {
     use super::job;
     use gaius_kernel_abi::{job_bytes, run_kernel};
 
     gaius_kernel_abi::export_runtime!();
+
+    /// # Safety
+    /// The buffer must be an allocation returned by this runtime.
+    #[no_mangle]
+    pub unsafe extern "C" fn run_ore(ptr: *const u8, len: u32) -> *mut u8 {
+        let bytes = unsafe { job_bytes(ptr, len) };
+        run_kernel(bytes, gaius_kernel_abi::kind::ORE, super::ore_job::run)
+    }
 
     /// # Safety
     /// `ptr` and `len` must describe a job buffer obtained from `alloc`.

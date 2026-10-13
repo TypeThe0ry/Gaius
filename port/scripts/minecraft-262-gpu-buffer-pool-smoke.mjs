@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {createHash} from "node:crypto";
@@ -7,6 +8,7 @@ import {access, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises"
 import {homedir, tmpdir} from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const nativePath = (value) => {
@@ -22,9 +24,9 @@ const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
 const version = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
-    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
-if (version !== "26.2") {
-  throw new Error(`GPU buffer-pool smoke is 26.2-only; got profile ${version}`);
+    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : CANONICAL_PROFILE.id));
+if (version !== CANONICAL_PROFILE.id) {
+  throw new Error(`GPU buffer-pool smoke is ${CANONICAL_PROFILE.id}-only; got profile ${version}`);
 }
 
 const clientCandidates = [
@@ -58,11 +60,11 @@ const helperSource = path.join(
   repositoryRoot,
   "port/src/main/java/dev/gaius/browser/BrowserGpuBufferPoolCache.java",
 );
-// The helper asks dev.gaius.browser.HostLoop (classlib overlay) for the TeaVM target; it
-// compiles with the JavaScript implementation, which needs teavm-platform.
-const hostLoopSource = path.join(
+// The helper packs its telemetry with dev.gaius.browser.JsArrays (classlib overlay); it
+// compiles with the JavaScript implementation.
+const jsArraysSource = path.join(
   repositoryRoot,
-  "port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java",
+  "port/overrides/classlib/src/main/java/dev/gaius/browser/JsArrays.java",
 );
 
 function run(command, args, options = {}) {
@@ -97,7 +99,7 @@ function selectJavaTools() {
       // Try the next configured JDK.
     }
   }
-  throw new Error("Minecraft 26.2 GPU buffer-pool smoke requires JDK 25 or newer");
+  throw new Error("Minecraft " + CANONICAL_PROFILE.id + " GPU buffer-pool smoke requires JDK 25 or newer");
 }
 
 const javaTools = selectJavaTools();
@@ -118,34 +120,35 @@ await Promise.all([
   access(rawClient),
   access(patcherSource),
   access(helperSource),
-  access(hostLoopSource),
+  access(jsArraysSource),
   access(asm),
   access(asmTree),
   access(asmAnalysis),
   ...teaVmJars.map(jar => access(jar)),
 ]);
 
-const [patcherText, helperText] = await Promise.all([
-  readFile(patcherSource, "utf8"),
-  readFile(helperSource, "utf8"),
-]);
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+// The pool patch and its helpers up to patchGlDevice, whatever their access modifier.
+const patcherText = stepSource("MinecraftClientPatcher");
+const helperText = await readFile(helperSource, "utf8");
 const featureStart = patcherText.indexOf(
-  "private static void patchStagedVertexBufferGpuPoolCache(",
+  "static void patchStagedVertexBufferGpuPoolCache(",
 );
 const featureEnd = patcherText.indexOf(
-  "private static void patchGlDevice(",
+  "static void patchGlDevice(",
   featureStart,
 );
 assert.ok(featureStart >= 0 && featureEnd > featureStart,
   "missing isolated GPU buffer-pool patcher method");
 const featureText = patcherText.slice(featureStart, featureEnd);
 
-// The call in main() runs under the modern-profile guard (26.2 and 26.3,
-// never 1.21.11), wrapped in PatchRegistry.run so 26.3 bring-up can skip it.
+// The call in main() runs under the modern-profile guard (the profiles whose
+// patchSet is modern, never 1.21.11), wrapped in PatchRegistry.run so a bring-up
+// can skip it.
 assert.match(patcherText,
-  /static boolean isModernProfile\(String minecraftVersion\) \{\s*return "26\.2"\.equals\(minecraftVersion\) \|\| "26\.3"\.equals\(minecraftVersion\);\s*\}/,
-  "isModernProfile must name exactly the modern profiles 26.2 and 26.3");
-const guardedPoolCall = patcherText.indexOf("() -> patchStagedVertexBufferGpuPoolCache(");
+  /static boolean isModernProfile\(String minecraftVersion\) \{\s*return VersionProfile\.forId\(minecraftVersion\)\.modernPatchSet\(\);\s*\}/,
+  "isModernProfile must read the profile's patchSet");
+const guardedPoolCall = patcherText.search(/\(\) -> (?:RenderPatches\.)?patchStagedVertexBufferGpuPoolCache\(/);
 const profileGuardStart = patcherText.lastIndexOf(
   "if (isModernProfile(minecraftVersion)) {",
   guardedPoolCall,
@@ -283,22 +286,37 @@ try {
     "private static native void publishTelemetryBrowser(",
   );
   const publishTelemetry = new Function(...telemetryBody.parameters, telemetryBody.script);
+  // One packed Float64Array plus the two strings: index P_X of the helper holds field x.
+  assert.deepEqual(telemetryBody.parameters, ["v", "label", "reason"],
+    "pool telemetry must be one packed array plus label and reason");
+  const packedIndex = Object.fromEntries([...helperText.matchAll(
+    /private static final int P_([A-Z_]+) = (\d+);/g)].map(match => [match[1], Number(match[2])]));
+  const packedCount = packedIndex.COUNT;
+  assert.ok(packedCount > 0 && packedCount <= 64, "missing packed telemetry layout");
   const publish = (poolId, ownerClosed, reason = ownerClosed ? "owner-close" : "periodic") => {
-    const values = {
-      poolId,
-      label: `pool-${poolId}`,
-      usage: poolId & 7,
-      ownerClosed,
-      reason,
-      maxPools: 24,
-    };
-    publishTelemetry(...telemetryBody.parameters.map(parameter => values[parameter] ?? 0));
+    const packed = new Float64Array(packedCount);
+    packed[packedIndex.POOL_ID] = poolId;
+    packed[packedIndex.USAGE] = poolId & 7;
+    packed[packedIndex.OWNER_CLOSED] = ownerClosed ? 1 : 0;
+    packed[packedIndex.MAX_POOLS] = 24;
+    packed[packedIndex.ACQUIRED_BYTES] = poolId * 4096;
+    publishTelemetry(packed, `pool-${poolId}`, reason);
   };
   globalThis.__gaiusGLStats = {};
   for (let poolId = 1; poolId <= 24; poolId++) publish(poolId, false);
   let telemetryRoot = globalThis.__gaiusGLStats.gpuBufferPoolCache;
   assert.equal(telemetryRoot.pools.length, 24,
     "bounded telemetry did not admit all 24 live pools");
+  const firstSlot = telemetryRoot.pools[0];
+  assert.equal(firstSlot.poolId, 1);
+  assert.equal(firstSlot.label, "pool-1");
+  assert.equal(firstSlot.usage, 1);
+  assert.equal(firstSlot.acquiredBytes, 4096, "packed telemetry index mismatch");
+  assert.equal(firstSlot.lastPublishReason, "periodic");
+  for (const key of ["frame", "availableCount", "availableBytes", "pendingDepth", "createCalls",
+    "storageCompactionFailures"]) {
+    assert.equal(firstSlot[key], 0, `packed telemetry field ${key} missing`);
+  }
   publish(25, false);
   assert.equal(telemetryRoot.pools.length, 24);
   assert.equal(telemetryRoot.overflowPublishes, 1,
@@ -1433,11 +1451,11 @@ try {
     "dev.gaius.tools.MinecraftClientPatcher",
     rawClient,
     patchedClasses,
-    "26.2",
+    CANONICAL_PROFILE.id,
   ], {stdio: ["ignore", "pipe", "pipe"]});
   assert.match(patchOutput,
-    /Instrumented 26\.2 StagedVertexBuffer GPU pool cache: count=4 bytes=1048576 idle=3/,
-    "exact 26.2 jar did not run the GPU buffer-pool patch");
+    /Instrumented blaze3d StagedVertexBuffer GPU pool cache: count=4 bytes=1048576 idle=3/,
+    "exact " + CANONICAL_PROFILE.id + " jar did not run the GPU buffer-pool patch");
 
   const patchedPoolClass = path.join(
     patchedClasses,
@@ -1456,7 +1474,7 @@ try {
     "-classpath", helperClasspath,
     "-d", helperClasses,
     helperSource,
-    hostLoopSource,
+    jsArraysSource,
   ], {stdio: ["ignore", "pipe", "pipe"]});
 
   const bytecodeVerifierFile = path.join(sourceRoot, "GpuBufferPoolBytecodeVerifier.java");

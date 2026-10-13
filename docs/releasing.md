@@ -59,7 +59,7 @@ for profile in 1.21.11 26.2 26.3; do
   ./port/scripts/fetch-version.sh
   ./port/scripts/remap-client.sh
   bash port/scripts/build-version-release.sh "$profile"
-  python3 port/scripts/quick-check.py
+  python3 port/scripts/legacy/quick-check.py
   GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS=500 \
     node port/scripts/singleplayer-worker-runtime-smoke.mjs
 done
@@ -96,6 +96,166 @@ every checkout. Record their actual results in the release notes or release
 checklist. Release bundles are compiled and verified on the maintainer's
 machine. GitHub Actions does not compile TeaVM release artifacts.
 
+### WebAssembly GC release (v0.4)
+
+From v0.4 every profile ships a WebAssembly GC client and singleplayer server
+(`port/scripts/build-wasmgc.sh --release`, TeaVM `ADVANCED`) next to the
+JavaScript build, which stays as the fallback for browsers without WebAssembly
+GC, `try_table` or JSPI. A release role compiles the module with its name
+section and then:
+
+1. runs binaryen's `wasm-opt` on it (`port/scripts/wasm-opt-release.sh`):
+   `-Os -g`, open world (the closed-world GC passes miscompiled a JSO callback),
+   and only the features of the JSPI browser baseline (GC, reference types,
+   exception handling, bulk memory, non-trapping float-to-int, sign extension,
+   mutable globals, multi-value, SIMD; never `-all`). The output is pinned to
+   binaryen 133: set `GAIUS_WASM_OPT` to its `wasm-opt`. Without it, or with
+   another binaryen release, the build warns and ships TeaVM's module;
+   `GAIUS_WASM_OPT_STRICT=1` (set by the release matrix below) makes that an
+   error. The report is `<role build root>/wasm-opt.json`;
+2. moves the name section into `<role build root>/symbols/<module>.symbols.wasm`
+   (`port/tools/wasm/wasm-symbols.mjs`), so the symbol file names the functions
+   of the optimized module; `port/tools/wasm/wasm-symbolize.mjs --symbols`
+   turns stack traces of the shipped module back into Java frames. TeaVM's line
+   tables describe the module before `wasm-opt` and are kept in
+   `symbols/pre-opt/` with that module's sha256 (a `GAIUS_WASM_OPT=off` release
+   build writes that module again);
+3. writes the build identity `<module>.build.json` next to the module: role
+   `wasm-client` (`classes.wasm`) or `wasm-singleplayer-worker`
+   (`singleplayer-server.wasm`), with the common source, protocol and overlay
+   identity of the JavaScript sidecars plus a `wasm` record (TeaVM settings,
+   the `wasm-opt` report, the symbol file, and the inputs only the WebAssembly
+   GC build reads, among them the profile's patch manifests). Verify one with
+   `gaius_build_identity.py verify --role wasm-client --artifact <dist>/classes.wasm`.
+
+Release reproducibility requires byte-identical modules, symbol files, line
+tables, optimization reports (excluding timing), and identity sidecars from one
+source tree. `check-wasmgc-reproducible.sh build` performs two isolated builds;
+it is a full TeaVM operation and must use the machine build slot. Preparation
+work that forbids TeaVM must leave this gate open.
+
+### Release build matrix (M7 v0.4.0 preparation)
+
+The v0.4.0 matrix contains **six WebAssembly GC compilations and three frozen JavaScript fallback rebuilds**: one WasmGC client, one WasmGC singleplayer server, and one JS bundle (client plus server) for each of 26.3, 26.2 and 1.21.11. `port/versions/<profile>.json` owns membership through `pages: {"enabled": true, "runtimes": ["wasm", "js"]}`. The packaging tools do not contain Minecraft version lists. Profiles run newest first according to `official.releaseTime`; within each profile the order is:
+
+1. Verify and reuse the frozen JS sidecars, or rebuild that fallback only when a listed trigger applies.
+2. Compile the WasmGC client with `build-wasmgc.sh --release` and `GAIUS_TEAVM_MAX_HEAP=8g`.
+3. Compile the WasmGC singleplayer server with the same command and `GAIUS_TEAVM_MAX_HEAP=14g`, using the same resources and overlays.
+4. Re-encode TeaVM's data segment offsets with `port/tools/wasm/wasm-data-fix.mjs` (TeaVM 0.15 writes them as unsigned LEB128; `build-wasmgc.sh` does this right after TeaVM). Run `wasm-opt` with `--skip-pass=memory-packing`, then require `WebAssembly.validate` and `wasm-data-check` for both modules. A failed parity or validation gate declines to the vanilla Java path.
+5. Verify both wasm identity sidecars, package the gzip-only dual-runtime site, then run the whole-release size gate after all profiles finish.
+
+`build-release-matrix.sh --plan --frozen-js <previous root> <release root>`
+reports the JS decisions without compiling. A full release uses:
+
+```sh
+export MAVEN_ARGS=--offline
+export MAVEN_OPTS="-Xms512m -Xmx3g"
+export CARGO_NET_OFFLINE=true
+export GAIUS_WASM_OPT=<cached binaryen 133 wasm-opt>
+export GAIUS_RELEASE_BUILD_WRAPPER="bash D:/gaius-next/v040/m1/slot.sh build pages-release --"
+bash port/scripts/build-release-matrix.sh --frozen-js <previous root> <release root>
+```
+
+This command is for a later build window, **not** an authorization to build
+during offline M6b/M7 preparation. Every full TeaVM invocation must acquire
+`slot.sh build <tag> -- <command>`; never invoke the compiler directly or run
+another full build in parallel. The 3 GB JVM limit still applies. Maven's
+cached launcher must support `MAVEN_ARGS`; all vanilla jars, mappings, tools,
+dependencies and native kernels must already be cached. `--offline` controls
+Maven dependency resolution, not downloads by other build helpers: missing
+inputs block the release rather than authorize a download. Use Cargo with
+`--offline --locked`. A 3 GB out-of-memory failure is an open build gate, not a
+reason to raise the heap on the shared machine.
+
+Outputs live under `<release root>/<profile>/{js,wasm}/{build,overlays,dist}`.
+The complete publication set includes `Gaius-site-<profile>.tar.gz`,
+`Gaius-pages-matrix.json`, `Gaius-<profile>.html`, and
+`Gaius-<profile>.manifest.json`; `release-matrix.json` and `pages-size.json`
+record identities and size decisions. `build-and-publish-prerelease.ps1` stages
+the matrix manifest before calculating `SHA256SUMS`. Symbols, compiler logs,
+and build roots stay outside the Pages archive. Site archives are
+deterministic: sorted regular-file entries, fixed mode/owner/time, gzip time
+zero. Checksums use `<64 lowercase hex>  <asset name>` with two spaces and LF.
+
+The JS fallback stays frozen. `<previous root>/<profile>/js/FROZEN.json`
+records its commit, artifact identities, and optional read-only `buildRoot`
+and `dist`. Rebuild it only when a rule in `release-js-triggers.json` fires:
+
+- **Storage schema:** profile `storage` metadata or browser persistence changes.
+- **Save format:** profile `worldVersion` or save persistence changes.
+- **Relay protocol:** client relay transport or framing changes.
+- **Worker protocol:** the singleplayer Worker bootstrap or the page/Worker messages change. One bootstrap serves both server runtimes of a site, so the frozen JS server must speak the current protocol.
+- **Security fixes:** explicitly pass `--js-trigger security`; this is not auto-detected.
+
+The trigger list for this release is deliberately limited to storage schema, save format, relay protocol, the singleplayer Worker protocol and security fixes. Launcher, Service Worker, renderer and other page-only changes do not rewrite the frozen JS bundles.
+
+A missing or invalid frozen baseline also requires a new verified JS build.
+`--plan` reports changed paths and reasons, including dirty source files;
+`--sites-only` packages the existing verified builds without compiling. Launcher,
+SW and site-only layout edits must not rewrite the frozen compiled JS files.
+
+When assembling a Wasm-primary portable page from that recorded fallback, pass
+`--frozen-js` to `build-portable-html.py`. This flag is limited to the embedded
+JS fallback components; the Wasm build, shader toolchain, and ordinary JS-primary
+portable builds retain strict current-input identity checks.
+
+**Stronghold positions (fixed in source for both runtimes, owner decision).** The
+earlier JS-only patch `patchChunkGeneratorStructureStateBrowserFastRings` returned
+the start chunk of each concentric-ring position instead of running vanilla's biome
+search (`BiomeSource.findBiomeHorizontal` over 112 blocks, a random pick among the
+matching biomes). Vanilla moves almost every position, so the singleplayer worlds of
+the JS runtime placed their strongholds where vanilla does not for the same seed, and
+their ender eyes and `/locate` pointed there: 699 (1.21.11), 702 (26.2) and 702
+(26.3) of 768 positions moved (6 seeds each), by up to 7 chunks. Multiplayer was
+unaffected (the remote server generates). The patch is removed; both targets now
+apply `patchChunkGeneratorStructureStateBrowserLazyRings` (helper `BrowserRingPositions`
+in the shared sources), which keeps vanilla's loop, random draws and search and only
+runs each search when a caller needs it (`contains` near a start chunk, or iteration
+by the first ender eye or `/locate`, which runs all 128). `node
+port/scripts/structure-rings-parity.mjs --target js` and `--target wasmgc` check the
+positions and the per-chunk `contains()` answers against vanilla (768/768 positions and
+9558/9558 answers on 3 profiles x 6 seeds, JVM only; no browser run).
+
+The frozen JS dists were built before the fix and keep the old behaviour until the JS
+bundles are rebuilt; the v0.4.0 release rebuild of the JS fallback carries the fix. No
+rule of `release-js-triggers.json` fires for it, so a JS rebuild outside that release
+needs its own decision. A world whose strongholds a frozen build generated keeps those
+chunks after the rebuild (ender eyes then look at vanilla's positions); worlds created
+after the rebuild match vanilla.
+
+#### Minecraft support window
+
+The latest **two Minecraft versions** receive active wasm maintenance. When a
+new version ships, the older wasm profile leaving that window freezes at its
+last accepted artifacts; keep its metadata, frozen JS fallback, site and release
+downloads. Do not silently rebuild that older wasm profile with the new source
+tree. For v0.4.0 preparation, 26.3 and 26.2 are active and 1.21.11 is frozen
+after its initial accepted pair. `wasmSupport` in the Pages matrix records this
+status from release timestamps; it is not evidence of acceptance.
+
+For later releases, build the active profiles explicitly with `--profiles` and
+reuse accepted older wasm distributions when assembling the full Pages matrix.
+Partial build output is not a publication set: carry forward the accepted
+frozen site archives, JS/download manifests and their recorded identities before
+staging the complete release. The Pages assembler refuses missing matrix sites.
+Frozen artifacts remain read-only. A necessary security or shared-protocol fix
+must be an explicit exception with its own identity and acceptance evidence;
+it must not expand the normal support window.
+
+#### Required release gates
+
+- Verify kernel semantics and golden parity for every profile; unsupported jobs
+ must decline to vanilla Java. Fixture success is not a compiled-client pass.
+- Verify JS/wasm sidecars, profile identity, reproducibility and asset SHA-256.
+- Run the boot decision-table, site/SW/cache, and release-assembly fixtures.
+- Pass the 900,000,000-byte gate for the complete published tree, including
+ retained files, redirects and matrix metadata. Never drop valid retained
+ files merely to turn a failing gate green.
+- Complete real browser checks for each client/server pair, renderer fallback,
+ world saves, relay interoperability and unchanged immutable cache responses.
+ Browser checks require `slot.sh chrome <tag> -- <command>` in a later permitted
+ window. Node mocks do not close M6b/M7 browser or production acceptance.
+
 For a lightweight source-only hygiene check, run:
 
 ```sh
@@ -110,7 +270,12 @@ A local pre-release of all three profiles is uploaded by
 re-verifies every identity sidecar of each dist, including `shader-toolchain`
 for a dist whose page loads the toolchain, before it stages `Gaius-<profile>.html`,
 `Gaius-<profile>.manifest.json` and the site archive `Gaius-site-<profile>.tar.gz`
-(all listed in `SHA256SUMS`).
+(all listed in `SHA256SUMS`). For a v0.4 release pass `-ReleaseRoot <release root>`
+of the release matrix: nothing is built then, the size gate in `pages-size.json`
+must have passed, the JavaScript fallback is checked where `release-matrix.json`
+names it (`gaius_build_identity.py frozen` for a frozen one), the
+`wasm-client` and `wasm-singleplayer-worker` sidecars are verified, and the site
+archives come from the release root.
 
 For a browser release, serve each `port/web/dist/<profile>/` directory locally
 as the corresponding `/dist/<profile>/` launch in a real Chrome session. Enter
@@ -147,6 +312,9 @@ them in, `port/web/dist/**` is covered by the repository's Git LFS attributes:
 | `port/web/dist/<profile>/<artifact>.build.json` | Build identity sidecars: six roles for every profile (`client`, `singleplayer-worker`, `wasm-hotpath`, `worker-bootstrap`, `vanilla-assets`, `relay-registry`) plus `shader-toolchain` on `gaius-shader-toolchain.json` for `26.3` |
 | `port/web/dist/<profile>/gaius-boot.js`, `gaius-sw.js`, `kernels/`, `runtime/quality/` | The page runtime the launcher's boot tag loads in a plain dist: kernel runtime, job codecs, kernel worker, wasm kernels with `kernels/kernels.json`, quality layer; `Gaius.html` inlines all of it |
 | `port/target/<profile>/Gaius-site-<profile>.tar.gz` | The profile's multi-file GitHub Pages site: content-hashed assets, `index.html`, `gaius-site.json` and the Service Worker (deterministic archive of `port/target/<profile>/pages-site/`) |
+| `<release root>/<profile>/wasm/dist/{classes,singleplayer-server}.wasm` and `<module>.build.json` | v0.4: the WebAssembly GC client and server of the release matrix and their build identity (roles `wasm-client`, `wasm-singleplayer-worker`); the site ships them as `.gz` only |
+| `<release root>/<profile>/wasm/build/{,server-worker/}symbols/` | Symbol files, `wasm-opt` input sha256 and TeaVM line tables of the shipped modules: kept with the release records, never published |
+| `<release root>/Gaius-site-<profile>.tar.gz`, `release-matrix.json`, `pages-size.json` | v0.4: the profile's site with the WebAssembly GC runtime, what the matrix decided and built, and the size gate |
 | `apps/server-plugin/target/gaius-server-plugin-<version>.jar` | Optional Paper bridge plugin |
 
 For the version in `VERSION`, stage every profile's assets outside Git's tracked source
@@ -189,122 +357,136 @@ artifacts.
 
 ### Deploy GitHub Pages
 
-GitHub Pages serves the Minecraft 1.21.11, 26.2 and 26.3 clients of one
-release. `.github/workflows/pages.yml` downloads them from the repository's
-Latest release unless the `release_tag` input names another tag, so mark the
-new release Latest first and then dispatch the workflow:
+Publication is a separate later operation. Offline preparation does not create
+or modify a tag, release, deployment, or remote asset. The dispatch-only
+`.github/workflows/pages.yml` resolves Latest or an explicit `release_tag`.
+It checks out only packaging scripts and profile metadata, without LFS or
+persisted Git credentials; repository files are never the published tree.
+Only the verified `pages-publish` directory goes to the Pages upload action.
+
+A v0.4.0 release supplies `Gaius-pages-matrix.json` in its `SHA256SUMS`.
+The manifest carries the enabled profiles and exact asset paths derived from
+`port/versions/*.json`; adding a profile requires metadata rather than script
+or workflow version lists. Every matrix profile requires its site archive,
+wasm client/server and frozen JS client/server. A partial matrix fails instead
+of reverting to a legacy single-file package.
+
+Archives unpack to `<profile>/`. Root `Gaius-<profile>.html` links redirect to
+that directory while preserving query and fragment. The root has no index;
+`gaius-pages.json` records the deployed tag, layout and profile list. Older
+releases without a matrix manifest retain legacy site or portable HTML
+assembly using the enabled profile metadata. A legacy portable layout installs
+an unregister-only SW at `<profile>/gaius-sw.js`, without deleting other
+profiles' browser caches.
+
+Before unpacking, `gaius_pages_release.py` verifies the manifest and every site
+archive against exactly one LF text-mode checksum record. Missing records,
+CRLF/binary-mode records, duplicate records and wrong hashes fail. Archives
+accept only unique regular relative files: no links, absolute paths or path
+traversal. The run summary records per-profile JS/wasm/shared bytes, retained
+bytes and verified asset hashes.
+
+The prior deployed tag is read from `gaius-pages.json`. Its archives must pass
+their own independent `SHA256SUMS`; only hashed assets absent from the new
+tree are retained. The retention rule excludes `index.html`, `gaius-sw.js`,
+`gaius-site.json`, client `classes.*`, `vanilla-assets.pack.*` and
+`vanilla-sounds.*`. Old lazy servers, kernels and toolchain assets remain
+available for already-open tabs. This preserves one previous site generation,
+not unlimited historical archives. An unavailable or invalid previous release
+produces a warning and no retention; valid retention is included in the hard
+size gate and cannot be discarded to avoid failure.
+
+The offline assembler can exercise the same workflow logic on local release
+assets without deploying:
 
 ```sh
-gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)"
-# Pin a specific tag (for example a pre-release) instead of Latest:
-gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)" -f release_tag=v0.4.0
+python port/scripts/build-pages-site.py --publish-release <asset directory> <empty output> \
+ --tag <release tag> --previous-release <previous asset directory> --json <report path>
 ```
 
-The workflow picks the layout from the release assets:
+`--previous-release` is optional. The assembler checks the complete tree before
+writing any output. Exactly 900,000,000 bytes is allowed; anything larger fails.
+Redirects, root metadata, every profile and retained file count. The limit
+cannot be raised by `--limit-bytes` or `GAIUS_PAGES_LIMIT_BYTES`.
 
-- **Site layout** (releases from v0.4.0 on, with all three
-  `Gaius-site-1.21.11.tar.gz`, `Gaius-site-26.2.tar.gz` and
-  `Gaius-site-26.3.tar.gz`): each archive is extracted to `<profile>/`, so the
-  clients run at `https://typethe0ry.github.io/Gaius/1.21.11/`,
-  `https://typethe0ry.github.io/Gaius/26.2/` and
-  `https://typethe0ry.github.io/Gaius/26.3/`. The site's Service Worker adds the
-  cross-origin isolation headers and caches the content-hashed assets, the
-  singleplayer server loads only when a world opens, and sounds stream in after
-  the client starts. `Gaius-<profile>.html` at the site root becomes a redirect
-  to `<profile>/` that keeps the query and fragment, so existing links keep
-  working. The extracted site must stay below 1 GB, the GitHub Pages limit; a
-  larger one fails the run. The content-hashed files of the site release
-  deployed before (named by the live `gaius-pages.json`) stay published next
-  to the new ones, so a tab opened before the deploy still finds its lazily
-  loaded singleplayer server and kernels: that release's archives must verify
-  against its own `SHA256SUMS`, only hashed names are merged (not
-  `index.html`, `gaius-sw.js`, `gaius-site.json` or the big client and asset
-  packs), and the merge is skipped with a warning when it cannot be verified
-  or would cross 1 GB.
-- **Single-file layout** (older releases without the site archives): the
-  three files `Gaius-1.21.11.html`, `Gaius-26.2.html` and `Gaius-26.3.html`
-  at the site root, plus `<profile>/gaius-sw.js`, a Service Worker that
-  deletes the `gaius-*` caches and unregisters itself (browsers that ran an
-  earlier site deploy fetch it on their next update check), and
-  `<profile>/index.html`, a redirect to `../Gaius-<profile>.html`.
+#### Runtime selection and immutable module URLs
 
-Either way the site root has no page and must return 404 (it only carries
-`gaius-pages.json`, the deployed tag and layout), and the portable single
-files remain release downloads.
+Each dual-runtime site's descriptor sets `runtimePolicy: "auto"`. The launcher
+applies the same decision table to every profile:
 
-The workflow runs only on dispatch and does not check out the repository at
-all (so it fetches no Git LFS objects): nothing from the repository is
-published, and pushes to `main` (including `docs/**` and `relay-nodes.json`)
-never redeploy Pages.
+| WasmGC + `try_table` + JSPI | WebGPU adapter and required shader assets | Runtime |
+| --- | --- | --- |
+| Available | Available | wasm + WebGPU |
+| Available | Missing, rejected or initialization fails | wasm + WebGL2 |
+| Any wasm prerequisite missing | Either | frozen JS + WebGL2 |
 
-Before uploading, the workflow downloads that release's `SHA256SUMS` into
-`$RUNNER_TEMP`, outside the published artifact, and checks every deployed
-asset with `sha256sum --check --strict` against its one record: the three site
-archives (each verified before it is listed or extracted; only plain relative
-files unpack) or the three single-file clients. A release without
-`SHA256SUMS`, without any one of those records, or with a mismatching hash
-fails the run before anything is deployed. The run summary records the tag,
-the layout and all three deployed sha256 values only after every check passes.
-`SHA256SUMS` must use LF line endings and text-mode records
-(`<64 lowercase hex>  Gaius-site-26.3.tar.gz`, two spaces, no `*` binary
-marker); a CRLF or binary-mode record does not match and fails the run.
+A gzip-only site without SW control additionally needs `DecompressionStream`;
+without it the launcher stays on JS. Safari-/Firefox-like capability sets that
+lack JSPI take that same fallback. Automatic server selection follows the
+chosen client; a late wasm-client failure retires WebGPU and the wasm-server
+choice before loading frozen JS. Explicit `runtime`, `gpu` and `serverRuntime`
+query overrides remain available for diagnostics. Ordinary JS-only portable
+artifacts keep their existing default behavior.
 
-Check the live site with `node tools/verify-github-pages-cdp.mjs`. It detects
-the layout per profile from `Gaius-<profile>.html` and records it in the
-report (`layout`).
+Only `classes.wasm.<hash>.gz` and `singleplayer-server.wasm.<hash>.gz` are
+physical runtime modules in a release site. `gaius-site.json` maps them to
+virtual `<name>.<hash>.wasm` URLs. The SW fetches gzip, decompresses it, stores
+an `application/wasm` response, and serves that URL to `compileStreaming`.
+The page/Worker inflation path handles first visits without SW control.
+`gaius-site-inflate-v1` is required; gzip-only packaging refuses an incompatible
+boot script. The release assembler rejects raw client/server wasm files.
 
-For the site layout, set `GAIUS_PAGES_EXPECTED_SITE_SHA256_12111`,
-`GAIUS_PAGES_EXPECTED_SITE_SHA256_262` and `GAIUS_PAGES_EXPECTED_SITE_SHA256_263`
-to the release's `Gaius-site-<profile>.tar.gz` sha256 values and
-`GAIUS_PAGES_SITE_ARCHIVES` to a directory holding those downloaded archives.
-The verifier then checks each archive against its value and requires every
-archived file to be served byte for byte; without the variables it still
-checks that `<profile>/index.html` carries the site descriptor, that
-`gaius-sw.js` and every asset listed in `gaius-site.json` answer 200, and that
-Chrome lands on `<profile>/`. Each site's id from `gaius-site.json` is recorded
-under `site["<profile>"].id`.
+Keep content-hashed URLs stable and return cached immutable responses unchanged.
+Do not wrap an immutable cached wasm response just to add isolation headers;
+isolation headers belong on documents and Workers. This preserves the browser's
+code-cache path alongside CacheStorage. Actual compilation-cache persistence
+is browser-dependent and remains a browser acceptance gate, not a Node result.
+The release omits redundant JS `.gz` copies; frozen JS runtime bytes are reused
+unchanged. WebGPU launcher assets come from the wasm distribution, not a
+rewritten frozen JS distribution. If an existing wasm distribution has WebGPU
+glue but predates `quality-post.js`, packaging supplies that measured page-only
+script from `port/web/runtime/webgpu/`; it never restages the compiled JS or
+writes into either input distribution. This closes the missing-script selection
+gap while leaving browser renderer acceptance open.
 
-For the single-file layout, set `GAIUS_PAGES_EXPECTED_SHA256_12111`,
-`GAIUS_PAGES_EXPECTED_SHA256_262` and `GAIUS_PAGES_EXPECTED_SHA256_263` to the
-release's `Gaius-1.21.11.html`, `Gaius-26.2.html` and `Gaius-26.3.html` sha256
-values (`GAIUS_PAGES_EXPECTED_SHA256` is still accepted as the 26.2 value). A
-single-file value set for a profile that serves a site, or a site value for a
-profile that serves a single file, fails the check.
+#### Offline layout and size projection
 
-Because a fresh deploy can take minutes to reach every CDN edge (Pages
-responses carry `max-age=600`), a stale page is re-fetched from the same
-canonical URL players load, under bounded backoff for up to
-`GAIUS_PAGES_SHA256_RETRY_MS` (default 600000, 10 minutes; `0` disables
-retries), until the edge serves the release bytes (or, for a site, the
-redirect and the archived `index.html`). Every attempt's status, byte count and
-sha256 (or fetch error) is recorded under `live["<file>"].attempts`. Extract
-all three records and refuse to run without them, since an empty value would
-silently skip that profile's binding:
+The planner uses the newest complete artifacts by module modification time
+within explicitly named project output roots. It does not scan drive roots or
+follow `port/work` junctions. This preparation uses:
 
 ```sh
-assets="$PWD/release-assets"   # the downloaded SHA256SUMS and Gaius-site-*.tar.gz
-GAIUS_PAGES_EXPECTED_SITE_SHA256_12111="$(awk '$2 == "Gaius-site-1.21.11.tar.gz" { print $1 }' "$assets/SHA256SUMS")" &&
-  GAIUS_PAGES_EXPECTED_SITE_SHA256_262="$(awk '$2 == "Gaius-site-26.2.tar.gz" { print $1 }' "$assets/SHA256SUMS")" &&
-  GAIUS_PAGES_EXPECTED_SITE_SHA256_263="$(awk '$2 == "Gaius-site-26.3.tar.gz" { print $1 }' "$assets/SHA256SUMS")" &&
-  GAIUS_PAGES_EXPECTED_SITE_SHA256_12111="${GAIUS_PAGES_EXPECTED_SITE_SHA256_12111:?no Gaius-site-1.21.11.tar.gz record in SHA256SUMS}" \
-  GAIUS_PAGES_EXPECTED_SITE_SHA256_262="${GAIUS_PAGES_EXPECTED_SITE_SHA256_262:?no Gaius-site-26.2.tar.gz record in SHA256SUMS}" \
-  GAIUS_PAGES_EXPECTED_SITE_SHA256_263="${GAIUS_PAGES_EXPECTED_SITE_SHA256_263:?no Gaius-site-26.3.tar.gz record in SHA256SUMS}" \
-  GAIUS_PAGES_SITE_ARCHIVES="$assets" \
-  node tools/verify-github-pages-cdp.mjs
+python port/scripts/build-pages-site.py \
+ --matrix D:/gaius-next/v040/evidence/pages/layout --dry-run --project-missing \
+ --artifact-root D:/gaius-next/v040/m1/out3 \
+ --artifact-root D:/gaius-next/v040/m1/out2 \
+ --json D:/gaius-next/v040/evidence/pages/pages-projection.json
 ```
 
-For a single-file release, bind the three `Gaius-<profile>.html` records the
-same way:
+`--dry-run` hashes and sizes the exact layout without copying artifacts or
+writing archives. Only an explicitly requested JSON report is written.
+Without `--project-missing`, an incomplete profile fails. Projection is legal
+only in dry-run mode: missing runtime components use the newest measured donor,
+with the missing component, donor path and projected status recorded per
+profile. This is a size estimate, never profile-parity or release evidence.
+When a previous site is supplied with `--previous-site`, its kept bytes are
+measured conservatively; otherwise the planner explicitly reserves one
+projected generation of retained files. A passing projection never sets
+`releaseReady` true.
+
+Run the local fixtures before handing off M6b/M7 preparation:
 
 ```sh
-GAIUS_PAGES_EXPECTED_SHA256_12111="$(awk '$2 == "Gaius-1.21.11.html" { print $1 }' SHA256SUMS)" &&
-  GAIUS_PAGES_EXPECTED_SHA256_262="$(awk '$2 == "Gaius-26.2.html" { print $1 }' SHA256SUMS)" &&
-  GAIUS_PAGES_EXPECTED_SHA256_263="$(awk '$2 == "Gaius-26.3.html" { print $1 }' SHA256SUMS)" &&
-  GAIUS_PAGES_EXPECTED_SHA256_12111="${GAIUS_PAGES_EXPECTED_SHA256_12111:?no Gaius-1.21.11.html record in SHA256SUMS}" \
-  GAIUS_PAGES_EXPECTED_SHA256_262="${GAIUS_PAGES_EXPECTED_SHA256_262:?no Gaius-26.2.html record in SHA256SUMS}" \
-  GAIUS_PAGES_EXPECTED_SHA256_263="${GAIUS_PAGES_EXPECTED_SHA256_263:?no Gaius-26.3.html record in SHA256SUMS}" \
-  node tools/verify-github-pages-cdp.mjs
+python port/scripts/test-build-pages-site.py
+python port/scripts/test-pages-release-matrix.py
+node port/scripts/gaius-boot-smoke.mjs
+node port/scripts/gaius-boot-gpu-smoke.mjs
+node port/scripts/service-worker-headers-smoke.mjs
 ```
+
+Place temporary files and reports under the designated output directory.
+These checks do not compile TeaVM, launch Chrome, verify the live site, or
+close the remaining browser, build-identity and publication gates.
 
 ## Keep Git Pushable
 

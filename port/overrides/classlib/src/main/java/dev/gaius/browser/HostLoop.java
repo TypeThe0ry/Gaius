@@ -13,7 +13,7 @@ import org.teavm.platform.Platform;
  * {@code org.teavm.platform.Platform}, which the WebAssembly GC backend does not support. This
  * is the JavaScript implementation: every method delegates to {@code Platform} unchanged.
  * {@code port/overrides/classlib/src/target-wasmgc/java} holds the WebAssembly GC
- * implementation with the same API (TeaVM's event queue and fibers).
+ * implementation with the same API (TeaVM's event queue and JSPI activations).
  */
 public final class HostLoop {
     private HostLoop() {
@@ -92,6 +92,15 @@ public final class HostLoop {
         throw new UnsupportedOperationException("HostLoop.yieldToEventLoop needs the JSPI build");
     }
 
+    /** Managed-block compatibility hooks; platform-specific WasmGC implementation yields. */
+    public static long managedBlockYield(boolean predicate, long lastYieldNanos) {
+        return lastYieldNanos;
+    }
+
+    public static long managedBlockIdle(long lastYieldNanos) {
+        return System.nanoTime();
+    }
+
     /**
      * Runs {@code task} from a host macrotask as soon as the browser is ready; like
      * {@link #schedule} the task has no cooperative thread. Platform.postpone uses
@@ -159,4 +168,25 @@ public final class HostLoop {
             }
             """)
     private static native void postMacrotask(MacrotaskCallback callback);
+
+    // Declared after every method of the JavaScript build, so that TeaVM's per-class names of
+    // the existing lambdas and JSBody functions, and with them the JavaScript output, stay as
+    // they were.
+
+    /**
+     * WebAssembly GC only: records a present for the frame boundary of
+     * {@link #awaitAnimationFrame}. This build yields after each present instead
+     * (BrowserGlfw/BrowserSdlDom yieldAfterPresent), so nothing calls it here.
+     */
+    public static void framePresented(boolean hidden, int interval) {
+    }
+
+    /**
+     * WebAssembly GC only (design D4): the frame boundary that the patched Minecraft.run calls
+     * at the head of its loop (MinecraftClientPatcher.patchMinecraftRunFrameBoundary, a
+     * wasm-only patch). This build yields after each present instead.
+     */
+    public static void awaitAnimationFrame() {
+        throw new UnsupportedOperationException("HostLoop.awaitAnimationFrame needs the WebAssembly GC build");
+    }
 }

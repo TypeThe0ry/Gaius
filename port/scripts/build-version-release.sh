@@ -115,8 +115,23 @@ elif ! bash "$root/port/native/build-wasm-variants.sh" --out "$kernel_directory"
   echo "WARNING: no wasm kernels for Minecraft $version; the release keeps the vanilla paths" >&2
   rm -rf "$kernel_directory"
 fi
+# The SPIR-V -> WGSL translator of ?gpu=webgpu (runtime/webgpu/gaius-shaderxlat.wasm, which
+# stage-web-runtime.py stages from GAIUS_SHADERXLAT_WASM): built here unless one is given. Without
+# cargo and the wasm32 target the dist has none and ?gpu=webgpu falls back to WebGL 2
+# ("translator unavailable"); GAIUS_KERNELS_STRICT=1 makes that an error.
+if [[ -z "${GAIUS_SHADERXLAT_WASM:-}" && "${GAIUS_SKIP_KERNELS:-}" != "1" ]]; then
+  if translator_module="$(bash "$root/port/web/runtime/webgpu/build-translator.sh" | tail -n 1)" \
+      && [[ -s "$translator_module" ]]; then
+    export GAIUS_SHADERXLAT_WASM="$translator_module"
+  elif [[ "${GAIUS_KERNELS_STRICT:-}" == "1" ]]; then
+    echo "The WebGPU shader translator could not be built" >&2
+    exit 1
+  else
+    echo "WARNING: no WebGPU shader translator; ?gpu=webgpu falls back to WebGL 2" >&2
+  fi
+fi
 rm -rf "$dist_directory/kernels"
-stage_arguments=("$dist_directory")
+stage_arguments=("$dist_directory" --profile "$version")
 [[ -f "$kernel_directory/kernels.json" ]] && stage_arguments+=(--kernels "$kernel_directory")
 "$root/port/scripts/run-python.sh" "$root/port/scripts/stage-web-runtime.py" "${stage_arguments[@]}"
 # build-teavm.sh restages the same runtime after publishing the client; it must neither rebuild

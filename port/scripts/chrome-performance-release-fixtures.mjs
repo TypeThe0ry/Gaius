@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
 import {
   evaluateUncappedFramePacing,
   mergeFramePacingTelemetrySources,
@@ -130,8 +131,8 @@ export const acceptanceFixtureIdentity = {
 };
 
 export const releaseManifestFixtureIdentity = {
-  profileId: "26.2",
-  profilePath: "versions/26.2.json",
+  profileId: CANONICAL_PROFILE.id,
+  profilePath: "versions/" + CANONICAL_PROFILE.id + ".json",
   profileSha256: fixtureHash("c"),
   clientDistribution: "named",
   protocolVersion: 776,
@@ -139,15 +140,15 @@ export const releaseManifestFixtureIdentity = {
   worldgenTelemetryMode: "task-pulsed",
   storage: {
     schema: 2,
-    databaseName: "gaius-fs-v2-26.2",
-    prefix: "gaius.fs.v2:26.2:",
-    opfsDirectory: "regions-v2-26.2",
+    databaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+    prefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+    opfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
   },
 };
 
 export const legacyReleaseManifestFixtureIdentity = {
-  profileId: "1.21.11",
-  profilePath: "versions/1.21.11.json",
+  profileId: LEGACY_PROFILE.id,
+  profilePath: "versions/" + LEGACY_PROFILE.id + ".json",
   profileSha256: fixtureHash("d"),
   clientDistribution: "obfuscated-with-mappings",
   protocolVersion: 774,
@@ -155,9 +156,9 @@ export const legacyReleaseManifestFixtureIdentity = {
   worldgenTelemetryMode: "checkpoint-only",
   storage: {
     schema: 2,
-    databaseName: "gaius-fs-v2-1.21.11",
-    prefix: "gaius.fs.v2:1.21.11:",
-    opfsDirectory: "regions-v2-1.21.11",
+    databaseName: "gaius-fs-v2-" + LEGACY_PROFILE.id + "",
+    prefix: "gaius.fs.v2:" + LEGACY_PROFILE.id + ":",
+    opfsDirectory: "regions-v2-" + LEGACY_PROFILE.id + "",
   },
 };
 
@@ -233,12 +234,12 @@ export function makeAcceptanceFixtureReport({
       launchGeneration: "1",
       renderDistance: Number(profile.renderDistance),
       simulationDistance: Number(profile.simulationDistance),
-      profileId: "26.2",
+      profileId: CANONICAL_PROFILE.id,
       worldVersion: 4903,
       storageSchema: 2,
-      storageDatabaseName: "gaius-fs-v2-26.2",
-      storagePrefix: "gaius.fs.v2:26.2:",
-      storageOpfsDirectory: "regions-v2-26.2",
+      storageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+      storagePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+      storageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
     }],
   };
   const harnessOverrideEvidence = {
@@ -355,12 +356,12 @@ export function makeAcceptanceFixtureReport({
         expectedWorkerServerDistance: expectedDistance,
         matchingWorkerStartMessages: 1,
         expectedStorage: {
-          profileId: "26.2",
+          profileId: CANONICAL_PROFILE.id,
           worldVersion: 4903,
           storageSchema: 2,
-          storageDatabaseName: "gaius-fs-v2-26.2",
-          storagePrefix: "gaius.fs.v2:26.2:",
-          storageOpfsDirectory: "regions-v2-26.2",
+          storageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+          storagePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+          storageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
         },
         naturalWorkerEvidence,
         harnessOverrideEvidence,
@@ -384,12 +385,12 @@ export function makeAcceptanceFixtureReport({
           expectedWorkerServerDistance: expectedDistance,
           matchingWorkerStartMessages: 1,
           expectedStorage: {
-            profileId: "26.2",
+            profileId: CANONICAL_PROFILE.id,
             worldVersion: 4903,
             storageSchema: 2,
-            storageDatabaseName: "gaius-fs-v2-26.2",
-            storagePrefix: "gaius.fs.v2:26.2:",
-            storageOpfsDirectory: "regions-v2-26.2",
+            storageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+            storagePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+            storageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
           },
           naturalWorkerEvidence,
           harnessOverrideEvidence,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import {access, readdir, readFile} from "node:fs/promises";
+import {createHash} from "node:crypto";
 import {dirname, isAbsolute, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
 
@@ -16,14 +17,35 @@ const PATCH_SETS = {
 
 // port/tools/bringup/<id>.txt lists the patches a GAIUS_BRINGUP=1 build may
 // skip. Lines are "<patchId> | <owner package> | <reason>"; '#' starts a
-// comment. Bring-up mode never applies to the release profiles, so they must
-// not carry entries.
-const BRINGUP_FORBIDDEN_PROFILES = new Set(["26.2", "1.21.11"]);
+// comment. Bring-up mode applies only to a profile whose bringupAllowed is true
+// (version-profile.sh, PatchRegistry), so the others must not carry entries.
+// renderSeam selects the render seam port/mc/seams/<generation> that adapts the profile's
+// Minecraft render SPI to the WebGPU core, or "none"; a seam's profiles are the profiles that
+// name it. build-overlays.sh refuses the same cases.
+const RENDER_SEAM_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+// inputSeam, shaderFront and kernelSemantics: the same rules as port/tools/profilegen/profilegen.mjs
+// (which also checks that one kernelSemantics.code names one set of semantics across the
+// profiles) and port/native/crates/gaius-noise/build.rs.
+const INPUT_SEAMS = ["sdl3", "glfw"];
+const SHADER_FRONTS = ["renderpearl", "blaze3d", "blaze3d-lenient"];
+const RENDERPEARL_SEAM = /^renderpearl-\d+$/u;
+const KERNEL_FLOOR_MODES = ["cast-adjust", "math-floor"];
+const KERNEL_SYNTHS = ["f64", "f32"];
+const KERNEL_DENSITY_GRAPHS = ["router-f64", "sampler-f32"];
 const configPath = resolve(root, "port/config.json");
 const config = JSON.parse(await readFile(configPath, "utf8"));
 const versionsDirectory = resolve(root, "port/versions");
 const allProfiles = process.argv.includes("--all");
 const profileOptionIndex = process.argv.indexOf("--profile");
+const draftIndex = process.argv.indexOf("--draft-profile");
+const draftMode = draftIndex >= 0;
+if (draftMode && (allProfiles || profileOptionIndex >= 0 || process.argv.includes("--remote") ||
+        process.argv.includes("--require-local"))) {
+    fail("--draft-profile is a schema/seam check only; cannot combine with other selection or metadata modes");
+}
+if (draftMode && (!process.argv[draftIndex + 1] || process.argv[draftIndex + 1].startsWith("--"))) {
+    fail("--draft-profile needs a JSON path");
+}
 if (allProfiles && profileOptionIndex >= 0) {
     fail("--all and --profile cannot be combined");
 }
@@ -34,7 +56,8 @@ if (profileOptionIndex >= 0 &&
 const selectedProfile = profileOptionIndex >= 0
     ? process.argv[profileOptionIndex + 1]
     : (process.env.GAIUS_VERSION_PROFILE_PATH || requiredString(config, "versionProfile"));
-const configuredProfilePath = resolveProfilePath(selectedProfile);
+const configuredProfilePath = draftMode ? resolve(process.argv[draftIndex + 1]) : resolveProfilePath(selectedProfile);
+if (draftMode && !configuredProfilePath.endsWith(".json")) fail("draft profile must be a JSON file");
 
 let profilePaths;
 if (allProfiles) {
@@ -99,7 +122,7 @@ if (allProfiles) {
 
 async function checkProfile(profilePath, remoteManifest) {
 
-if (profilePath !== versionsDirectory && !profilePath.startsWith(versionsDirectory + sep)) {
+if (!draftMode && profilePath !== versionsDirectory && !profilePath.startsWith(versionsDirectory + sep)) {
     fail(`version profile must point inside port/versions: ${profilePath}`);
 }
 
@@ -111,13 +134,40 @@ const localMetadataPath = resolve(work, "version.json");
 const localClientVersionPath = resolve(work, "client-version.json");
 let checkedLocalMetadata = false;
 let checkedClientVersion = false;
+let checkedLocalAssetIndex = false;
 
-if (await exists(localMetadataPath)) {
-    validateOfficialMetadata(
-        JSON.parse(await readFile(localMetadataPath, "utf8")), profile, "local version metadata");
+if (!draftMode && await exists(localMetadataPath)) {
+    const metadata = JSON.parse(await readFile(localMetadataPath, "utf8"));
+    const assetIndexPath = resolve(work, "assets/indexes", `${profile.official.assetIndexId}.json`);
+    let cachedSha1 = null;
+    if (await exists(assetIndexPath)) {
+        const bytes = await readFile(assetIndexPath);
+        cachedSha1 = createHash("sha1").update(bytes).digest("hex");
+        if (cachedSha1 !== metadata.assetIndex?.sha1) {
+            fail(`cached asset index ${assetIndexPath} SHA-1 ${cachedSha1} does not match ` +
+                `${localMetadataPath} SHA-1 ${metadata.assetIndex?.sha1}; the cache is corrupt or mixed. ` +
+                `Restore a verified metadata/index pair before retrying; do not change the profile pin ` +
+                `to accept corrupt bytes. See docs/version-profile-cache.md.`);
+        }
+        if (Number.isInteger(metadata.assetIndex?.size) && bytes.length !== metadata.assetIndex.size) {
+            fail(`cached asset index ${assetIndexPath} has ${bytes.length} bytes, expected ` +
+                `${metadata.assetIndex.size} in ${localMetadataPath}; restore the verified cache pair.`);
+        }
+        checkedLocalAssetIndex = true;
+    }
+    if (metadata.assetIndex?.sha1 !== profile.official.assetIndexSha1) {
+        fail(`local version metadata asset index SHA-1 ${metadata.assetIndex?.sha1} does not match ` +
+            `${profile.official.assetIndexSha1} pinned by ${profilePath}. Metadata: ${localMetadataPath}. ` +
+            `Index: ${assetIndexPath}; cached SHA-1: ${cachedSha1 ?? "not present"}. ` +
+            `The same index id can name different revisions; cache self-consistency is not proof ` +
+            `of an official republish. Restore a verified pinned metadata/index pair, or review ` +
+            `publisher evidence before intentionally updating the pin. No asset-index download or cache write ` +
+            `was attempted. See docs/version-profile-cache.md.`);
+    }
+    validateOfficialMetadata(metadata, profile, "local version metadata");
     checkedLocalMetadata = true;
 }
-if (await exists(localClientVersionPath)) {
+if (!draftMode && await exists(localClientVersionPath)) {
     validateClientVersion(
         JSON.parse(await readFile(localClientVersionPath, "utf8")), profile);
     checkedClientVersion = true;
@@ -143,7 +193,8 @@ if (process.argv.includes("--require-local") &&
     fail(`local ${profile.id} metadata is incomplete; run fetch-version.sh first`);
 }
 
-const bringup = await validateBringupList(profile.id);
+const bringup = await validateBringupList(profile.id, profile.bringupAllowed);
+const renderSeam = await validateRenderSeam(profile);
 
 return {
     profile: profile.id,
@@ -155,12 +206,14 @@ return {
     worldgenTelemetryMode: profile.worldgenTelemetryMode,
     patchSet: profile.patchSet,
     extraPatchers: profile.extraPatchers,
+    renderSeam,
     bringup,
     packVersions: profile.packVersions,
     assetIndex: {id: profile.official.assetIndexId, sha1: profile.official.assetIndexSha1},
     storage: profile.storage,
     checkedLocalMetadata,
     checkedClientVersion,
+    checkedLocalAssetIndex,
     checkedRemoteMetadata,
 };
 }
@@ -168,6 +221,9 @@ return {
 function validateProfile(value) {
     requiredString(value, "id");
     requiredString(value, "releaseType");
+    if (typeof value.bringupAllowed !== "boolean") {
+        fail(`profile ${value.id}.bringupAllowed must be true or false`);
+    }
     requiredInteger(value, "protocolVersion");
     requiredInteger(value, "worldVersion");
     requiredInteger(value, "javaVersion");
@@ -178,6 +234,7 @@ function validateProfile(value) {
         fail("clientDistribution must be named or obfuscated-with-mappings");
     }
     validatePatchSet(value);
+    validateSeamsAndKernelSemantics(value);
     for (const pack of ["resource", "data"]) {
         requiredInteger(value.packVersions?.[pack], "major", `packVersions.${pack}`);
         requiredInteger(value.packVersions?.[pack], "minor", `packVersions.${pack}`);
@@ -191,6 +248,42 @@ function validateProfile(value) {
         requiredSha1(value.official, "clientMappingsSha1");
     } else if (value.official.clientMappingsSha1 !== null) {
         fail("official.clientMappingsSha1 must be null for a named client");
+    }
+}
+
+function validateSeamsAndKernelSemantics(profile) {
+    const id = profile?.id ?? "<unknown>";
+    if (!INPUT_SEAMS.includes(profile.inputSeam)) {
+        fail(`profile ${id}.inputSeam must be one of ${INPUT_SEAMS.join(", ")} ` +
+            `(received ${JSON.stringify(profile.inputSeam)})`);
+    }
+    if (!SHADER_FRONTS.includes(profile.shaderFront)) {
+        fail(`profile ${id}.shaderFront must be one of ${SHADER_FRONTS.join(", ")} ` +
+            `(received ${JSON.stringify(profile.shaderFront)})`);
+    }
+    if ((profile.shaderFront === "renderpearl") !== RENDERPEARL_SEAM.test(String(profile.renderSeam))) {
+        fail(`profile ${id}.shaderFront renderpearl goes with a renderpearl-<n> renderSeam and only ` +
+            `with one (shaderFront ${profile.shaderFront}, renderSeam ${profile.renderSeam})`);
+    }
+    const semantics = profile.kernelSemantics;
+    if (semantics === null || typeof semantics !== "object" || Array.isArray(semantics)) {
+        fail(`profile ${id}.kernelSemantics must be an object`);
+    }
+    if (!Number.isInteger(semantics.code) || semantics.code < 0 || semantics.code > 255) {
+        fail(`profile ${id}.kernelSemantics.code must be an integer 0..255`);
+    }
+    for (const [key, choices] of [["floorMode", KERNEL_FLOOR_MODES], ["synth", KERNEL_SYNTHS],
+        ["densityGraph", KERNEL_DENSITY_GRAPHS]]) {
+        if (!choices.includes(semantics[key])) {
+            fail(`profile ${id}.kernelSemantics.${key} must be one of ${choices.join(", ")} ` +
+                `(received ${JSON.stringify(semantics[key])})`);
+        }
+    }
+    if ((semantics.synth === "f32") !== (semantics.densityGraph === "sampler-f32")) {
+        fail(`profile ${id}.kernelSemantics synth f32 goes with densityGraph sampler-f32, f64 with router-f64`);
+    }
+    if (!Number.isInteger(semantics.irVersion) || semantics.irVersion < 1 || semantics.irVersion > 0xffff) {
+        fail(`profile ${id}.kernelSemantics.irVersion must be an integer 1..65535`);
     }
 }
 
@@ -225,16 +318,38 @@ function validatePatchSet(profile) {
     }
 }
 
-async function validateBringupList(id) {
+async function validateBringupList(id, bringupAllowed) {
     const path = resolve(root, "port/tools/bringup", `${id}.txt`);
     if (!(await exists(path))) {
         return {list: null, entries: 0};
     }
     const entries = parseBringupList(await readFile(path, "utf8"), path);
-    if (BRINGUP_FORBIDDEN_PROFILES.has(id) && entries.length > 0) {
-        fail(`profile ${id} must not have bring-up entries (${relative(root, path)})`);
+    if (!bringupAllowed && entries.length > 0) {
+        fail(`profile ${id} (bringupAllowed false) must not have bring-up entries (${relative(root, path)})`);
     }
     return {list: relative(root, path).replaceAll("\\", "/"), entries: entries.length};
+}
+
+async function validateRenderSeam(profile) {
+    const id = profile?.id ?? "<unknown>";
+    const seam = profile?.renderSeam;
+    if (seam === "none") {
+        return seam;
+    }
+    if (typeof seam !== "string" || !RENDER_SEAM_NAME.test(seam)) {
+        fail(`profile ${id}.renderSeam must be "none" or the name of a port/mc/seams/<generation> ` +
+            `directory (received ${JSON.stringify(seam)})`);
+    }
+    const manifestPath = resolve(root, "port/mc/seams", seam, "seam.json");
+    const manifestName = relative(root, manifestPath).replaceAll("\\", "/");
+    if (!(await exists(manifestPath))) {
+        fail(`profile ${id}.renderSeam ${seam} has no ${manifestName}`);
+    }
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    if (manifest.generation !== seam) {
+        fail(`${manifestName} declares generation ${JSON.stringify(manifest.generation)}, not ${seam}`);
+    }
+    return seam;
 }
 
 function parseBringupList(text, path) {

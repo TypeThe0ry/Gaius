@@ -5,15 +5,18 @@
 // This file is a plain script so it can be inlined next to kernel-pool.js. It installs
 // globalThis.GaiusNoiseJob:
 //
-//   const job = GaiusNoiseJob.noisePoints({profile: "26.3", random: "xoroshiro", seed: "42",
-//     fork: "minecraft:ridge", noise: {type: "normal", firstOctave: -7, amplitudes: [1, 2]},
+//   const job = GaiusNoiseJob.noisePoints({semantics: profile.kernelSemantics,
+//     random: "xoroshiro", seed: "42", fork: "minecraft:ridge",
+//     noise: {type: "normal", firstOctave: -7, amplitudes: [1, 2]},
 //     xyz: new Float64Array([x0, y0, z0, x1, y1, z1])}, jobId);
 //   const values = GaiusNoiseJob.readNoisePoints(await pool.submit("noise_points", job), jobId);
 //
+// semantics is the kernelSemantics object of the page's version profile
+// (port/versions/<id>.json) or its numeric code; the codec knows no Minecraft version.
 // noise is {type: "normal", firstOctave, amplitudes}, {type: "recipe", baseAmplitude,
 // baseOctave, octaveCount, normalize: "disabled" | "enabled" | "legacy", amplitudeModifiers}
-// (26.3 only) or {type: "blended", xzScale, yScale, xzFactor, yFactor, smearScaleMultiplier}
-// (integral block positions). A Float64Array xyz is copied bit for bit.
+// (float synth semantics only) or {type: "blended", xzScale, yScale, xzFactor, yFactor,
+// smearScaleMultiplier} (integral block positions). A Float64Array xyz is copied bit for bit.
 (function (global) {
   "use strict";
 
@@ -23,7 +26,6 @@
   const HEADER_LEN = 16;
   const KIND_NOISE_POINTS = 0x0101;
 
-  const PROFILES = Object.freeze({"1.21.11": 0, "26.2": 1, "26.3": 2});
   const RANDOMS = Object.freeze({xoroshiro: 0, legacy: 1});
   const NORMALIZE = Object.freeze({disabled: 0, enabled: 1, legacy: 2});
   const NOISES = Object.freeze({normal: 0, recipe: 1, blended: 2});
@@ -33,6 +35,15 @@
   function code(table, value, what) {
     if (!Object.prototype.hasOwnProperty.call(table, value)) throw new RangeError(`unknown ${what} ${value}`);
     return table[value];
+  }
+
+  // The wire byte of a kernelSemantics object (or of a bare code).
+  function semanticsCode(semantics) {
+    const value = typeof semantics === "number" ? semantics : semantics && semantics.code;
+    if (!Number.isInteger(value) || value < 0 || value > 0xff) {
+      throw new RangeError(`unknown kernel semantics ${JSON.stringify(semantics)}`);
+    }
+    return value;
   }
 
   // Returns the noise section as [byte length, writer(view, offset)]; offsets are payload-relative.
@@ -85,7 +96,7 @@
     view.setUint32(12, payloadLength, true);
 
     const payload = new DataView(buffer, HEADER_LEN);
-    payload.setUint8(0, code(PROFILES, job.profile, "profile"));
+    payload.setUint8(0, semanticsCode(job.semantics));
     payload.setUint8(1, code(NOISES, job.noise.type, "noise type"));
     payload.setUint8(2, code(RANDOMS, job.random || "xoroshiro", "random source"));
     payload.setUint32(4, xyz.length / 3, true);
@@ -119,7 +130,7 @@
     return new Uint8Array(buffer, HEADER_LEN, length);
   }
 
-  // The f64 results of a noise_points job, viewed in place (26.3 float results are widened).
+  // The f64 results of a noise_points job, viewed in place (float results are widened).
   function readNoisePoints(buffer, jobId) {
     const bytes = readResult(buffer, jobId);
     if (bytes.byteLength % 8 !== 0) throw new Error("noise_points result is not a whole number of f64");
@@ -127,6 +138,6 @@
   }
 
   global.GaiusNoiseJob = Object.freeze({
-    ABI_VERSION, KIND_NOISE_POINTS, PROFILES, noisePoints, readResult, readNoisePoints,
+    ABI_VERSION, KIND_NOISE_POINTS, noisePoints, readResult, readNoisePoints,
   });
 })(typeof globalThis !== "undefined" ? globalThis : self);

@@ -610,6 +610,7 @@
       const root = {bytes, index, dataOffset, resourceCount};
       window.__gaiusVanillaAssets = root;
       bootTimings.vanillaAssetsDecoded = performance.now();
+      if (performance.mark) performance.mark("gaius:asset-pack-decode");
       return root;
     }
 
@@ -701,7 +702,7 @@
     // edges and GUI pixels stay sharp instead of smeared. ?gaiusPixelated=0 keeps the browser's
     // smooth scaling.
     (function installGaiusCanvasSampling() {
-      const canvas = document.getElementById("mc-canvas");
+      let canvas = document.getElementById("mc-canvas");
       if (!canvas || urlParams.get("gaiusPixelated") === "0") return;
       let applied = null;
       const update = () => {
@@ -716,9 +717,21 @@
         canvas.style.imageRendering = wanted;
       };
       window.__gaiusUpdateCanvasSampling = update;
-      if (typeof MutationObserver === "function") {
-        new MutationObserver(update).observe(canvas, {attributes: true, attributeFilter: ["width", "height", "style"]});
-      }
+      const observer = typeof MutationObserver === "function" ? new MutationObserver(update) : null;
+      const observe = () => {
+        if (observer) observer.observe(canvas, {attributes: true, attributeFilter: ["width", "height", "style"]});
+      };
+      observe();
+      // A WebGPU/WebGL fallback replaces the game canvas (window.__gaiusCanvasHost): follow it.
+      window.addEventListener("gaius:canvas-replaced", (event) => {
+        const next = event && event.detail ? event.detail.canvas : null;
+        if (!next || next === canvas) return;
+        if (observer) observer.disconnect();
+        canvas = next;
+        applied = null;
+        observe();
+        update();
+      });
       window.addEventListener("resize", update);
       update();
     })();
@@ -1774,23 +1787,74 @@
         }
       }
       if (!online && !username) {
-        let rememberedName = "";
-        try {
-          rememberedName = localStorage.getItem("gaius.playerName") || "";
-        } catch (error) {
-          console.warn("Could not read the remembered Gaius player name", error);
+        // Storage reads must settle before deciding whether this is first launch. A transient
+        // localStorage failure on a returning page used to look like an empty profile and opened
+        // BrowserProfileScreen. Retry briefly; if it still fails, reuse a valid session identity
+        // and never manufacture a first-run decision from an I/O error.
+        const readProfileStorage = async key => {
+          const started = performance.now();
+          let last = null;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const value = localStorage.getItem(key);
+              console.info("Gaius profile storage read", key, "ok", attempt + 1,
+                Math.round(performance.now() - started));
+              return {value: value || "", error: null};
+            } catch (error) {
+              last = error;
+              console.warn("Gaius profile storage read retry", key, attempt + 1, error);
+              await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+            }
+          }
+          console.error("Gaius profile storage read failed", key, last);
+          return {value: "", error: last || new Error("profile storage unavailable")};
+        };
+        const rememberedRead = await readProfileStorage("gaius.playerName");
+        let rememberedName = rememberedRead.value;
+        console.info("Gaius profile storage result", JSON.stringify({
+          playerName: rememberedName,
+          playerNameError: rememberedRead.error ? String(rememberedRead.error) : "",
+        }));
+        if (rememberedRead.error) {
+          const sessionName = String(stored.username || "").trim();
+          if (/^[A-Za-z0-9_]{1,16}$/.test(sessionName)) {
+            username = sessionName;
+            session.username = username;
+            rememberedName = sessionName;
+          } else {
+            throw new Error("Profile storage is temporarily unavailable; retrying is required");
+          }
         }
         let profileSetupPending = false;
-        try {
-          profileSetupPending = localStorage.getItem("gaius.profileSetupPending") === "1";
-        } catch (error) {
-          profileSetupPending = false;
+        const pendingRead = rememberedRead.error ? {value: "", error: rememberedRead.error}
+          : await readProfileStorage("gaius.profileSetupPending");
+        if (pendingRead.error) {
+          const sessionName = String(stored.username || "").trim();
+          if (!/^[A-Za-z0-9_]{1,16}$/.test(sessionName)) {
+            throw new Error("Profile storage is temporarily unavailable; retrying is required");
+          }
+          username = sessionName;
+          session.username = username;
+        } else {
+          profileSetupPending = pendingRead.value === "1";
         }
-        if (/^[A-Za-z0-9_]{1,16}$/.test(rememberedName)) {
+        console.info("Gaius profile storage result", JSON.stringify({
+          playerName: rememberedName,
+          profileSetupPending,
+          pendingRaw: pendingRead.value || "",
+          pendingError: pendingRead.error ? String(pendingRead.error) : "",
+          sessionUsername: String(stored.username || ""),
+        }));
+        if (rememberedRead.error || /^[A-Za-z0-9_]{1,16}$/.test(rememberedName)) {
           username = rememberedName;
-          // A new player who left before the Edit Profile screen was confirmed or closed
-          // still gets it on the next launch (BrowserProfileScreen clears the flag).
-          if (profileSetupPending) window.__gaiusProfile.firstRun = true;
+          // A remembered name can still be the generated first-run name. The pending flag
+          // is cleared only when BrowserProfileScreen Done/Close completes setup.
+          if (profileSetupPending && !/^[A-Za-z0-9_]{1,16}$/.test(String(stored.username || ""))) {
+            window.__gaiusProfile.firstRun = true;
+            console.info("Gaius profile firstRun branch", "pending", true);
+          } else {
+            console.info("Gaius profile firstRun branch", "remembered", false);
+          }
         } else {
           // First launch: start straight into the game with a default name; the title
           // screen then opens the in-game Edit Profile screen (BrowserProfileScreen).
@@ -1802,6 +1866,7 @@
             console.warn("Could not remember the Gaius player name", error);
           }
           window.__gaiusProfile.firstRun = true;
+          console.info("Gaius profile firstRun branch", "new", true);
         }
         session.username = username;
         session.uuid = uuid;
@@ -3469,13 +3534,42 @@
       });
     }
 
+    // One Gaius runtime per browser profile: a Web Lock, or a localStorage lease where Web Locks
+    // are missing. A page that replaces the runtime in the same tab (reload, navigation) can ask
+    // before the old document's lock is gone: the old page releases it on pagehide, but a lock
+    // also lives until its document is destroyed, which may come later. So a lease held elsewhere
+    // is waited for (runtimeLeaseHandoffMs) before the page reports another tab; a tab that keeps
+    // running keeps its lease and the wait ends with that error.
+    const runtimeLeaseHandoffMs = 8000;
+    function releaseGaiusRuntimeLeaseOnPagehide(release) {
+      addEventListener("pagehide", release);
+      addEventListener("unload", release);
+      addEventListener("pageshow", event => {
+        if (event.persisted) location.reload();
+      });
+    }
+
     async function acquireGaiusRuntimeLease() {
       if (window.__gaiusRuntimeLeaseHeld || urlParams.get("allowMultipleTabs") === "1") {
         return true;
       }
+      let active = true;
+      let releaseLease = () => {};
+      const release = () => {
+        if (!active) return;
+        active = false;
+        window.__gaiusRuntimeLeaseHeld = false;
+        try {
+          releaseLease();
+        } catch (error) {
+          console.warn("Could not release the runtime lease", error);
+        }
+      };
+      releaseGaiusRuntimeLeaseOnPagehide(release);
+      window.__gaiusReleaseRuntimeLease = release;
       const lockName = "gaius-client-runtime-v1";
       if (navigator.locks && typeof navigator.locks.request === "function") {
-        const acquired = await new Promise(resolve => {
+        const requestLock = options => new Promise(resolve => {
           let settled = false;
           const finish = value => {
             if (settled) return;
@@ -3483,17 +3577,21 @@
             resolve(value);
           };
           try {
-            navigator.locks.request(lockName, {mode: "exclusive", ifAvailable: true}, lock => {
-              if (!lock) {
+            navigator.locks.request(lockName, options, lock => {
+              if (!lock || !active) {
                 finish(false);
                 return;
               }
               window.__gaiusRuntimeLeaseHeld = true;
               finish(true);
               return new Promise(release => {
-                window.__gaiusReleaseRuntimeLease = release;
+                releaseLease = release;
               });
             }).catch(error => {
+              if (options.signal && options.signal.aborted) {
+                finish(false);
+                return;
+              }
               console.warn("Web Locks runtime lease is unavailable", error);
               finish(null);
             });
@@ -3502,10 +3600,22 @@
             finish(null);
           }
         });
+        let acquired = await requestLock({mode: "exclusive", ifAvailable: true});
+        if (!active) return false;
+        if (acquired === false && typeof AbortController === "function") {
+          bootTimings.runtimeLeaseWaitStart = performance.now();
+          const handoff = new AbortController();
+          releaseLease = () => handoff.abort();
+          const timer = setTimeout(() => handoff.abort(), runtimeLeaseHandoffMs);
+          acquired = await requestLock({mode: "exclusive", signal: handoff.signal});
+          clearTimeout(timer);
+        }
+        if (!active) return false;
         if (acquired !== null) return acquired;
       }
 
       const leaseKey = "gaius.runtimeLease.v1";
+      const leaseStaleMs = 10000;
       const leaseId = (crypto.randomUUID ? crypto.randomUUID() :
         Date.now().toString(36) + Math.random().toString(36).slice(2));
       const readLease = () => {
@@ -3518,29 +3628,54 @@
       const writeLease = () => {
         localStorage.setItem(leaseKey, JSON.stringify({id: leaseId, at: Date.now()}));
       };
-      try {
+      const heldElsewhere = () => {
         const current = readLease();
-        if (current && current.id !== leaseId && Date.now() - Number(current.at || 0) < 10000) {
-          return false;
+        return !!current && current.id !== leaseId && Date.now() - Number(current.at || 0) < leaseStaleMs;
+      };
+      let heartbeat;
+      releaseLease = () => {
+        clearInterval(heartbeat);
+        const owned = readLease();
+        if (owned && owned.id === leaseId) localStorage.removeItem(leaseKey);
+      };
+      const checkOwnership = () => {
+        const owned = readLease();
+        if (owned && owned.id === leaseId) return true;
+        release();
+        location.reload();
+        return false;
+      };
+      const renewLease = () => {
+        if (!active || !checkOwnership()) return;
+        try {
+          writeLease();
+        } catch (error) {
+          release();
+          location.reload();
         }
+      };
+      try {
+        // A live tab renews its lease every 3 s; one that went away stops renewing and its lease
+        // turns stale, so waiting a stale period plus the handoff is enough for either outcome.
+        const waitUntil = Date.now() + leaseStaleMs + runtimeLeaseHandoffMs;
+        while (heldElsewhere()) {
+          if (!active || Date.now() >= waitUntil) return false;
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        if (!active) return false;
         writeLease();
         await new Promise(resolve => setTimeout(resolve, 80));
         const claimed = readLease();
-        if (!claimed || claimed.id !== leaseId) return false;
-        const heartbeat = setInterval(writeLease, 3000);
-        const release = () => {
-          clearInterval(heartbeat);
-          const owned = readLease();
-          if (owned && owned.id === leaseId) localStorage.removeItem(leaseKey);
-        };
-        addEventListener("pagehide", release, {once: true});
-        addEventListener("beforeunload", release, {once: true});
-        window.__gaiusReleaseRuntimeLease = release;
+        if (!active || !claimed || claimed.id !== leaseId) return false;
+        heartbeat = setInterval(renewLease, 3000);
+        addEventListener("storage", event => {
+          if (active && (event.key === leaseKey || event.key === null)) checkOwnership();
+        });
         window.__gaiusRuntimeLeaseHeld = true;
         return true;
       } catch (error) {
         console.warn("Cross-tab runtime lease is unavailable", error);
-        return true;
+        return active;
       }
     }
 

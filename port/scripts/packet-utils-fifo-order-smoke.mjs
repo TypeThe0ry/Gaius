@@ -4,15 +4,13 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
 import {join} from "node:path";
+import {memberText, patcherSource} from "./patcher-sources.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
-const patcherPath = join(repositoryRoot,
-  "port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java");
-const source = await readFile(patcherPath, "utf8");
-const start = source.indexOf("private static void patchClientPacketUtilsBrowserInline");
-const end = source.indexOf("private static void patchPacketProcessorBrowserSlice", start);
-assert.ok(start >= 0 && end > start, "PacketUtils patch method is missing");
-const method = source.slice(start, end);
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const source = patcherSource("MinecraftClientPatcher");
+const method = memberText(source, "patchClientPacketUtilsBrowserInline");
+assert.ok(method, "PacketUtils patch method is missing");
 // A polled packet must be handled before the next queue item. Re-adding it at
 // the tail under worldgen pressure reorders movement and chunk acknowledgments.
 assert.ok(!source.includes('"shouldDeferQueuedPacket"'),

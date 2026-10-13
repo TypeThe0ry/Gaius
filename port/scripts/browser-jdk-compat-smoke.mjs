@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {existsSync} from 'node:fs';
@@ -10,7 +11,7 @@ import {fileURLToPath} from 'node:url';
 // Smoke for the 26.3 TeaVM class library gap helpers (milestone M2, lead package P0):
 // dev.gaius.browser.BrowserJdkCompat (Math.powExact(II), ByteBuffer.slice(II),
 // Reader.readAllAsString(), Duration.isPositive()) and dev.gaius.browser.BrowserScopedValue
-// (java.lang.ScopedValue), both in port/src/versions/26.3, which JdkCompatPatches263 wires
+// (java.lang.ScopedValue), both in port/mc/shared/renderpearl-1, which JdkCompatPatches263 wires
 // into the 26.3 client jar.
 //
 // One scenario source is generated twice: against the real JDK 25 APIs and against the
@@ -41,7 +42,7 @@ const stages = new Set(option('--stages', 'jvm,teavm,overlay').split(',').filter
 for (const stage of stages) {
   assert.ok(['jvm', 'teavm', 'overlay'].includes(stage), `unknown stage ${stage}`);
 }
-const profile = option('--profile', '26.3');
+const profile = option('--profile', RENDERPEARL_PROFILE.id);
 const overlayDirectory = resolve(option('--overlay-dir',
   process.env.GAIUS_OVERLAY_DIRECTORY || join(root, 'port', 'work', 'overlays', profile)));
 const optimization = option('--optimization', 'SIMPLE');
@@ -55,7 +56,7 @@ const repository = process.env.M2_REPO || join(homedir(), '.m2', 'repository');
 const config = JSON.parse(await readFile(join(root, 'port', 'config.json'), 'utf8'));
 const teavmVersion = config.teaVMVersion;
 const helperSources = ['BrowserJdkCompat', 'BrowserScopedValue'].map(name =>
-  join(root, 'port', 'src', 'versions', '26.3', 'java', 'dev', 'gaius', 'browser', `${name}.java`));
+  join(root, 'port', 'mc', 'shared', 'renderpearl-1', 'src', 'java', 'dev', 'gaius', 'browser', `${name}.java`));
 
 // ------------------------------------------------------------------ scenario
 
@@ -488,7 +489,7 @@ public class OverlayJdkCompatCheck {
         "java/nio/ByteBuffer.slice(II)Ljava/nio/ByteBuffer;", "slice(Ljava/nio/ByteBuffer;II)Ljava/nio/ByteBuffer;",
         "java/io/Reader.readAllAsString()Ljava/lang/String;", "readAllAsString(Ljava/io/Reader;)Ljava/lang/String;",
         "java/time/Duration.isPositive()Z", "isPositive(Ljava/time/Duration;)Z");
-    // The shared helpers Minecraft262BrowserPatcher redirects to (26.2 and 26.3).
+    // The shared helpers Minecraft262BrowserPatcher redirects to (${CANONICAL_PROFILE.id} and ${RENDERPEARL_PROFILE.id}).
     static final Set<String> SHARED = Set.of("readAll(Ljava/io/Reader;)Ljava/lang/String;",
         "firstLine(Ljava/lang/String;)Ljava/lang/String;",
         "resolve(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;");
@@ -585,7 +586,7 @@ try {
     assert.ok(shared.includes('public static String readAll(Reader reader)'),
       'the shared BrowserJdkCompat no longer has readAll(Reader)');
     assert.equal(sharedTail(versioned).replace(/\r\n/g, '\n'), sharedTail(shared).replace(/\r\n/g, '\n'),
-      'the 26.3 BrowserJdkCompat copy of the shared helpers differs from port/src/main/java');
+      'the ' + RENDERPEARL_PROFILE.id + ' BrowserJdkCompat copy of the shared helpers differs from port/src/main/java');
     const compatTranscript = expectTranscript(
       run(compatClasses, 'dev.gaius.smoke.CompatTranscript'), 'helper run on the JVM');
     const difference = firstDifference(jdkTranscript, compatTranscript);
@@ -657,13 +658,13 @@ try {
       return [name, Number(count)];
     }));
     const users = /^OVERLAY_SCOPED_VALUE_USERS \[(.*)\]$/m.exec(report)[1];
-    if (profile === '26.3') {
+    if (profile === RENDERPEARL_PROFILE.id) {
       // Every call site of the vanilla 26.3 jar (scan of the whole jar, not only TeaVM's paths).
       // firstLine, readAll, resolve and one slice (StagingBuffer$Cpu.copyTo) are
       // Minecraft262BrowserPatcher's redirects; the rest are JdkCompatPatches263's.
       assert.deepEqual(counts, {firstLine: 1, isPositive: 1, powExact: 2, readAll: 1,
         readAllAsString: 1, resolve: 1, slice: 4},
-        'unexpected redirect counts in the 26.3 client jar');
+        'unexpected redirect counts in the ' + RENDERPEARL_PROFILE.id + ' client jar');
       assert.ok(users.includes('net/minecraft/world/level/block/state/SolidDebugger.class'),
         'SolidDebugger does not use BrowserScopedValue');
     }

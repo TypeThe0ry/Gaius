@@ -110,6 +110,75 @@ public final class GaiusSpawnEntityGateFixture {
         check("2,-1;".equals(worker.getField("loaded").get(null)),
                 "a passing gate must report the loaded spawn chunk once");
         System.out.println("SPAWN_ENTITY_GATE_DRAINS_PENDING_LOADS");
+
+        checkSpawnFixup(spawn);
+    }
+
+    /**
+     * Preparing.tick once the spawn chunk and its entities are in: a returning player's saved
+     * position reaches Ready unchanged, as in vanilla; only a spawn that came from the
+     * (shortened) PlayerSpawnFinder search goes through PlayerSpawnFinder.gaius$fixupLoadedSpawn.
+     * Runs as a non-Worker server, whose entity gate passes at once.
+     */
+    private static void checkSpawnFixup(Object spawn) throws Throwable {
+        Class<?> worker = Class.forName("dev.gaius.browser.BrowserIntegratedServerMain");
+        worker.getField("worker").setBoolean(null, false);
+        Class<?> taskClass = Class.forName("net.minecraft.server.network.config.PrepareSpawnTask");
+        Class<?> preparingClass =
+                Class.forName("net.minecraft.server.network.config.PrepareSpawnTask$Preparing");
+        Class<?> readyClass =
+                Class.forName("net.minecraft.server.network.config.PrepareSpawnTask$Ready");
+        Class<?> listenerClass =
+                Class.forName("net.minecraft.server.level.progress.LevelLoadListener");
+        Object listener = java.lang.reflect.Proxy.newProxyInstance(
+                listenerClass.getClassLoader(), new Class<?>[] {listenerClass}, (proxy, method, arguments) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return switch (method.getName()) {
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            case "equals" -> proxy == arguments[0];
+                            default -> "LevelLoadListener";
+                        };
+                    }
+                    return null;
+                });
+        Object task = allocate(taskClass);
+        set(taskClass, task, "loadListener", listener);
+        Method tick = preparingClass.getDeclaredMethod("tick");
+        tick.setAccessible(true);
+        for (boolean searched : new boolean[] {false, true}) {
+            Object preparing = allocate(preparingClass);
+            set(preparingClass, preparing, "this$0", task);
+            set(preparingClass, preparing, "spawnPosition",
+                    java.util.concurrent.CompletableFuture.completedFuture(spawn));
+            set(preparingClass, preparing, "chunkLoadFuture",
+                    java.util.concurrent.CompletableFuture.completedFuture(null));
+            set(preparingClass, preparing, "chunkLoadCounter",
+                    Class.forName("net.minecraft.server.level.ChunkLoadCounter").getConstructor().newInstance());
+            set(preparingClass, preparing, "spawnAngle", Class.forName("net.minecraft.world.phys.Vec2")
+                    .getConstructor(float.class, float.class).newInstance(0.0F, 0.0F));
+            set(preparingClass, preparing, "gaius$spawnSearched", searched);
+            Object ready;
+            try {
+                ready = tick.invoke(preparing);
+            } catch (InvocationTargetException failure) {
+                // No level here: a fixup that runs fails inside it, which shows it ran.
+                boolean inFixup = false;
+                for (StackTraceElement frame : failure.getCause().getStackTrace()) {
+                    inFixup |= frame.getMethodName().equals("gaius$fixupLoadedSpawn");
+                }
+                check(searched && inFixup,
+                        "only a searched spawn may reach gaius$fixupLoadedSpawn: " + failure.getCause());
+                continue;
+            }
+            check(!searched, "a searched spawn must go through gaius$fixupLoadedSpawn");
+            check(ready != null && readyClass.isInstance(ready),
+                    "Preparing must turn Ready once the spawn chunk is in: " + ready);
+            Field position = readyClass.getDeclaredField("spawnPosition");
+            position.setAccessible(true);
+            check(position.get(ready) == spawn,
+                    "a saved position must reach Ready unchanged: " + position.get(ready));
+        }
+        System.out.println("SPAWN_FIXUP_ONLY_FOR_SEARCHED_SPAWN");
     }
 
     private static Object allocate(Class<?> type) throws ReflectiveOperationException {

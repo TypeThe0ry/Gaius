@@ -2019,29 +2019,36 @@ public final class PlatformSmoke {
     }
 
     @JSBody(params = "resource", script = """
-            const root = globalThis.__gaiusVanillaAssets;
-            if (!root || !root.bytes || !root.index) return -1;
-            if (!Object.prototype.hasOwnProperty.call(root.index, resource)) return -1;
-            const range = root.index[resource];
-            return Array.isArray(range) && range.length === 2 ? range[1] | 0 : -1;
+            const packs = [globalThis.__gaiusVanillaAssets, globalThis.__gaiusVanillaSounds];
+            for (const root of packs) {
+                if (!root || !root.bytes || !root.index ||
+                    !Object.prototype.hasOwnProperty.call(root.index, resource)) continue;
+                const range = root.index[resource];
+                if (Array.isArray(range) && range.length === 2) return range[1] | 0;
+            }
+            return -1;
             """)
     private static native int externalAssetLength(String resource);
 
     @JSBody(params = {"resource", "output"}, script = """
-            const root = globalThis.__gaiusVanillaAssets;
-            if (!root || !root.bytes || !root.index) return false;
-            if (!Object.prototype.hasOwnProperty.call(root.index, resource)) return false;
-            const range = root.index[resource];
-            if (!Array.isArray(range) || range.length !== 2) return false;
-            const offset = range[0] | 0;
-            const length = range[1] | 0;
+            const packs = [globalThis.__gaiusVanillaAssets, globalThis.__gaiusVanillaSounds];
             const target = output && output.data ? output.data : output;
-            if (!target || target.length !== length || offset < 0 || length < 0) return false;
-            const start = root.dataOffset + offset;
-            const end = start + length;
-            if (start < root.dataOffset || end > root.bytes.length) return false;
-            target.set(root.bytes.subarray(start, end));
-            return true;
+            if (!target) return false;
+            for (const root of packs) {
+                if (!root || !root.bytes || !root.index ||
+                    !Object.prototype.hasOwnProperty.call(root.index, resource)) continue;
+                const range = root.index[resource];
+                if (!Array.isArray(range) || range.length !== 2) continue;
+                const offset = range[0] | 0;
+                const length = range[1] | 0;
+                if (target.length !== length || offset < 0 || length < 0) return false;
+                const start = root.dataOffset + offset;
+                const end = start + length;
+                if (start < root.dataOffset || end > root.bytes.length) return false;
+                target.set(root.bytes.subarray(start, end));
+                return true;
+            }
+            return false;
             """)
     private static native boolean copyExternalAsset(String resource, @JSByRef byte[] output);
 
@@ -2166,22 +2173,24 @@ public final class PlatformSmoke {
                 || !realms.contains("pc.realms.minecraft.net")) {
             throw new AssertionError("Browser Realms proxy URL is invalid");
         }
+        // Any version header value passes through; it is not a profile id.
+        String versionHeader = "platform-smoke-version";
         Map<String, String> headers = BrowserHttpProxy.browserSafeHeaders(Map.of(
                 "User-Agent", "Minecraft Java/1.21.11",
                 "Host", "packs.example.invalid",
-                "X-Minecraft-Version", "1.21.11"));
+                "X-Minecraft-Version", versionHeader));
         if (headers.containsKey("User-Agent") || headers.containsKey("Host")
-                || !"1.21.11".equals(headers.get("X-Minecraft-Version"))) {
+                || !versionHeader.equals(headers.get("X-Minecraft-Version"))) {
             throw new AssertionError("Browser HTTP forbidden-header filtering is invalid");
         }
         Map<String, String> mirrorHeaders = BrowserHttpProxy.browserSafeResourcePackHeaders(
                 pinnedResourcePack,
                 Map.of(
                         "Accept", "application/octet-stream",
-                        "X-Minecraft-Version", "1.21.11",
+                        "X-Minecraft-Version", versionHeader,
                         "X-Minecraft-UUID", "00000000-0000-0000-0000-000000000000"));
         if (!"application/octet-stream".equals(mirrorHeaders.get("Accept"))
-                || !"1.21.11".equals(mirrorHeaders.get("X-Minecraft-Version"))
+                || !versionHeader.equals(mirrorHeaders.get("X-Minecraft-Version"))
                 || !mirrorHeaders.containsKey("X-Minecraft-UUID")) {
             throw new AssertionError("Resource-pack relay metadata headers are missing");
         }

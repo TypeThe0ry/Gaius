@@ -1,4 +1,4 @@
-import dev.gaius.tools.m263.StrictMath263;
+import dev.gaius.tools.patches.worldgen.WorldgenStrictMath;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Method;
@@ -31,7 +31,7 @@ import org.objectweb.asm.tree.analysis.BasicValue;
 import org.objectweb.asm.tree.analysis.BasicVerifier;
 
 /**
- * Checks the StrictMath263 output of a client jar and builds the JVM twin of BrowserStrictMath.
+ * Checks the WorldgenStrictMath output of a client jar and builds the JVM twin of BrowserStrictMath.
  *
  * <pre>java StrictMathCheck CLIENT_JAR REWRITTEN_ROOT BrowserStrictMath.class TWIN_ROOT</pre>
  *
@@ -71,7 +71,7 @@ public final class StrictMathCheck {
         try (ZipFile zip = new ZipFile(jar)) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
                 String name = entry.getName();
-                if (!name.endsWith(".class") || !StrictMath263.inScope(name.substring(0, name.length() - 6))) {
+                if (!name.endsWith(".class") || !WorldgenStrictMath.inScope(name.substring(0, name.length() - 6))) {
                     continue;
                 }
                 ClassNode original;
@@ -130,10 +130,10 @@ public final class StrictMathCheck {
     private static boolean fromOutside(AbstractInsnNode instruction) {
         int opcode = instruction.getOpcode();
         return instruction instanceof MethodInsnNode call && call.desc.endsWith(")F")
-                && !StrictMath263.inScope(call.owner) && !call.owner.equals(StrictMath263.HELPER)
+                && !WorldgenStrictMath.inScope(call.owner) && !call.owner.equals(WorldgenStrictMath.HELPER)
                 || instruction instanceof FieldInsnNode field && field.desc.equals("F")
                         && (opcode == Opcodes.GETFIELD || opcode == Opcodes.GETSTATIC)
-                        && !StrictMath263.inScope(field.owner);
+                        && !WorldgenStrictMath.inScope(field.owner);
     }
 
     private static void checkMethod(String owner, MethodNode method) {
@@ -195,7 +195,7 @@ public final class StrictMathCheck {
         while (next != null && next.getOpcode() < 0) {
             next = next.getNext();
         }
-        return next instanceof MethodInsnNode call && call.owner.equals(StrictMath263.HELPER)
+        return next instanceof MethodInsnNode call && call.owner.equals(WorldgenStrictMath.HELPER)
                 && call.name.equals("round") && call.desc.equals("(F)F");
     }
 
@@ -247,7 +247,7 @@ public final class StrictMathCheck {
     private static int checkTwin(Path root) throws Exception {
         int cases = 0;
         try (URLClassLoader loader = new URLClassLoader(new URL[] {root.toUri().toURL()}, null)) {
-            Class<?> helper = loader.loadClass(StrictMath263.HELPER.replace('/', '.'));
+            Class<?> helper = loader.loadClass(WorldgenStrictMath.HELPER.replace('/', '.'));
             Method fromLong = helper.getMethod("fromLong", long.class);
             Method fromInt = helper.getMethod("fromInt", int.class);
             Method toIntD = helper.getMethod("toInt", double.class);

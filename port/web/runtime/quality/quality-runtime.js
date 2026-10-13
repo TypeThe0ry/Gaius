@@ -27,6 +27,13 @@
 // the device ratio capped per tier (1 on low and mid, and on every profile but 26.3), not the
 // native ratio. Without that wiring the runtime attaches lazily on the first frame and the
 // canvas keeps its old cap.
+//
+// Under WebGPU (GaiusWebGpu.active, ?gpu=webgpu) the GL passes cannot touch the frame: the world
+// renders at full scale (beginLevel answers 1000), endLevel runs the WGSL post chain
+// (runtime/webgpu/quality-post.js) with the same stages and settings, the inventory snapshot does
+// nothing, and oitAllowed() asks the WebGPU device (float32-blendable for the RGBA32F depth
+// bounds) instead of the WebGL extensions, with the same tier and ?gaiusOit rules (PLAN-DELTA
+// 3.10). There is no WGSL upscaler (DESIGN D10).
 (function installGaiusQualityRuntime(root) {
   "use strict";
   if (!root) return;
@@ -56,7 +63,8 @@
     inventorySkips: 0,
     snapshotSaves: 0,
     snapshotRestores: 0,
-    outlineStretches: 0
+    outlineStretches: 0,
+    backend: "webgl2"
   };
 
   const state = {
@@ -105,9 +113,18 @@
     }
   }
 
+  // A lost or restored context invalidates every object of the old resources, including the
+  // wrappers around the game's textures (gl-pass.js ExternalFramebuffers never re-checks them).
   function dropResources() {
+    if (state.res && state.res.external) state.res.external.forget();
     state.res = null;
     state.inventory.snapshotValid = false;
+  }
+
+  // The WebGPU backend renders this session (its glue says so once the core's device exists).
+  function webGpuActive() {
+    const gpu = root.GaiusWebGpu;
+    return !!(gpu && gpu.active === true);
   }
 
   function onContext(gl) {
@@ -115,6 +132,13 @@
     if (state.gl !== gl) {
       state.gl = gl;
       dropResources();
+      // Record viewport, scissor and colour mask from the start, so saveState never has to
+      // read them back (gl-pass.js installShadow).
+      try {
+        if (Q.gl) Q.gl.installShadow(gl);
+      } catch (error) {
+        fail(error);
+      }
       if (gl.canvas && gl.canvas.addEventListener) {
         gl.canvas.addEventListener("webglcontextlost", dropResources, false);
         gl.canvas.addEventListener("webglcontextrestored", dropResources, false);
@@ -128,6 +152,7 @@
   }
 
   function context() {
+    if (webGpuActive()) return null;
     const gl = root.__gaiusWebGL || null;
     if (!gl) return null;
     if (gl !== state.gl) onContext(gl);
@@ -218,6 +243,11 @@
 
   function beginLevel(width, height, fullResolution) {
     stats.frames++;
+    if (webGpuActive()) {
+      stats.backend = "webgpu";
+      stats.renderScale = 1;
+      return 1000;
+    }
     if (!ready() || !Q.upscaler) return 1000;
     const s = settings();
     autoScaleTick(s);
@@ -239,8 +269,43 @@
     }
   }
 
+  // Under WebGPU the texture ids are the negated glue handles of the core textures
+  // (QualityPatches263's gaius$glTextureId) and the WGSL chain (runtime/webgpu/quality-post.js,
+  // loaded with the glue) runs the same stages with the same settings on the glue's encoder. The
+  // world is never scaled there, so there is no upscaling.
+  function endLevelWebGpu(colorId, depthId, width, height, rectWidth, rectHeight, projection) {
+    const post = Q.webgpuPost;
+    const gpu = root.GaiusWebGpu;
+    if (!post || !gpu || typeof gpu.debugObject !== "function" || !Q.profile || state.failed || colorId >= 0) return;
+    const s = settings();
+    stats.width = width;
+    stats.height = height;
+    stats.rectWidth = rectWidth;
+    stats.rectHeight = rectHeight;
+    if (!post.anyStage(s.post)) return;
+    const color = gpu.debugObject(-colorId);
+    if (!color) return;
+    const started = now();
+    const ran = post.run({color: color, depth: depthId < 0 ? gpu.debugObject(-depthId) : null, width: width,
+      height: height, rectWidth: rectWidth, rectHeight: rectHeight, projection: projection, zeroToOne: true}, s.post);
+    if (ran) {
+      stats.postFrames++;
+      stats.lastStages = post.stats.lastStages;
+    } else if (post.stats.lastError) {
+      stats.lastError = post.stats.lastError;
+    }
+    const elapsed = now() - started;
+    stats.lastSubmitMs = Math.round(elapsed * 1000) / 1000;
+    if (elapsed > stats.maxSubmitMs) stats.maxSubmitMs = stats.lastSubmitMs;
+  }
+
   function endLevel(colorId, depthId, outlineId, width, height, rectWidth, rectHeight,
       m00, m11, m20, m21, m22, m23, m32, m33) {
+    if (webGpuActive()) {
+      endLevelWebGpu(colorId, depthId, width, height, rectWidth, rectHeight,
+          [m00, m11, m20, m21, m22, m23, m32, m33]);
+      return;
+    }
     if (!ready()) return;
     const s = settings();
     const scaled = rectWidth < width || rectHeight < height;
@@ -340,6 +405,11 @@
 
   function worldFrameDone(colorId, width, height, skipped, throttled) {
     const inv = state.inventory;
+    if (webGpuActive()) {
+      inv.active = !!throttled;
+      inv.snapshotValid = false;
+      return;
+    }
     if (!throttled) {
       inv.active = false;
       if (inv.snapshotValid && ++inv.idleFrames > SNAPSHOT_IDLE_FRAMES) {
@@ -394,6 +464,16 @@
 
   function oitAllowed() {
     if (!Q.profile) return false;
+    if (webGpuActive()) {
+      // RGBA16F targets blend on every WebGPU device; the RGBA32F depth bounds blended with MAX
+      // need float32-blendable. Two colour outputs with per-target blend state are core WebGPU.
+      const gpu = root.GaiusWebGpu;
+      const s = Q.profile.settings();
+      if (s.oitForced === false) return false;
+      const capable = typeof gpu.contextAvailable === "function" && gpu.contextAvailable() === true
+        && typeof gpu.hasFeature === "function" && gpu.hasFeature("float32-blendable");
+      return s.oitForced === true ? capable : capable && !!s.oitTier;
+    }
     context();
     return Q.profile.oitAllowed();
   }

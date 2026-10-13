@@ -8,6 +8,7 @@
 
   diff <base.json> <new.json> [--ignore GLOB ...] [--products]
        [--strict-added] [--allow-added GLOB ...] [--quiet]
+       [--accept reviewed.json --profile PROFILE]
       Prints changed / removed / added keys. Exits 1 when anything was
       changed or removed, 0 when the new snapshot is identical or only adds
       keys, 2 on usage errors.
@@ -18,6 +19,9 @@
       that do not change any product pass.
       --strict-added also fails on added keys unless they match an
       --allow-added GLOB (G1: new entries only from the reviewed whitelist).
+      --accept uses exact reviewed before/after hashes and reasons, and
+      requires --products --strict-added without ignores or globs. It also
+      checks reviewed hashes when comparing an already promoted baseline.
 
 Keys are "<relative/path>" for plain files and "<relative/path.jar>!<entry>"
 for archive entries. GLOB patterns (fnmatch) are matched against these keys.
@@ -34,6 +38,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import sys
 import zipfile
 
@@ -154,8 +159,43 @@ def flatten(document):
     return flat
 
 
+def reviewed_entries(path, profile, base, new):
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if document.get("schemaVersion") != 1 or document.get("target") != "js":
+        raise ValueError("expected a schemaVersion=1 JS review")
+    profiles = document.get("profiles")
+    if not isinstance(profiles, dict) or profile not in profiles:
+        raise ValueError("profile is absent from the reviewed accept file")
+    entries = profiles[profile].get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("review must contain exact entries")
+    accepted = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"key", "beforeSha256", "afterSha256", "reason"}:
+            raise ValueError("review entry must declare its exact key, before/after hashes and reason")
+        key = entry.get("key")
+        before = entry.get("beforeSha256")
+        after = entry.get("afterSha256")
+        reason = entry.get("reason")
+        if (not isinstance(key, str) or any(marker in key for marker in "*?[]")
+                or key in accepted or not excluded(key, PRODUCT_PATTERNS)):
+            raise ValueError("invalid, duplicate or out-of-scope reviewed key: %s" % key)
+        if (not isinstance(after, str) or not re.fullmatch("[0-9a-f]{64}", after)
+                or before is not None and (not isinstance(before, str)
+                                          or not re.fullmatch("[0-9a-f]{64}", before))
+                or before == after or not isinstance(reason, str) or not reason.strip()):
+            raise ValueError("review needs distinct exact hashes and a reason: %s" % key)
+        if new.get(key) != after:
+            raise ValueError("reviewed candidate hash is stale or missing: %s" % key)
+        if base.get(key) not in (before, after):
+            raise ValueError("reviewed baseline hash does not match: %s" % key)
+        accepted.add(key)
+    return accepted
+
+
 def diff(base_path, new_path, ignores, quiet, products=False, strict_added=False,
-         allow_added=()):
+         allow_added=(), accept_path=None, profile=None):
     with open(base_path, encoding="utf-8") as handle:
         base = flatten(json.load(handle))
     with open(new_path, encoding="utf-8") as handle:
@@ -165,6 +205,16 @@ def diff(base_path, new_path, ignores, quiet, products=False, strict_added=False
     if products:
         base = {k: v for k, v in base.items() if excluded(k, PRODUCT_PATTERNS)}
         new = {k: v for k, v in new.items() if excluded(k, PRODUCT_PATTERNS)}
+    accepted = set()
+    if accept_path:
+        if not products or not strict_added or ignores or allow_added or not profile:
+            print("RESULT FAIL (--accept requires --profile, --products, --strict-added and no ignores/allow-added)")
+            return 1
+        try:
+            accepted = reviewed_entries(accept_path, profile, base, new)
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            print("RESULT FAIL (review: %s)" % error)
+            return 1
     changed = sorted(k for k in base.keys() & new.keys() if base[k] != new[k])
     removed = sorted(base.keys() - new.keys())
     added = sorted(new.keys() - base.keys())
@@ -177,12 +227,18 @@ def diff(base_path, new_path, ignores, quiet, products=False, strict_added=False
             else:
                 print("%s %s" % (label, key))
     unexpected_added = [
-        key for key in added if strict_added and not excluded(key, allow_added)
+        key for key in added if strict_added and key not in accepted
+        and not excluded(key, allow_added)
     ]
     print("SUMMARY compared=%d changed=%d removed=%d added=%d ignore=%s scope=%s" % (
         len(base.keys() | new.keys()), len(changed), len(removed), len(added),
         ",".join(ignores) or "-", "products" if products else "all"))
-    if changed or removed:
+    unexpected_changed = [key for key in changed if key not in accepted]
+    reviewed_count = len(accepted.intersection(changed + added))
+    if accept_path:
+        print("REVIEW profile=%s acceptedDeltas=%d unreviewedChanged=%d unreviewedAdded=%d" % (
+            profile, reviewed_count, len(unexpected_changed), len(unexpected_added)))
+    if unexpected_changed or removed:
         print("RESULT FAIL (changed or removed entries)")
         return 1
     if unexpected_added:
@@ -190,7 +246,8 @@ def diff(base_path, new_path, ignores, quiet, products=False, strict_added=False
             print("UNEXPECTED-ADDED %s" % key)
         print("RESULT FAIL (added entries outside --allow-added)")
         return 1
-    print("RESULT PASS" + (" (additions only)" if added else " (identical)"))
+    print("RESULT PASS" + (" (exact reviewed deltas)" if reviewed_count
+                          else " (additions only)" if added else " (identical)"))
     return 0
 
 
@@ -216,11 +273,13 @@ def main(argv):
                          help="fail on added keys that match no --allow-added glob")
     compare.add_argument("--allow-added", action="append", default=[],
                          help="fnmatch glob of keys that may be added with --strict-added")
+    compare.add_argument("--accept", help="reviewed JS entries with exact before/after SHA256 and reasons")
+    compare.add_argument("--profile", help="exact profile key in the reviewed accept file")
     args = parser.parse_args(argv)
     if args.command == "snapshot":
         return snapshot(args.overlay_dir, args.out_json, args.exclude)
     return diff(args.base_json, args.new_json, args.ignore, args.quiet,
-                args.products, args.strict_added, args.allow_added)
+                args.products, args.strict_added, args.allow_added, args.accept, args.profile)
 
 
 if __name__ == "__main__":

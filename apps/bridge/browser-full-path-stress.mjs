@@ -6,6 +6,7 @@
  * radius-8 / 257-unique-chunk extreme tiers.
  */
 
+import {CANONICAL_PROFILE} from "../../port/scripts/verification-profiles.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -32,9 +33,9 @@ const BROWSER_CHANNEL_SOURCE_MARKERS = Object.freeze([
     ["relayNodeRecordResolverPublish", "state.relayNodeRecordResolver = relayNodeRecord;", false],
 ].map(([name, marker, jsBody]) => Object.freeze({name, marker, jsBody})));
 const canonicalProfilePath = fileURLToPath(
-    new URL("../../port/versions/26.2.json", import.meta.url));
+    new URL("../../port/versions/" + CANONICAL_PROFILE.id + ".json", import.meta.url));
 const canonicalEvidenceRoot = fileURLToPath(
-    new URL("../../port/target/26.2/browser-relay-full-path-evidence/", import.meta.url));
+    new URL("../../port/target/" + CANONICAL_PROFILE.id + "/browser-relay-full-path-evidence/", import.meta.url));
 const HARD_DEADLINES_MILLIS = Object.freeze({
     8: 20 * 60_000,
     16: 40 * 60_000,
@@ -98,7 +99,7 @@ const ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE =
 const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
     "gaius.browser-client-arrival-periodic-server-sync.v1";
 const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
-const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = "26.2";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = CANONICAL_PROFILE.id;
 const ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION = 776;
 const ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID = 113;
 const ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS = 1000;
@@ -152,7 +153,7 @@ for (const tier of tiers) {
     assert.equal(configuration.stressMode, true);
     assert.equal(configuration.acceptanceMode, false);
     assert.equal(configuration.stressTier, tier);
-    assert.equal(configuration.profile.id, "26.2");
+    assert.equal(configuration.profile.id, CANONICAL_PROFILE.id);
     assert.equal(configuration.profile.protocolVersion, 776);
     assert.equal(configuration.profile.worldVersion, 4903);
     assert.equal(configuration.clients, tier);
@@ -334,7 +335,7 @@ if (!ok) process.exitCode = 1;
 
 function validateStressResult(result, tier, configuration) {
     assert.equal(result?.ok, true, `stress tier ${tier} child result was not ok`);
-    assert.equal(result?.profile?.id, "26.2");
+    assert.equal(result?.profile?.id, CANONICAL_PROFILE.id);
     assert.equal(result?.profile?.protocolVersion, 776);
     assertSourceProvenance(
         result?.transport?.browserChannelSourceEvidence,

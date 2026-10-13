@@ -5,7 +5,7 @@ import net.minecraft.client.gui.screens.Screen;
 
 /**
  * Opens a screen on the version's screen owner: {@code Gui.setScreen} on 26.x. The 1.21.11
- * profile overrides this class (port/src/versions/1.21.11), where {@code Minecraft.setScreen}
+ * compat set overrides this class (port/mc/shared/legacy-12111), where {@code Minecraft.setScreen}
  * still owns the current screen.
  */
 public final class BrowserScreens {

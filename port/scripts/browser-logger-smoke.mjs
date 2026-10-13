@@ -35,6 +35,14 @@ assert.match(source, /sb\.length\(\) < 4096/,
   "BrowserLogger Throwable formatting must have a bounded payload");
 assert.match(source, /private static native void logToConsole\(int level, String text\)/,
   "BrowserLogger JSBody adapter must remain String-only");
+for (const level of ["trace", "debug"]) {
+  const methods = source.split("\n").filter(line => line.includes(`public void ${level}(`));
+  assert.equal(methods.length, 5, `BrowserLogger must keep the five ${level} overloads`);
+  for (const method of methods) {
+    assert.match(method, /\{ if \(verbose\(\)\) log\(/,
+      `BrowserLogger ${level} must return before formatting when disabled: ${method.trim()}`);
+  }
+}
 
 const fixtureRoot = await mkdtemp(join(tmpdir(), "gaius-browser-logger-"));
 try {
@@ -69,6 +77,22 @@ public final class BrowserLoggerFixture {
     String ordinary = (String) format.invoke(null, new Object[] {
         "plain {} {}", new Object[] {"a", "b"}});
     if (!"plain a b".equals(ordinary)) throw new AssertionError(ordinary);
+    // Debug and trace are off (no opt-in): they must not format their arguments, nor reach
+    // the console adapter (its native would fail here on the JVM).
+    java.lang.reflect.Field state = BrowserLogger.class.getDeclaredField("verboseState");
+    state.setAccessible(true);
+    state.setInt(null, -1);
+    BrowserLogger logger = new BrowserLogger("fixture");
+    Object bomb = new Object() {
+      @Override public String toString() { throw new AssertionError("disabled level formatted"); }
+    };
+    logger.debug("a {}", bomb);
+    logger.debug("a {} {}", bomb, bomb);
+    logger.debug("a {} {} {}", bomb, bomb, bomb);
+    logger.trace("a {}", bomb);
+    logger.trace("a {} {}", bomb, bomb);
+    logger.trace("a {} {} {}", bomb, bomb, bomb);
+    if (logger.isDebugEnabled() || logger.isTraceEnabled()) throw new AssertionError("levels enabled");
     System.out.println("JVM_BROWSER_LOGGER_OK");
   }
   static final class IOExceptionLike extends Throwable {
@@ -104,4 +128,5 @@ console.log(JSON.stringify({
   boundedCauseDepth: 4,
   boundedPayloadChars: 4096,
   jsBodyAdapter: "String",
+  debugTraceSkippedWhenDisabled: true,
 }));

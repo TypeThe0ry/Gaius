@@ -26,10 +26,12 @@ import org.teavm.jso.JSObject;
 /**
  * First light of generated chunks in the Rust light kernel (port/native/crates/gaius-light,
  * {@code light_column} jobs of port/native/crates/gaius-light-wasm), run by the kernel worker
- * pool instead of on the integrated server Worker. Used on the 26.2 and 26.3 profiles, whose
- * light engine the kernel mirrors.
+ * pool instead of on the integrated server Worker. Used on every profile whose patch chain applies
+ * {@code dev.gaius.tools.patches.light.LightKernelPatches} (its light engine is the one the
+ * kernel mirrors); the vanilla members whose names differ between generations go through
+ * {@link LightVersionOps}.
  *
- * <p>{@code dev.gaius.tools.kernel.LightKernelPatches} routes
+ * <p>{@code dev.gaius.tools.patches.light.LightKernelPatches} routes
  * {@code ThreadedLevelLightEngine.lightChunk} here. For a chunk that is not lit yet, the
  * PRE_UPDATE task in which vanilla calls {@code propagateLightSources} instead turns the column's
  * light on and snapshots it into a job: the palettes of its sections, its stored light and which
@@ -83,15 +85,16 @@ public final class BrowserLightKernel {
     /** Ring sides in job order: north (z-1), south, west (x-1), east. */
     private static final int[] SIDE_DX = {0, 0, -1, 1};
     private static final int[] SIDE_DZ = {-1, 1, 0, 0};
+    private static final LightVersionOps OPS = LightVersionOps.INSTANCE;
     private static final Direction[] SIDE_DIRECTIONS = {
         Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST};
 
     /** Chunks whose PRE_UPDATE task found every job slot taken, oldest first. */
     private static final ArrayDeque<Runnable> WAITING = new ArrayDeque<>();
     /**
-     * Snapshotted columns whose result is not applied yet, by {@code ChunkPos.pack}. Each level
-     * has its own light engine, so one column can have a job per dimension: they are chained
-     * through {@link Job#nextSameColumn}.
+     * Snapshotted columns whose result is not applied yet, by {@link LightVersionOps#packChunk}.
+     * Each level has its own light engine, so one column can have a job per dimension: they are
+     * chained through {@link Job#nextSameColumn}.
      */
     private static final Long2ObjectOpenHashMap<Job> IN_FLIGHT = new Long2ObjectOpenHashMap<>();
     private static boolean disabled;
@@ -148,9 +151,9 @@ public final class BrowserLightKernel {
             this.done = done;
             this.id = id;
             ChunkPos pos = chunk.getPos();
-            this.chunkX = pos.x();
-            this.chunkZ = pos.z();
-            this.column = ChunkPos.pack(chunkX, chunkZ);
+            this.chunkX = OPS.chunkX(pos);
+            this.chunkZ = OPS.chunkZ(pos);
+            this.column = OPS.packChunk(chunkX, chunkZ);
             this.minSection = chunk.getMinSectionY();
             this.lightSections = chunk.getSectionsCount() + 2;
             this.sky = sky;
@@ -210,7 +213,7 @@ public final class BrowserLightKernel {
         ChunkPos pos = chunk.getPos();
         chunk.setLightCorrect(false);
         CompletableFuture<ChunkAccess> done = new CompletableFuture<>();
-        hooks.gaius$addLightTask(pos.x(), pos.z(), BrowserLightEngineHooks.PRE_UPDATE,
+        hooks.gaius$addLightTask(OPS.chunkX(pos), OPS.chunkZ(pos), BrowserLightEngineHooks.PRE_UPDATE,
                 () -> start(engine, hooks, chunk, done));
         return done;
     }
@@ -245,7 +248,7 @@ public final class BrowserLightKernel {
     }
 
     private static void noteCheck(ThreadedLevelLightEngine engine, int chunkX, int chunkZ, long pos) {
-        for (Job job = IN_FLIGHT.get(ChunkPos.pack(chunkX, chunkZ)); job != null; job = job.nextSameColumn) {
+        for (Job job = IN_FLIGHT.get(OPS.packChunk(chunkX, chunkZ)); job != null; job = job.nextSameColumn) {
             if (job.engine == engine) {
                 job.addRecheck(pos);
             }
@@ -290,7 +293,7 @@ public final class BrowserLightKernel {
         if (submitted >= maxInFlight) {
             ChunkPos pos = chunk.getPos();
             WAITING.addLast(() -> {
-                hooks.gaius$addLightTask(pos.x(), pos.z(), BrowserLightEngineHooks.PRE_UPDATE,
+                hooks.gaius$addLightTask(OPS.chunkX(pos), OPS.chunkZ(pos), BrowserLightEngineHooks.PRE_UPDATE,
                         () -> start(engine, hooks, chunk, done));
                 engine.tryScheduleUpdate();
             });
@@ -329,7 +332,7 @@ public final class BrowserLightKernel {
         fallbacks++;
         ChunkPos pos = chunk.getPos();
         hooks.gaius$propagateLightSourcesVanilla(pos);
-        completeAfterUpdate(hooks, pos.x(), pos.z(), chunk, done);
+        completeAfterUpdate(hooks, OPS.chunkX(pos), OPS.chunkZ(pos), chunk, done);
     }
 
     private static void completeAfterUpdate(BrowserLightEngineHooks hooks, int chunkX, int chunkZ, ChunkAccess chunk,
@@ -567,7 +570,7 @@ public final class BrowserLightKernel {
             ChunkPos at = slots[slot].getPos();
             layers[slot] = new DataLayer[job.lightSections * 2];
             for (int light = 0; light < job.lightSections; light++) {
-                long key = SectionPos.asLong(at.x(), job.minSection - 1 + light, at.z());
+                long key = SectionPos.asLong(OPS.chunkX(at), job.minSection - 1 + light, OPS.chunkZ(at));
                 int flags = 0;
                 if (sky != null && GaiusLightColumnAccess.storing(sky, key)) {
                     flags |= SKY_STORING;

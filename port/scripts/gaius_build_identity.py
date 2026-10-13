@@ -28,9 +28,15 @@ WORLDGEN_TELEMETRY_MODES = frozenset(("task-pulsed", "checkpoint-only"))
 
 SOURCE_DIRECTORIES = (
     "port/src/main",
-    # Profile source sets (generate-pom.sh stages them over port/src/main/java).
-    "port/src/versions",
+    # Vanilla-facing source sets, selected by profile fields (generate-pom.sh stages them over
+    # port/src/main/java, build-overlays.sh over the client overrides; port/tools/sourcesets).
+    "port/mc/shared",
+    "port/tools/sourcesets",
     "port/overrides",
+    # The WebGPU core (every profile) and the render seams (selected by the profile's
+    # renderSeam), compiled into the client overlay by build-overlays.sh.
+    "port/gpu",
+    "port/mc/seams",
     "port/tools/src/main",
     "port/wasm/hotpath",
     # The v0.4 page runtime every distribution ships next to (or inlined into) the launcher:
@@ -67,6 +73,31 @@ SOURCE_FILES = (
     "port/scripts/build-wasm-hotpath.sh",
     "port/scripts/generate-wasm-hotpath.py",
 )
+# WebAssembly GC artifacts (build-wasmgc.sh): classes.wasm and singleplayer-server.wasm.  Their
+# sidecars carry the common identity above plus a "wasm" record: the TeaVM settings, the
+# binaryen step (wasm-opt-release.sh report), the symbol file, and the inputs that only the
+# WebAssembly GC build reads, hashed under their own policy so the identity of every
+# JavaScript sidecar stays what it was.
+WASM_ROLES = ("wasm-client", "wasm-singleplayer-worker")
+WASM_INPUT_POLICY = "gaius-wasmgc-build-inputs-v1"
+WASM_BUILD_POLICY = "gaius-wasmgc-build-v1"
+WASM_SOURCE_FILES = (
+    "port/scripts/build-wasmgc.sh",
+    "port/scripts/wasm-opt-release.sh",
+    "port/scripts/overlay-lock.sh",
+    "port/scripts/stage-web-runtime.py",
+    "port/tools/wasm/wasm-binary.mjs",
+    "port/tools/wasm/wasm-symbols.mjs",
+)
+# The profile's patch manifests (patch-manifest.wasmgc.json: the wasmgc patch chain), SPI
+# fingerprint and usage lock; the wasmgc-only source set when a tree has one.
+WASM_SOURCE_DIRECTORIES = (
+    "port/src/target-wasmgc",
+)
+WASM_BUILD_KEYS = (
+    "target", "role", "release", "optimization", "assertionsRemoved", "telemetryStripped",
+    "wasmOpt", "symbols",
+)
 PROTOCOL_FILES = (
     "port/config.json",
     "port/web/singleplayer/server-worker-bootstrap.js",
@@ -78,6 +109,12 @@ PROTOCOL_FILES = (
     "port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser/BrowserInlineEventLoop.java",
     "port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
     "port/scripts/postprocess-teavm-js.py",
+)
+# The patch code of MinecraftClientPatcher that moved into the domain packages (DESIGN D16,
+# port/tools/patchkit/README.md "Domains"): the network and integrated-server patches among it
+# keep defining the client/Worker protocol.
+PROTOCOL_DIRECTORIES = (
+    "port/tools/src/main/java/dev/gaius/tools/patches",
 )
 
 
@@ -196,14 +233,13 @@ def _input_paths(root: Path, relative_profile: str, *, protocol: bool) -> list[P
         path = root / relative
         if path.is_file():
             paths[path.relative_to(root).as_posix()] = path
-    if not protocol:
-        for relative in SOURCE_DIRECTORIES:
-            directory = root / relative
-            if not directory.is_dir():
-                continue
-            for path in directory.rglob("*"):
-                if path.is_file():
-                    paths[path.relative_to(root).as_posix()] = path
+    for relative in PROTOCOL_DIRECTORIES if protocol else SOURCE_DIRECTORIES:
+        directory = root / relative
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if path.is_file():
+                paths[path.relative_to(root).as_posix()] = path
     return [paths[name] for name in sorted(paths)]
 
 
@@ -374,6 +410,40 @@ def current_build_identity(root: Path) -> dict[str, object]:
     }
 
 
+def _wasm_input_paths(root: Path, profile_id: str) -> list[Path]:
+    paths: dict[str, Path] = {}
+    for relative in WASM_SOURCE_FILES:
+        path = root / relative
+        if path.is_file():
+            paths[relative] = path
+    for relative in (*WASM_SOURCE_DIRECTORIES, f"port/mc/profiles/{profile_id}"):
+        directory = root / relative
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if path.is_file():
+                paths[path.relative_to(root).as_posix()] = path
+    return [paths[name] for name in sorted(paths)]
+
+
+def wasm_inputs(root: Path) -> dict[str, object]:
+    root = root.resolve()
+    profile, _relative, _path, _bytes = _load_profile(root)
+    return _hash_input_set(root, _wasm_input_paths(root, profile["id"]), WASM_INPUT_POLICY)
+
+
+def _wasm_record(root: Path, build: object) -> dict[str, object]:
+    if not isinstance(build, dict):
+        raise RuntimeError("the WebAssembly GC build record must be an object")
+    missing = [key for key in WASM_BUILD_KEYS if key not in build]
+    if missing or build.get("target") != "wasmgc":
+        raise RuntimeError(f"the WebAssembly GC build record is incomplete: missing {missing or ['target=wasmgc']}")
+    record = {key: build[key] for key in WASM_BUILD_KEYS}
+    record["policy"] = WASM_BUILD_POLICY
+    record["inputs"] = wasm_inputs(root)
+    return record
+
+
 def sidecar_path(artifact: Path) -> Path:
     return artifact.with_name(f"{artifact.name}.build.json")
 
@@ -411,10 +481,19 @@ def _write_text_atomically(target: Path, text: str) -> None:
                 pass
 
 
-def create_sidecar(root: Path, role: str, artifact: Path) -> dict[str, object]:
+def create_sidecar(
+    root: Path,
+    role: str,
+    artifact: Path,
+    wasm_build: object | None = None,
+) -> dict[str, object]:
     artifact = artifact.resolve()
     if not artifact.is_file() or artifact.stat().st_size == 0:
         raise RuntimeError(f"build artifact is missing or empty: {artifact}")
+    if (role in WASM_ROLES) != (wasm_build is not None):
+        raise RuntimeError(
+            f"role {role} {'needs' if role in WASM_ROLES else 'takes no'} WebAssembly GC build record"
+        )
     identity = current_build_identity(root)
     record: dict[str, object] = {
         "kind": IDENTITY_KIND,
@@ -434,15 +513,28 @@ def create_sidecar(root: Path, role: str, artifact: Path) -> dict[str, object]:
             "bytes": artifact.stat().st_size,
         },
     }
+    if wasm_build is not None:
+        record["wasm"] = _wasm_record(root, wasm_build)
+        wasm_opt = record["wasm"]["wasmOpt"]
+        if isinstance(wasm_opt, dict) and wasm_opt.get("applied") is True:
+            output = wasm_opt.get("output")
+            if not isinstance(output, dict) or output.get("sha256") is None:
+                raise RuntimeError("the wasm-opt report names no output module")
     record["identitySha256"] = sha256_bytes(canonical_json(record).encode("ascii"))
     return record
 
 
-def write_sidecar(root: Path, role: str, artifact: Path, output: Path | None = None) -> Path:
+def write_sidecar(
+    root: Path,
+    role: str,
+    artifact: Path,
+    output: Path | None = None,
+    wasm_build: object | None = None,
+) -> Path:
     artifact = artifact.resolve()
     output = (output or sidecar_path(artifact)).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    record = create_sidecar(root, role, artifact)
+    record = create_sidecar(root, role, artifact, wasm_build)
     _write_text_atomically(output, f"{canonical_json(record)}\n")
     return output
 
@@ -491,6 +583,19 @@ def verify_sidecar(
     }
     if record.get("artifact") != expected_artifact:
         raise RuntimeError(f"build identity artifact hash does not match: {artifact}")
+    wasm = record.get("wasm")
+    if role in WASM_ROLES:
+        if (
+            not isinstance(wasm, dict)
+            or wasm.get("policy") != WASM_BUILD_POLICY
+            or wasm.get("target") != "wasmgc"
+            or any(key not in wasm for key in WASM_BUILD_KEYS)
+        ):
+            raise RuntimeError(f"build identity has no WebAssembly GC build record: {sidecar}")
+        if wasm.get("inputs") != wasm_inputs(root):
+            raise RuntimeError(f"build identity wasm inputs do not match current inputs: {sidecar}")
+    elif wasm is not None:
+        raise RuntimeError(f"build identity of role {role} carries a WebAssembly GC build record: {sidecar}")
     identity_hash = record.get("identitySha256")
     unsigned = dict(record)
     unsigned.pop("identitySha256", None)
@@ -499,15 +604,91 @@ def verify_sidecar(
     return record
 
 
+# Compatibility fields of a frozen build (one built from an earlier tree and published again):
+# sidecar key -> what changed when it differs from the current tree.
+FROZEN_COMPATIBILITY = (
+    ("storage", "storage"),
+    ("worldVersion", "save"),
+    ("profile.protocolVersion", "minecraft-protocol"),
+    ("protocol.sha256", "protocol"),
+)
+
+
+def _field(record: dict, dotted: str) -> object:
+    value: object = record
+    for key in dotted.split("."):
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
+def check_frozen(
+    root: Path,
+    role: str,
+    artifact: Path,
+    sidecar: Path | None = None,
+) -> dict[str, object]:
+    """Integrity of a frozen artifact's sidecar, and which compatibility fields differ now.
+
+    The artifact must still be the one its sidecar names (bytes and sha256) and the sidecar
+    must be intact (self hash, kind, schema, role, profile id); its source and overlay identity
+    are those of the tree it was built from and are not compared.
+    """
+    artifact = artifact.resolve()
+    sidecar = (sidecar or sidecar_path(artifact)).resolve()
+    try:
+        record = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(f"build identity sidecar is missing or invalid: {sidecar}") from exc
+    if not isinstance(record, dict):
+        raise RuntimeError(f"build identity sidecar is not an object: {sidecar}")
+    unsigned = dict(record)
+    identity_hash = unsigned.pop("identitySha256", None)
+    if identity_hash != sha256_bytes(canonical_json(unsigned).encode("ascii")):
+        raise RuntimeError(f"build identity self hash does not match: {sidecar}")
+    if (
+        record.get("kind") != IDENTITY_KIND
+        or record.get("schemaVersion") != IDENTITY_SCHEMA_VERSION
+        or record.get("role") != role
+    ):
+        raise RuntimeError(f"build identity contract or role does not match: {sidecar}")
+    if not artifact.is_file() or record.get("artifact") != {
+        "name": artifact.name,
+        "sha256": sha256_file(artifact),
+        "bytes": artifact.stat().st_size,
+    }:
+        raise RuntimeError(f"frozen artifact is not the one its sidecar names: {artifact}")
+    current = current_build_identity(root)
+    if _field(record, "profile.id") != _field(current, "profile.id"):
+        raise RuntimeError(f"frozen artifact belongs to profile {_field(record, 'profile.id')}: {artifact}")
+    differences = [
+        {"field": field, "trigger": trigger, "frozen": _field(record, field), "current": _field(current, field)}
+        for field, trigger in FROZEN_COMPATIBILITY
+        if _field(record, field) != _field(current, field)
+    ]
+    return {
+        "artifact": artifact.name,
+        "role": role,
+        "compatibilitySha256": record.get("compatibilitySha256"),
+        "currentCompatibilitySha256": current["compatibilitySha256"],
+        "differences": differences,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("write", "verify"):
+    for command in ("write", "verify", "frozen"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--root", type=Path, required=True)
         subparser.add_argument("--role", required=True)
         subparser.add_argument("--artifact", type=Path, required=True)
         subparser.add_argument("--sidecar", type=Path)
+        if command == "write":
+            subparser.add_argument(
+                "--wasm-build",
+                type=Path,
+                help="JSON record of the WebAssembly GC build (roles wasm-client, wasm-singleplayer-worker)",
+            )
     common = subparsers.add_parser("common")
     common.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
@@ -516,8 +697,17 @@ def main() -> int:
         print(canonical_json(current_build_identity(args.root)))
         return 0
     if args.command == "write":
-        output = write_sidecar(args.root, args.role, args.artifact, args.sidecar)
+        wasm_build = None
+        if args.wasm_build is not None:
+            try:
+                wasm_build = json.loads(args.wasm_build.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError(f"WebAssembly GC build record is missing or invalid: {args.wasm_build}") from exc
+        output = write_sidecar(args.root, args.role, args.artifact, args.sidecar, wasm_build)
         print(f"Build identity: {output}")
+        return 0
+    if args.command == "frozen":
+        print(canonical_json(check_frozen(args.root, args.role, args.artifact, args.sidecar)))
         return 0
     record = verify_sidecar(args.root, args.role, args.artifact, args.sidecar)
     print(record["compatibilitySha256"])

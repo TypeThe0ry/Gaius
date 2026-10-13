@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
+import {memberText, patcherSource as clientPatcherSource} from "./patcher-sources.mjs";
 import {MessageChannel} from "node:worker_threads";
 import vm from "node:vm";
 
@@ -13,10 +14,8 @@ const schedulerSource = await readFile(new URL(
   "../src/main/java/dev/gaius/browser/BrowserPacketScheduler.java",
   import.meta.url,
 ), "utf8");
-const patcherSource = await readFile(new URL(
-  "../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
-  import.meta.url,
-), "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcherSource = clientPatcherSource("MinecraftClientPatcher");
 const recoverySource = await readFile(new URL(
   "../src/main/java/dev/gaius/browser/BrowserMultiplayerRecovery.java",
   import.meta.url,
@@ -634,9 +633,8 @@ assert.match(runTickPatch,
   /wrapperCalls != 1 \|\| directPacketProcessorCalls != 0/,
   "the patcher does not fail closed against a second PLAY FIFO batch");
 
-const packetProcessorPatch = between(patcherSource,
-  "private static void patchPacketProcessorBrowserSlice",
-  "private static void patchPacketProcessorQueuedAccounting");
+const packetProcessorPatch = memberText(patcherSource, "patchPacketProcessorBrowserSlice");
+assert.ok(packetProcessorPatch, "the PacketProcessor patch method is missing");
 assert.match(packetProcessorPatch,
   /"java\/util\/Queue", "poll", "\(\)Ljava\/lang\/Object;"/,
   "patched PacketProcessor no longer owns FIFO dequeue order through Queue.poll");

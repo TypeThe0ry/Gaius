@@ -82,6 +82,7 @@ pub struct BiomeGrid {
 pub const GRID_XZ: i32 = 6;
 /// Grid columns outside the chunk (the 6 x 6 grid minus the chunk's 4 x 4).
 pub const RING_COLUMNS: usize = 20;
+pub const STORED_COLUMNS: usize = (GRID_XZ * GRID_XZ) as usize;
 const UNKNOWN: u16 = u16::MAX;
 
 impl BiomeGrid {
@@ -131,16 +132,17 @@ impl BiomeGrid {
         !(1..=4).contains(&x) || !(1..=4).contains(&z)
     }
 
-    /// Fills the quarts outside the chunk with `ring`: per ring column in grid order (x, then
-    /// z), every quart y from the bottom. These are the biomes the neighbouring chunks store,
+    /// Fills the stored 6 x 6 grid, or the legacy 20-column border: in grid order (x, then
+    /// z), every quart y from the bottom. These are the biomes the region's chunks store,
     /// which is what vanilla's `BiomeManager` reads through the `WorldGenRegion`.
     pub fn seed_ring(&mut self, ring: &[u16]) {
         let size_y = self.size_y as usize;
-        assert_eq!(ring.len(), RING_COLUMNS * size_y, "ring biome count");
+        let stored = ring.len() == STORED_COLUMNS * size_y;
+        assert!(stored || ring.len() == RING_COLUMNS * size_y, "ring biome count");
         let mut k = 0;
         for x in 0..GRID_XZ {
             for z in 0..GRID_XZ {
-                if !Self::is_ring_column(x, z) {
+                if !stored && !Self::is_ring_column(x, z) {
                     continue;
                 }
                 let base = ((x * GRID_XZ + z) * self.size_y) as usize;

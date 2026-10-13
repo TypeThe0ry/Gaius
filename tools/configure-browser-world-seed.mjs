@@ -1,7 +1,17 @@
 import {mkdir, writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 
+export const SEED_WIDGET_PREDICATE = "widget&&widget.visible!==false&&widget.active!==false"
+  + "&&(String(widget.type||'').endsWith('CreateWorldScreen$WorldTab$1')"
+  + "||(/EditBox$/.test(String(widget.type||''))&&/seed/i.test(String(widget.text||''))))";
+
+export function seedScreenSupportsShortcut(state) {
+  return /(?:^|[.$])CreateWorldScreen$/.test(String(state?.screen || ""));
+}
+
 export async function configureWorldSeed(session, seed, {findButton, click, dispatchKey, evaluate, waitFor, sleep, outputPath}) {
+  seed = String(seed);
+  if (!seed || seed.length > 32) throw new Error("world seed must contain 1 to 32 characters");
   let tab = await findButton(session, "World", 3_000);
   let usedWorldTabShortcut = false;
   let worldTabShortcutHeld = false;
@@ -11,24 +21,21 @@ export async function configureWorldSeed(session, seed, {findButton, click, disp
     } else {
       const canUseWorldTabShortcut = await evaluate(session, "(() => {"
         + "const state=window.__gaiusMinecraftState||{};"
-        + "const widgets=Array.isArray(state.screenWidgets)?state.screenWidgets:[];"
-        + "return String(state.screen||'').includes('CreateWorldScreen')&&"
-        + "widgets.some(widget=>widget&&widget.visible!==false&&"
-        + "/MenuTabBar|TabNavigationBar/.test(String(widget.type||'')));"
+        + "return (" + seedScreenSupportsShortcut.toString() + ")(state);"
         + "})()");
       if (canUseWorldTabShortcut !== true) {
-        throw new Error("--world-seed requires the visible World tab or CreateWorldScreen TabNavigationBar");
+        throw new Error("--world-seed requires the visible World tab or the CreateWorldScreen");
       }
       usedWorldTabShortcut = true;
       await dispatchKey(session, "ControlLeft", "keyDown");
       worldTabShortcutHeld = true;
       await dispatchKey(session, "Digit2", "keyDown");
       await dispatchKey(session, "Digit2", "keyUp");
+      await dispatchKey(session, "ControlLeft", "keyUp");
+      worldTabShortcutHeld = false;
       await sleep(100);
     }
-  const seedPredicate = "widget&&widget.visible!==false&&widget.active!==false"
-    + "&&(String(widget.type||'').endsWith('CreateWorldScreen$WorldTab$1')"
-    + "||(/EditBox$/.test(String(widget.type||''))&&/seed/i.test(String(widget.text||''))))";
+  const seedPredicate = SEED_WIDGET_PREDICATE;
   await waitFor(session, "(() => {const widgets=window.__gaiusMinecraftState?.screenWidgets||[];"
     + "return widgets.filter(widget=>" + seedPredicate + ").length===1;})()",
     5000, "the World tab seed input to replace the world-name input");

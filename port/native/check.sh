@@ -7,6 +7,9 @@
 #                                  golden harness or the client jars, then run everything
 #   port/native/check.sh --golden  always regenerate the fixtures first
 #   port/native/check.sh --verify  also prove a fresh JVM dump reproduces the fixtures
+#   port/native/check.sh --mesh-only  run only exact JVM/native/SIMD/baseline mesher parity
+#                                  GAIUS_MESH_GOLDEN_OUT chooses the fixture/report directory;
+#                                  GAIUS_MESH_DIST selects existing shipped kernel artifacts
 #   port/native/check.sh --no-golden  never touch the fixtures (no JDK or jars needed); also
 #                                  skips the JVM check of the StrictMath263 worldgen rewrite
 #   port/native/check.sh --teavm[=classes.js]  also run the golden fixtures through the
@@ -16,20 +19,24 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/../.." && pwd)"
-PROFILES=(26.3 26.2 1.21.11)
+# Every version profile (port/versions/*.json) needs golden fixtures.
+mapfile -t PROFILES < <(jq -r '.id' "$ROOT"/port/versions/*.json | tr -d '\r')
+(( ${#PROFILES[@]} > 0 )) || { printf 'check: no version profiles under %s/port/versions\n' "$ROOT" >&2; exit 1; }
 WASM="$HERE/target/wasm32-unknown-unknown/release/gaius_noise_wasm.wasm"
 
 golden=auto
 verify=0
+mesh_only=0
 teavm=()
 for arg in "$@"; do
     case "$arg" in
         --golden) golden=always ;;
         --no-golden) golden=never ;;
         --verify) verify=1 ;;
+        --mesh-only) mesh_only=1 ;;
         --teavm) teavm=(--) ;;
         --teavm=*) teavm=(-- "${arg#--teavm=}") ;;
-        *) printf 'usage: %s [--golden | --no-golden] [--verify] [--teavm[=classes.js]]\n' "$0" >&2; exit 2 ;;
+        *) printf 'usage: %s [--golden | --no-golden] [--verify] [--mesh-only] [--teavm[=classes.js]]\n' "$0" >&2; exit 2 ;;
     esac
 done
 
@@ -64,6 +71,16 @@ stale_profiles() {
 }
 
 cd "$HERE"
+export CARGO_NET_OFFLINE=true
+export CARGO_BUILD_JOBS=2
+mesh_args=()
+if (( verify )); then mesh_args+=(--verify); fi
+if (( mesh_only )); then
+    if [[ "$golden" == never ]]; then mesh_args+=(--no-generate); fi
+    step "exact vanilla JVM SectionCompiler/native/SIMD/baseline mesher golden"
+    node "$HERE/golden/mesh/check.mjs" "${mesh_args[@]}"
+    exit 0
+fi
 case "$golden" in
     always)
         step "golden fixtures (all profiles)"
@@ -92,15 +109,23 @@ fi
 
 step "cargo fmt / clippy"
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked --quiet -- -D warnings
+cargo clippy --workspace --all-targets --offline --locked -j 2 --quiet -- -D warnings
 
 step "cargo test (unit tests, golden parity for every profile, kernel framing)"
-cargo test --workspace --locked --quiet
+cargo test --workspace --offline --locked -j 2 --quiet
 
 step "wasm build (release, simd128) and native == wasm probes"
 ./build-wasm.sh --check
 
 command -v node > /dev/null || die "node not found"
+step "mesher golden byte comparator regression checks"
+node "$ROOT/port/scripts/mesh-golden-compare.test.mjs"
+node "$ROOT/port/scripts/m2-mesh-gate.test.mjs"
+node --test "$ROOT/port/scripts/mesh-jvm-sources.test.mjs" "$ROOT/port/scripts/png-boot.test.mjs"
+if [[ "$golden" != never ]]; then
+    step "exact vanilla JVM SectionCompiler/native/SIMD/baseline mesher golden"
+    node "$HERE/golden/mesh/check.mjs" "${mesh_args[@]}"
+fi
 step "wasm kernel against the golden fixtures"
 node "$HERE/wasm-fixture-check.mjs" "$WASM"
 
@@ -120,6 +145,11 @@ node "$ROOT/port/scripts/kernel-runtime-smoke.mjs"
 
 step "noise kernel through the kernel pool (worker threads)"
 node "$ROOT/port/scripts/native-noise-pool-smoke.mjs" "$WASM"
+
+if [[ -n "${GAIUS_PNG_OUT:-}" ]]; then
+    step "PNG: current Java == native == wasm for all local profiles"
+    python "$HERE/golden/png/check.py" --out "$GAIUS_PNG_OUT"
+fi
 
 if (( ${#teavm[@]} > 0 )); then
     step "TeaVM-compiled Java noise against the 26.3 golden fixtures"

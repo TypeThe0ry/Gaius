@@ -7,9 +7,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
 import {
-  MINECRAFT_1_21_11,
-  MINECRAFT_26_2,
-  MINECRAFT_26_3,
   MINECRAFT_PROFILES,
 } from "./dist/protocol.js";
 import { encodePacket } from "../../packages/protocol/dist/framing.js";
@@ -22,9 +19,8 @@ import { encodeString } from "../../packages/protocol/dist/binary.js";
 const directory = fileURLToPath(new URL(".", import.meta.url));
 const origin = "http://127.0.0.1:8781";
 const token = "encryption-request-smoke-token";
-const profiles = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3];
-assert.deepEqual(profiles, [...MINECRAFT_PROFILES],
-  "every RelayNode profile must be exercised explicitly");
+const profiles = [...MINECRAFT_PROFILES];
+assert.ok(profiles.length > 0, "the smoke needs at least one supported RelayNode profile");
 const bridgeSource = await readFile(new URL("./dist/main.js", import.meta.url), "utf8");
 
 assert.match(

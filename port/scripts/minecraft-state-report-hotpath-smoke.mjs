@@ -9,18 +9,16 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {memberText, patcherSource} from "./patcher-sources.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const sourcePath = path.resolve(
   scriptDir,
   "../overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java",
 );
-const patcherPath = path.resolve(
-  scriptDir,
-  "../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
-);
 const source = fs.readFileSync(sourcePath, "utf8");
-const patcher = fs.readFileSync(patcherPath, "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = patcherSource("MinecraftClientPatcher");
 
 const reportStart = source.indexOf("public static void reportMinecraftState(");
 const reportEnd = source.indexOf("\n    public static Object fallbackClientLevel(", reportStart);
@@ -63,7 +61,13 @@ assert.deepEqual(refreshPattern, [true, false, false, false, true, false, false,
 // slower side channel just to optimize the tick hook.
 const reportJsStart = source.indexOf("private static native void reportMinecraftStateJs(", reportEnd);
 assert.ok(reportJsStart > reportEnd, "reportMinecraftStateJs declaration is missing");
-const reportJs = source.slice(reportEnd, source.indexOf("private static native void reportMinecraftStateJs(", reportJsStart));
+// The script is inline before the declaration or, shared with the WebAssembly GC variant, the
+// MINECRAFT_STATE_SCRIPT text block constant.
+const scriptConstant = "private static final String MINECRAFT_STATE_SCRIPT = \"\"\"";
+const scriptConstantStart = source.indexOf(scriptConstant);
+const reportJs = scriptConstantStart >= 0
+  ? source.slice(scriptConstantStart, source.indexOf("\"\"\";", scriptConstantStart + scriptConstant.length))
+  : source.slice(reportEnd, reportJsStart);
 for (const field of ["\"screenWidgets\"", "\"worldSelection\"", "\"loadedChunkCount\"", "\"running\"", "\"screen\"", "\"level\""]) {
   assert.ok(reportJs.includes(field), `state schema lost ${field}`);
 }
@@ -74,11 +78,9 @@ const runTick = patcher.slice(runTickStart, patcher.indexOf("} else if (method.n
 assert.match(runTick, /pumpBrowserChannels\(\)/, "runTick must continue pumping browser network channels");
 assert.ok(runTick.indexOf("pumpBrowserChannels()") < runTick.indexOf("minecraftStateReport("),
   "state report must remain after the network pump");
-const pumpHelperStart = patcher.indexOf("private static MethodInsnNode pumpBrowserChannels()");
-const pumpHelperEnd = patcher.indexOf("\n    private static InsnList minecraftStateReport(", pumpHelperStart);
-assert.ok(pumpHelperStart >= 0 && pumpHelperEnd > pumpHelperStart,
-  "browser channel pump helper is missing");
-const pumpHelper = patcher.slice(pumpHelperStart, pumpHelperEnd);
+// A helper the step's domain classes share is public since the domain split: take the method.
+const pumpHelper = memberText(patcher, "pumpBrowserChannels");
+assert.ok(pumpHelper, "browser channel pump helper is missing");
 assert.match(pumpHelper, /dev\/gaius\/browser\/BrowserClientNetwork/,
   "runTick pump must use the shared BrowserClientNetwork guard");
 assert.match(pumpHelper, /pumpBrowserChannelsAtFrameBoundary/,
@@ -87,10 +89,8 @@ assert.doesNotMatch(pumpHelper, /io\/netty\/channel\/browser\/BrowserWebSocketCh
   "runTick must not call the raw BrowserWebSocketChannel pump directly");
 assert.match(runTick, /method\.instructions\.insertBefore\(\s*instruction,\s*minecraftStateReport\(/,
   "state report must remain on the existing runTick return hook");
-const stateHelperStart = patcher.indexOf("private static InsnList minecraftStateReport(");
-const stateHelperEnd = patcher.indexOf("\n    private static boolean hookMinecraftRunCatchDiagnostics", stateHelperStart);
-assert.ok(stateHelperStart >= 0 && stateHelperEnd > stateHelperStart, "state helper is missing");
-const stateHelper = patcher.slice(stateHelperStart, stateHelperEnd);
+const stateHelper = memberText(patcher, "minecraftStateReport");
+assert.ok(stateHelper, "state helper is missing");
 assert.ok(stateHelper.indexOf("shouldReportMinecraftState") < stateHelper.indexOf("reportMinecraftState"),
   "state report must remain cadence-gated");
 

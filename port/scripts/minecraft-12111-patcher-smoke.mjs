@@ -3,7 +3,9 @@
 // 1.21.11 is the checkpoint-only profile.  This smoke exercises the dedicated
 // task-layer holder cursor directly on the named client jar; it never invokes
 // the 26.2 patcher and it rejects scheduler pulse/checkpoint bytecode.
+import {LEGACY_PROFILE, profileIdPattern} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 import {execFileSync} from "node:child_process";
 import {access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat} from "node:fs/promises";
 import {existsSync} from "node:fs";
@@ -22,11 +24,11 @@ const profileIdFromPath = (value) => basename(nativePath(value).replaceAll("\\",
   .replace(/\.json$/, "");
 const requestedProfile = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
-    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH) : "1.21.11");
-if (requestedProfile !== "1.21.11") {
-  throw new Error(`Minecraft 1.21.11 patcher smoke got profile ${requestedProfile}`);
+    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH) : LEGACY_PROFILE.id);
+if (requestedProfile !== LEGACY_PROFILE.id) {
+  throw new Error(`Minecraft ${LEGACY_PROFILE.id} patcher smoke got profile ${requestedProfile}`);
 }
-const rawClientJar = join(repositoryRoot, "port/work/1.21.11/client-named.jar");
+const rawClientJar = join(repositoryRoot, "port/work/" + LEGACY_PROFILE.id + "/client-named.jar");
 const toolsSource = join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools");
 const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
 const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
@@ -320,29 +322,28 @@ assert.deepEqual(oldOneHolderOrder.submitted, [0],
   "the old await model must not submit the dependency holder after blocking");
 
 await Promise.all([access(rawClientJar), access(asm), access(asmTree), access(asmAnalysis), access(verifierSource)]);
-const patcherSource = await readFile(
-  join(toolsSource, "Minecraft12111BrowserPatcher.java"), "utf8",
-);
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcherSource = stepSource("Minecraft12111BrowserPatcher");
 assert.match(patcherSource, /checkpoint-only/,
-  "1.21.11 patcher must declare checkpoint-only ownership");
+  "" + LEGACY_PROFILE.id + " patcher must declare checkpoint-only ownership");
 assert.match(patcherSource, /BROWSER_HOLDERS_PER_TURN = 16/,
-  "1.21.11 holder batching must retain the reviewed 16-holder upper bound");
+  "" + LEGACY_PROFILE.id + " holder batching must retain the reviewed 16-holder upper bound");
 assert.doesNotMatch(patcherSource, /BrowserWorldgenScheduler/,
-  "1.21.11 task patcher must not reference BrowserWorldgenScheduler");
+  "" + LEGACY_PROFILE.id + " task patcher must not reference BrowserWorldgenScheduler");
 assert.doesNotMatch(patcherSource, /BrowserWorldgenScheduler|"pulse"|"checkpoint"|\.pulse\(|\.checkpoint\(/,
-  "1.21.11 task patcher must not add pulse/checkpoint calls");
+  "" + LEGACY_PROFILE.id + " task patcher must not add pulse/checkpoint calls");
 assert.match(patcherSource, /Opcodes\.GETFIELD, CHUNK_POS, "x", "I"/,
-  "1.21.11 cursor must read public ChunkPos.x");
+  "" + LEGACY_PROFILE.id + " cursor must read public ChunkPos.x");
 assert.match(patcherSource, /Opcodes\.GETFIELD, CHUNK_POS, "z", "I"/,
-  "1.21.11 cursor must read public ChunkPos.z");
+  "" + LEGACY_PROFILE.id + " cursor must read public ChunkPos.z");
 assert.match(patcherSource, /Platform/,
-  "1.21.11 cursor must schedule a browser-turn continuation");
+  "" + LEGACY_PROFILE.id + " cursor must schedule a browser-turn continuation");
 assert.match(patcherSource, /patchGraphicsPresetBrowserDistances\(jar, root\)/,
-  "1.21.11 dedicated patcher must invoke its FAST graphics overlay");
+  "" + LEGACY_PROFILE.id + " dedicated patcher must invoke its FAST graphics overlay");
 assert.match(patcherSource, /findGraphicsPresetDistanceConstant/,
-  "1.21.11 graphics overlay must retain the render-distance shape guard");
+  "" + LEGACY_PROFILE.id + " graphics overlay must retain the render-distance shape guard");
 assert.match(patcherSource, /GraphicsPreset\.apply FAST .*getter/,
-  "1.21.11 graphics overlay must retain the per-getter shape guard");
+  "" + LEGACY_PROFILE.id + " graphics overlay must retain the per-getter shape guard");
 
 const root = await mkdtemp(join(tmpdir(), "gaius-mc12111-cursor-"));
 try {
@@ -397,19 +398,19 @@ try {
   const patchedGraphicsApply = graphicsPresetApply(patchedGraphics);
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
-    "1.21.11 raw FAST render distance shape changed");
+    "" + LEGACY_PROFILE.id + " raw FAST render distance shape changed");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
-    "1.21.11 raw FAST simulation distance shape changed");
+    "" + LEGACY_PROFILE.id + " raw FAST simulation distance shape changed");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
-    "1.21.11 FAST render distance was reduced from vanilla 8");
+    "" + LEGACY_PROFILE.id + " FAST render distance was reduced from vanilla 8");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
-    "1.21.11 FAST simulation distance was reduced from vanilla 6");
+    "" + LEGACY_PROFILE.id + " FAST simulation distance was reduced from vanilla 6");
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
-    "1.21.11 CUSTOM graphics preset arm changed");
+    "" + LEGACY_PROFILE.id + " CUSTOM graphics preset arm changed");
   const patchedMinecraft = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
     "net.minecraft.client.Minecraft"], {
       encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 60_000,
@@ -417,29 +418,29 @@ try {
   const minecraftInit = method(patchedMinecraft,
     "public net.minecraft.client.Minecraft(net.minecraft.client.main.GameConfig);");
   assert.equal(occurrences(minecraftInit, "Options.gaius$applyStartupGraphicsPreset"), 1,
-    "1.21.11 Minecraft.<init> must replay the graphics preset through the startup gate once");
+    "" + LEGACY_PROFILE.id + " Minecraft.<init> must replay the graphics preset through the startup gate once");
   assert.equal(occurrences(minecraftInit, "Options.applyGraphicsPreset"), 0,
-    "1.21.11 Minecraft.<init> still re-applies the saved graphics preset unconditionally");
+    "" + LEGACY_PROFILE.id + " Minecraft.<init> still re-applies the saved graphics preset unconditionally");
 
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [
     "--release", "21", "-proc:none", "-classpath", verifierClasspath,
-    "-d", classes, verifierSource,
+    "-sourcepath", join(repositoryRoot, "port/tools/src/main/java"), "-d", classes, verifierSource,
   ], {encoding: "utf8", timeout: 30_000});
   const verifierOutput = execFileSync(java, [
     "-Xverify:all", "-classpath", [classes, verifierClasspath].join(delimiter),
-    "GaiusChunkLayerBytecodeVerifier", clientJar, "1.21.11",
+    "GaiusChunkLayerBytecodeVerifier", clientJar, LEGACY_PROFILE.id,
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/);
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/);
   assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
-    "ASM CFG verifier did not validate the 1.21.11 chunk layer barrier");
+    "ASM CFG verifier did not validate the " + LEGACY_PROFILE.id + " chunk layer barrier");
   assert.match(verifierOutput,
-    /PROFILE_CALL_SURFACE_OK 1\.21\.11 net\/minecraft\/server\/level\/ChunkGenerationTask/,
-    "ASM profile verifier did not validate 1.21.11 task scheduler call surface");
+    new RegExp(String.raw`PROFILE_CALL_SURFACE_OK ${profileIdPattern(LEGACY_PROFILE)} net\/minecraft\/server\/level\/ChunkGenerationTask`),
+    "ASM profile verifier did not validate " + LEGACY_PROFILE.id + " task scheduler call surface");
   assert.match(verifierOutput,
-    /PROFILE_CALL_SURFACE_OK 1\.21\.11 dev\/gaius\/browser\/BrowserChunkGenerationYield/,
-    "ASM profile verifier did not validate 1.21.11 yield scheduler call surface");
+    new RegExp(String.raw`PROFILE_CALL_SURFACE_OK ${profileIdPattern(LEGACY_PROFILE)} dev\/gaius\/browser\/BrowserChunkGenerationYield`),
+    "ASM profile verifier did not validate " + LEGACY_PROFILE.id + " yield scheduler call surface");
   process.stdout.write(verifierOutput);
 
   const bytecode = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
@@ -447,13 +448,13 @@ try {
     encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
   });
   assert.doesNotMatch(bytecode, /BrowserWorldgenScheduler/,
-    "1.21.11 ChunkGenerationTask must remain scheduler-call free");
+    "" + LEGACY_PROFILE.id + " ChunkGenerationTask must remain scheduler-call free");
   assert.match(bytecode, /Platform\.startThread/,
-    "1.21.11 ChunkGenerationTask must bootstrap holder continuations in a TeaVM thread");
+    "" + LEGACY_PROFILE.id + " ChunkGenerationTask must bootstrap holder continuations in a TeaVM thread");
   assert.match(bytecode, /Field net\/minecraft\/world\/level\/ChunkPos\.x:I/,
-    "1.21.11 patched bytecode must use ChunkPos.x field");
+    "" + LEGACY_PROFILE.id + " patched bytecode must use ChunkPos.x field");
   assert.match(bytecode, /Field net\/minecraft\/world\/level\/ChunkPos\.z:I/,
-    "1.21.11 patched bytecode must use ChunkPos.z field");
+    "" + LEGACY_PROFILE.id + " patched bytecode must use ChunkPos.z field");
   const runUntilWait = method(bytecode,
     "public java.util.concurrent.CompletableFuture<?> runUntilWait();",
     "private void scheduleNextLayer");
@@ -478,9 +479,9 @@ try {
   assert.ok(yieldIndex < activeIndex
       && activeIndex < firstScheduleNextIndex
       && firstScheduleNextIndex < firstLayerWaitIndex,
-  "1.21.11 active cursor must resume before waitForScheduledLayer is reachable");
+  "" + LEGACY_PROFILE.id + " active cursor must resume before waitForScheduledLayer is reachable");
   assert.equal(occurrences(runUntilWait, "Method scheduleNextLayer:()V"), 2,
-    "1.21.11 runUntilWait must retain active-resume and fresh-layer scheduling paths");
+    "" + LEGACY_PROFILE.id + " runUntilWait must retain active-resume and fresh-layer scheduling paths");
   const scheduleLayer = method(bytecode,
     "private void scheduleLayer(net.minecraft.world.level.chunk.status.ChunkStatus, boolean);",
     "private int getRadiusForLayer");
@@ -498,14 +499,14 @@ try {
       ? [{entry, index, target: Number(match[1])}] : [];
   });
   assert.equal(batchBackedges.length, 1,
-    "1.21.11 scheduleLayer must retain one bounded holder-batch backedge");
+    "" + LEGACY_PROFILE.id + " scheduleLayer must retain one bounded holder-batch backedge");
   assert.match(scheduleInstructions[batchBackedges[0].index - 1]?.instruction ?? "",
     /(?:bipush\s+16|ldc(?:_w)?\s+.*\/\/ int 16)/,
-    "1.21.11 batch backedge must enforce the 16-holder upper bound");
+    "" + LEGACY_PROFILE.id + " batch backedge must enforce the 16-holder upper bound");
   assert.ok(scheduleLayer.indexOf("scheduleChunkInLayer") < scheduleLayer.indexOf("Platform.startThread"),
-    "1.21.11 must submit holders before publishing its batch continuation");
+    "" + LEGACY_PROFILE.id + " must submit holders before publishing its batch continuation");
   assert.equal(occurrences(scheduleLayer, "BrowserWorldgenScheduler"), 0);
-  console.log("Minecraft 1.21.11 checkpoint-only holder cursor smoke passed", JSON.stringify({
+  console.log("Minecraft " + LEGACY_PROFILE.id + " checkpoint-only holder cursor smoke passed", JSON.stringify({
     patchClasses: patchFiles.length,
     inputBytes: (await stat(rawClientJar)).size,
     cursorRadii: [0, 1, 2],

@@ -1,5 +1,5 @@
-//! Chunk section mesher: the vanilla `SectionCompiler.compile` of 26.2 and
-//! 26.3 (`ModelBlockRenderer`, `BlockModelLighter`, `FluidRenderer`,
+//! Chunk section mesher: the profile-selected vanilla `SectionCompiler.compile`
+//! (`ModelBlockRenderer`, `BlockModelLighter`, `FluidRenderer`,
 //! `VisGraph`, `MeshData.sortQuads`) over flat snapshots, for the mesh
 //! workers of the kernel pool.
 //!
@@ -31,6 +31,8 @@ mod rng;
 mod simd;
 mod tint;
 mod visgraph;
+
+include!(concat!(env!("OUT_DIR"), "/mesh_layouts.rs"));
 
 pub use mesher::Scratch;
 pub use visgraph::ALL_VISIBLE;

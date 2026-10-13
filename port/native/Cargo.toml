@@ -8,6 +8,8 @@ members = [
     "crates/gaius-mesher-wasm",
     "crates/gaius-noise",
     "crates/gaius-noise-wasm",
+    "crates/gaius-png",
+    "crates/gaius-png-wasm",
     "crates/gaius-shaderxlat",
     "crates/gaius-shaderxlat/wasm",
     "crates/gaius-worldgen",
@@ -23,6 +25,7 @@ publish = false
 [workspace.dependencies]
 gaius-kernel-abi = { path = "crates/gaius-kernel-abi" }
 gaius-noise = { path = "crates/gaius-noise" }
+gaius-png = { path = "crates/gaius-png" }
 
 # Bit-exact parity with the JVM forbids fast-math style rewrites; Rust never
 # contracts a*b+c into a fused multiply-add on its own, so the default float

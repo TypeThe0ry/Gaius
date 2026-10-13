@@ -25,11 +25,12 @@ import org.objectweb.asm.tree.VarInsnNode;
  * Routes TeaVM 0.15's thread and monitor primitives to TJspiThreadSupport when the build has
  * the gaius-jspi platform tag (WebAssembly GC JSPI mode, gaius.teavm.jspi).
  *
- * <p>Each patched entry point starts with {@code if (JspiHost.enabled()) { delegate; return;
- * }}. TeaVM's PlatformMarkerSupport folds the call to a constant before dependency analysis,
- * so a JSPI build never reaches the stock {@code @Async} primitives (monitorEnterWait,
- * waitImpl, switchContext, the sleep callback) and every other build never reaches
- * TJspiThreadSupport. {@code Thread.sleep(long)} is an {@code @Async} native method, so the
+ * <p>Each patched entry point (the monitor primitives, wait/notify, {@code Thread.start},
+ * {@code yield}, {@code sleep} and {@code join(long, int)}) starts with
+ * {@code if (JspiHost.enabled()) { delegate; return; }}. TeaVM's PlatformMarkerSupport folds
+ * the call to a constant before dependency analysis, so a JSPI build never reaches the stock
+ * {@code @Async} primitives (monitorEnterWait, waitImpl, switchContext, the sleep callback)
+ * and every other build never reaches TJspiThreadSupport. {@code Thread.sleep(long)} is an {@code @Async} native method, so the
  * stock pair moves to {@code gaiusSleepAsync} and {@code sleep} becomes a plain method that
  * picks one of the two.
  *
@@ -39,6 +40,13 @@ import org.objectweb.asm.tree.VarInsnNode;
  * {@code TThread.runThread} and {@code TObject.createMonitor} to the package, and the TThread
  * fields that {@code runThread}'s finally block updates ({@code alive}, {@code finishedLock},
  * {@code activeCount}), which TJspiThreadSupport.abandon updates for a thread that trapped.
+ *
+ * <p>TeaVM 0.15's TThread has no {@code onSpinWait()} (Java 9), which vanilla 26.2 and later
+ * call in the retry loops of SectionRenderDispatcher's compile and resort tasks once the
+ * JavaScript-only patch that turns them into scheduler yields is not applied (WebAssembly GC
+ * target). On the JVM it is a hint inside a loop that waits for another thread; a JSPI thread
+ * only gives up the agent at a park, a yield or its end, so the patch adds it as
+ * {@code Thread.yield()} (yieldNow), which lets the thread the loop waits for run.
  *
  * <p>The other {@code @Async} methods of the class library that a game build reaches
  * ({@link #ASYNC_METHODS}) keep their callback implementation: in a JSPI build the method
@@ -178,6 +186,9 @@ public final class TeaVMClasslibJspiPatcher {
         String t = "(L" + THREAD + ";";
         delegate(node, "start", "()V", "start", t + ")V", -1);
         delegate(node, "yield", "()V", "yieldNow", "()V", -1);
+        addOnSpinWait(node);
+        // join(J) and join() call join(JI): the JVM's loop on isAlive (TJspiThreadSupport.join).
+        delegate(node, "join", "(JI)V", "join", t + "JI)V", -1);
 
         // sleep(J) is "@Async native" with the callback implementation sleep(JAsyncCallback).
         MethodNode sleep = method(node, "sleep", "(J)V");
@@ -203,6 +214,18 @@ public final class TeaVMClasslibJspiPatcher {
         code.add(new InsnNode(Opcodes.RETURN));
         node.methods.add(wrapper);
         return node;
+    }
+
+    /** Adds {@code public static void onSpinWait() { yield(); }} (see the class comment). */
+    private static void addOnSpinWait(ClassNode node) {
+        if (node.methods.stream().anyMatch(m -> m.name.equals("onSpinWait"))) {
+            throw new IllegalStateException(THREAD + " already has onSpinWait");
+        }
+        MethodNode spin = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "onSpinWait", "()V",
+                null, null);
+        spin.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, THREAD, "yield", "()V", false));
+        spin.instructions.add(new InsnNode(Opcodes.RETURN));
+        node.methods.add(spin);
     }
 
     /**

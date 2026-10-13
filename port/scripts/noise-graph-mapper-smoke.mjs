@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {mkdir, mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises';
@@ -5,7 +6,7 @@ import {homedir, tmpdir} from 'node:os';
 import {delimiter, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-// Minecraft 26.2 only. BrowserNoiseGraphMapper (overrides/client/src/versions/26.2) memoizes the
+// Minecraft 26.2 only. BrowserNoiseGraphMapper (port/mc/shared/canonical/client) memoizes the
 // per-chunk NoiseChunk.wrap graph mapping of the 26.2 density runtime. 26.3 compiles each
 // density graph once per RandomState, has no NoiseRouter/DensityFunction.mapAll and no
 // DensityFunction$Visitor, and registers Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper
@@ -13,20 +14,20 @@ import {fileURLToPath} from 'node:url';
 // --profile with another id fails instead of reporting coverage that does not exist.
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const profileIndex = process.argv.indexOf('--profile');
-if (profileIndex >= 0 && process.argv[profileIndex + 1] !== '26.2') {
-  console.error(`noise-graph-mapper-smoke: 26.2 only; profile ${process.argv[profileIndex + 1]} `
+if (profileIndex >= 0 && process.argv[profileIndex + 1] !== CANONICAL_PROFILE.id) {
+  console.error(`noise-graph-mapper-smoke: ${CANONICAL_PROFILE.id} only; profile ${process.argv[profileIndex + 1]} `
     + 'drops Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper (compiled density runtime)');
   process.exit(2);
 }
 const positional = process.argv.slice(2).filter((value, index, all) => value !== '--real'
   && value !== '--teavm' && value !== '--profile' && all[index - 1] !== '--profile');
 const helper = resolve(positional[0] || join(root,
-  'port/overrides/client/src/versions/26.2/java/net/minecraft/world/level/levelgen/BrowserNoiseGraphMapper.java'));
+  'port/mc/shared/canonical/client/java/net/minecraft/world/level/levelgen/BrowserNoiseGraphMapper.java'));
 const fixture = resolve(positional[1] || join(root, 'port/scripts/fixtures/NoiseGraphMapperFixture.java'));
 const realFixture = resolve(join(root, 'port/scripts/fixtures/RealNoiseGraphMapperFixture.java'));
-assert.ok(await readFile(helper, 'utf8'), '26.2 BrowserNoiseGraphMapper source is required');
+assert.ok(await readFile(helper, 'utf8'), '' + CANONICAL_PROFILE.id + ' BrowserNoiseGraphMapper source is required');
 if (process.argv.includes('--real')) {
-  const classpathFile = resolve(positional[2] || join(root, 'port/work/26.2/classpath.txt'));
+  const classpathFile = resolve(positional[2] || join(root, 'port/work/' + CANONICAL_PROFILE.id + '/classpath.txt'));
   const rawClasspath = (await readFile(classpathFile, 'utf8')).trim();
   const separator = process.platform === 'win32' && rawClasspath.includes(';') ? ';' : /:(?![\\/])/;
   // fetch-version.sh writes a POSIX list; accept native Windows lists as well.
@@ -34,7 +35,7 @@ if (process.argv.includes('--real')) {
   const libraries = paths.filter(Boolean).map(value =>
     process.platform === 'win32' && /^\/[a-zA-Z]\//.test(value)
       ? value[1].toUpperCase() + ':' + value.slice(2).replaceAll('/', '\\') : value);
-  const namedJar = join(root, 'port/work/26.2/client-named.jar');
+  const namedJar = join(root, 'port/work/' + CANONICAL_PROFILE.id + '/client-named.jar');
   const realTemp = await mkdtemp(join(tmpdir(), 'gaius-real-noise-graph-'));
   try {
     const files = [helper, realFixture];

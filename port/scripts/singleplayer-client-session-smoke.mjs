@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
@@ -22,6 +23,7 @@ for (const contract of [
   "message.type === 'server-listener-ready'",
   "connectWhenWorkerReady(minecraft, sessionId, launchGeneration, 0)",
   "HostLoop.startThread(",
+  "initialGameRules: String(initialGameRules || '')",
   "profileId: globalThis.__gaiusProfileId || null",
   "worldVersion: globalThis.__gaiusWorldVersion || null",
   "storageSchema: globalThis.__gaiusStorageSchema || null",
@@ -30,15 +32,15 @@ for (const contract of [
   "storageOpfsDirectory: globalThis.__gaiusStorageOpfsDirectory || null",
   "globalThis.__gaiusStorageDatabaseName || ''",
   "Number(globalThis.__gaiusStorageSchema)",
-  "storageDatabaseName === 'gaius-fs-v2-1.21.11'",
-  "storageDatabaseName === 'gaius-fs-v2-26.2'",
+  "storageDatabaseName === 'gaius-fs-v2-" + LEGACY_PROFILE.id + "'",
+  "storageDatabaseName === 'gaius-fs-v2-" + CANONICAL_PROFILE.id + "'",
   "storageMatchesProfile",
-  "gaius-fs-v2-1.21.11",
-  "gaius-fs-v2-26.2",
-  "gaius.fs.v2:1.21.11:",
-  "gaius.fs.v2:26.2:",
-  "regions-v2-1.21.11",
-  "regions-v2-26.2",
+  "gaius-fs-v2-" + LEGACY_PROFILE.id + "",
+  "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+  "gaius.fs.v2:" + LEGACY_PROFILE.id + ":",
+  "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+  "regions-v2-" + LEGACY_PROFILE.id + "",
+  "regions-v2-" + CANONICAL_PROFILE.id + "",
   "storageSchema === 2",
   "Promise.reject(new Error(",
   "indexedDB.open(storageDatabaseName, storageSchema)",
@@ -366,12 +368,12 @@ function createLaunchRuntime(failureMode, options = {}) {
     navigator: {hardwareConcurrency: 8},
     setInterval,
     setTimeout: runtimeSetTimeout,
-    __gaiusProfileId: "26.2",
+    __gaiusProfileId: CANONICAL_PROFILE.id,
     __gaiusWorldVersion: 4903,
     __gaiusStorageSchema: 2,
-    __gaiusStorageDatabaseName: "gaius-fs-v2-26.2",
-    __gaiusStoragePrefix: "gaius.fs.v2:26.2:",
-    __gaiusStorageOpfsDirectory: "regions-v2-26.2",
+    __gaiusStorageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+    __gaiusStoragePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+    __gaiusStorageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
   };
   if (options.workerUrl !== undefined) {
     context.__gaiusSingleplayerWorkerUrl = options.workerUrl;
@@ -379,7 +381,7 @@ function createLaunchRuntime(failureMode, options = {}) {
   context.globalThis = context;
   vm.runInNewContext(
     `globalThis.launchWorker = function(worldId, newWorld, renderDistance, ` +
-      `simulationDistance) {${launchScript}\n};`,
+      `simulationDistance, initialGameRules) {${launchScript}\n};`,
     context,
   );
   return {context, channels, createdWorkers, capturedTimers};
@@ -450,6 +452,42 @@ function createLaunchRuntime(failureMode, options = {}) {
     "diagnostic query rewriting changed the opaque Blob Worker URL");
   assert.equal(worker.messages[0]?.type, "diagnostic-config",
     "Blob Worker did not receive the pre-start Mob AI telemetry opt-in");
+  for (const timer of runtime.capturedTimers) timer.cleared = true;
+  worker.terminate();
+}
+
+// The game rules chosen on the Create World screen are not part of the saved level on the
+// profiles whose vanilla IntegratedServer takes them as a separate Optional<GameRules>; the Worker
+// start message is the only channel the integrated server Worker gets them from.
+{
+  const rules = '{"minecraft:random_tick_speed":7,"minecraft:advance_time":false}';
+  const runtime = createLaunchRuntime(null, {captureTimers: true});
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4, rules);
+  assert.ok(sessionId, "game rules fixture did not launch a Worker");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const worker = runtime.createdWorkers[0];
+  const start = worker.messages.find((message) => message?.type === "start");
+  assert.ok(start, "the Worker never received its start message");
+  assert.equal(start.initialGameRules, rules,
+    "the initial game rules did not reach the Worker start message verbatim");
+  assert.equal(start.newWorld, true);
+  for (const timer of runtime.capturedTimers) timer.cleared = true;
+  worker.terminate();
+}
+
+// Opening a saved world, or a profile without a separate rules argument, sends no rules: the
+// empty text, never undefined or the string 'undefined' (the Worker decodes any non-empty text).
+for (const [label, launch] of [
+  ["empty text", (runtime) => runtime.context.launchWorker("world", false, 6, 4, "")],
+  ["omitted", (runtime) => runtime.context.launchWorker("world", false, 6, 4)],
+]) {
+  const runtime = createLaunchRuntime(null, {captureTimers: true});
+  assert.ok(launch(runtime), `${label}: fixture did not launch a Worker`);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const worker = runtime.createdWorkers[0];
+  const start = worker.messages.find((message) => message?.type === "start");
+  assert.ok(start, `${label}: the Worker never received its start message`);
+  assert.equal(start.initialGameRules, "", `${label}: a launch without game rules sent a value`);
   for (const timer of runtime.capturedTimers) timer.cleared = true;
   worker.terminate();
 }

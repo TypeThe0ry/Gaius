@@ -88,6 +88,7 @@ public final class LinkGapScanner {
     public static void main(String[] args) throws IOException {
         LinkGapScanner scanner = new LinkGapScanner();
         Path out = null;
+        Path suggestions = null;
         Root classlib = null;
         for (int index = 0; index < args.length; index++) {
             String argument = args[index];
@@ -96,6 +97,7 @@ public final class LinkGapScanner {
                 case "--classpath" -> scanner.classpath.add(Root.open(Path.of(args[++index])));
                 case "--teavm-classlib" -> classlib = Root.open(Path.of(args[++index]));
                 case "--out" -> out = Path.of(args[++index]);
+                case "--suggestions" -> suggestions = Path.of(args[++index]);
                 default -> throw new IllegalArgumentException("unknown argument " + argument);
             }
         }
@@ -111,6 +113,9 @@ public final class LinkGapScanner {
         }
         try {
             scanner.scan();
+            if (suggestions != null) {
+                Files.writeString(suggestions, scanner.suggestions(), StandardCharsets.UTF_8);
+            }
         } finally {
             for (Root root : scanner.subjects) root.close();
             for (Root root : scanner.classpath) root.close();
@@ -127,6 +132,53 @@ public final class LinkGapScanner {
                 + " references=" + scanner.checkedReferences
                 + " issues=" + scanner.issues.size()
                 + " teavmClasslib=" + (classlib != null));
+    }
+
+    private String suggestions() throws IOException {
+        StringBuilder text = new StringBuilder();
+        List<String> names = new ArrayList<>();
+        if (issues.keySet().stream().anyMatch(key -> key.startsWith("missing-class "))) {
+            for (Root root : classpath) names.addAll(root.classNames());
+        }
+        for (String key : issues.keySet()) {
+            String target = key.substring(key.indexOf(' ') + 1);
+            List<String> candidates = new ArrayList<>();
+            if (key.startsWith("missing-class ")) {
+                String simple = target.substring(target.lastIndexOf('/') + 1);
+                for (String name : names) {
+                    if (!name.equals(target) && name.endsWith("/" + simple)) {
+                        candidates.add("relocation candidate: " + target.replace('/', '.') + " -> "
+                                + name.replace('/', '.'));
+                    }
+                }
+            } else {
+                int dot = target.indexOf('.');
+                if (dot > 0) {
+                    ClassInfo owner = jvm.info(target.substring(0, dot));
+                    String member = target.substring(dot + 1);
+                    int split = member.indexOf('(');
+                    boolean method = split >= 0;
+                    if (!method) split = member.indexOf(':');
+                    if (owner != null && split >= 0) {
+                        String name = member.substring(0, split);
+                        String descriptor = member.substring(split);
+                        for (String candidate : (method ? owner.methods : owner.fields).keySet()) {
+                            if (method && !name.startsWith("<") && candidate.startsWith("<")) continue;
+                            if (candidate.startsWith(name + (method ? "(" : ":"))
+                                    || candidate.endsWith(descriptor)) {
+                                candidates.add("member candidate (verify semantics): "
+                                        + owner.name + "." + candidate);
+                            }
+                        }
+                    }
+                }
+            }
+            if (candidates.isEmpty()) candidates.add("inspect the selected vanilla ABI; add a relocation or VersionOps adapter");
+            text.append(key).append('\t')
+                    .append(String.join(" | ", candidates.stream().distinct().sorted().limit(8).toList()))
+                    .append('\n');
+        }
+        return text.toString();
     }
 
     private void scan() throws IOException {

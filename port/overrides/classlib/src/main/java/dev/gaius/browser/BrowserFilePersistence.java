@@ -539,6 +539,7 @@ public final class BrowserFilePersistence {
     private static boolean shouldPersist(String path) {
         String normalized = normalize(path);
         return normalized.contains("/saves/")
+                || normalized.startsWith("/gaius/screenshots/")
                 || normalized.startsWith("/gaius/downloads/")
                 || normalized.endsWith("/options.txt")
                 || normalized.endsWith("/servers.dat")
@@ -1068,6 +1069,10 @@ public final class BrowserFilePersistence {
             try {
               var root = globalThis;
               var quality = root.GaiusQuality;
+              if (quality && quality.profile && typeof quality.profile.resolve === 'function') {
+                var settings = quality.profile.resolve();
+                if (settings && settings.memoryTier && settings.memoryTier.lowMemory) return 'low';
+              }
               if (quality && quality.caps && typeof quality.caps.ensureTier === 'function') {
                 var ensured = quality.caps.ensureTier();
                 if (ensured && ensured.tier) return String(ensured.tier);

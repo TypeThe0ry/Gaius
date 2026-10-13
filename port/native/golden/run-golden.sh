@@ -2,13 +2,14 @@
 # Compiles the JVM golden-data harness against a profile's named client jar and
 # dumps the golden fixtures into port/native/fixtures/<profile>/.
 #
-#   run-golden.sh [profile...]           regenerate fixtures (default: 26.3 26.2 1.21.11)
+#   run-golden.sh [profile...]           regenerate fixtures (default: every version profile,
+#                                        port/versions/*.json)
 #   run-golden.sh --verify [profile...]  regenerate into a scratch directory and fail if
 #                                        the result differs from the checked-in fixtures
 #
 # Environment: GAIUS_WORK overrides the directory holding <profile>/client-named.jar
 # and <profile>/classpath.txt (default: port/work of the main checkout).
-# GOLDEN_JAVA_HOME overrides the JDK (default: the Temurin JDK 25 install).
+# GOLDEN_JAVA_HOME overrides the JDK (default: the active Java home).
 # GOLDEN_CLASSPATH_PREFIX (a native class path) goes before the client jar when the harness
 # runs, to dump from rewritten classes; --verify then works in build/verify<GOLDEN_VERIFY_TAG>-<profile>.
 set -euo pipefail
@@ -18,7 +19,7 @@ ROOT="$(cd -- "$HERE/../../.." && pwd)"
 FIXTURES="$ROOT/port/native/fixtures"
 MAX_BYTES=$((2 * 1024 * 1024))
 
-JDK="${GOLDEN_JAVA_HOME:-/c/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot}"
+JDK="${GOLDEN_JAVA_HOME:-${GAIUS_JAVA_HOME:-${JAVA_HOME:-$(dirname -- "$(dirname -- "$(command -v javac)")")}}}"
 JAVAC="$JDK/bin/javac"
 JAVA="$JDK/bin/java"
 
@@ -100,7 +101,10 @@ if [[ "${1:-}" == "--verify" ]]; then
     shift
 fi
 profiles=("$@")
-(( ${#profiles[@]} > 0 )) || profiles=(26.3 26.2 1.21.11)
+if (( ${#profiles[@]} == 0 )); then
+    mapfile -t profiles < <(jq -r '.id' "$ROOT"/port/versions/*.json | tr -d '\r')
+    (( ${#profiles[@]} > 0 )) || die "no version profiles under $ROOT/port/versions"
+fi
 
 for profile in "${profiles[@]}"; do
     if (( verify )); then

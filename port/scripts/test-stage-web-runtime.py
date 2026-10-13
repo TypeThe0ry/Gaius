@@ -15,6 +15,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parents[1]
@@ -48,6 +49,23 @@ def boot_list(name: str) -> list[str]:
 
 
 class WebRuntimeDistributionTest(unittest.TestCase):
+    def test_png_is_wasmgc_only_and_optional(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gaius-stage-png-") as temporary:
+            directory = Path(temporary)
+            module = directory / "png.wasm"
+            module.write_bytes(b"\0asm\1\0\0\0")
+            wasm_dist = directory / "wasm"
+            staged = STAGE.stage(wasm_dist, None, True, png=module)
+            self.assertIn("png-kernel.js", staged)
+            self.assertIn("gaius-png.wasm", staged)
+            self.assertEqual((wasm_dist / "gaius-png.wasm").read_bytes(), module.read_bytes())
+            js_dist = directory / "js"
+            staged = STAGE.stage(js_dist, None, False)
+            self.assertNotIn("png-kernel.js", staged)
+            self.assertFalse((js_dist / "gaius-png.wasm").exists())
+            with self.assertRaises(ValueError):
+                STAGE.stage(js_dist, None, False, png=module)
+
     def test_boot_lists_name_real_files(self) -> None:
         for name in ("KERNEL_RUNTIME_SCRIPTS", "QUALITY_SCRIPTS", "SERVER_KERNEL_SCRIPTS"):
             for script in boot_list(name):
@@ -68,6 +86,50 @@ class WebRuntimeDistributionTest(unittest.TestCase):
 
     def test_site_ships_the_quality_layer_in_boot_order(self) -> None:
         self.assertEqual([f"runtime/quality/{name}" for name in SITE.QUALITY_MODULES], boot_list("QUALITY_SCRIPTS"))
+
+    def test_webgpu_files_reach_every_form(self) -> None:
+        scripts = boot_list("WEBGPU_SCRIPTS")
+        translator = re.search(r'const WEBGPU_TRANSLATOR = "([^"]+)";', BOOT)
+        self.assertIsNotNone(translator, "gaius-boot.js has no WEBGPU_TRANSLATOR")
+        self.assertEqual(list(STAGE.WEBGPU_MODULES), scripts)
+        self.assertEqual(list(PORTABLE.WEBGPU_MODULES), scripts)
+        self.assertEqual([f"runtime/webgpu/{name}" for name in SITE.WEBGPU_MODULES], scripts)
+        self.assertEqual(STAGE.WEBGPU_TRANSLATOR, translator.group(1))
+        self.assertEqual(PORTABLE.WEBGPU_TRANSLATOR, translator.group(1))
+        self.assertEqual(f"runtime/webgpu/{SITE.WEBGPU_TRANSLATOR}", translator.group(1))
+        for name, source in STAGE.WEBGPU_MODULES.items():
+            self.assertTrue(source.is_file(), f"{name} has no source {source}")
+            self.assertEqual(ROOT / PORTABLE.WEBGPU_MODULES[name], source)
+        inline, hashes = PORTABLE.runtime_bootstrap(ROOT)
+        for name in scripts:
+            self.assertIn(f'<script data-gaius-boot-module="{name}">', inline)
+            self.assertIn(name, hashes)
+        with tempfile.TemporaryDirectory(prefix="gaius-stage-webgpu-") as temporary:
+            directory = Path(temporary)
+            module = directory / "translator.wasm"
+            module.write_bytes(bytes([0, 0x61, 0x73, 0x6D, 1, 0, 0, 0]))
+            dist = directory / "dist"
+            staged = STAGE.stage_webgpu(dist, module)
+            self.assertEqual(staged, scripts + [STAGE.WEBGPU_TRANSLATOR])
+            self.assertEqual((dist / STAGE.WEBGPU_TRANSLATOR).read_bytes(), module.read_bytes())
+
+    def test_mirror_policy_survives_staging_and_portable_embedding(self) -> None:
+        table = {"schemaVersion": 1, "profile": "reviewed-profile", "kernels": {
+            "noise": {"enabled": True}, "mesher": {"enabled": False}, "light": {"enabled": False}}}
+        with tempfile.TemporaryDirectory(prefix="gaius-stage-mirror-") as temporary:
+            dist = Path(temporary)
+            with patch.object(STAGE.subprocess, "check_output", return_value=json.dumps(table)) as invoke:
+                staged = STAGE.stage(dist, None, wasm=False, profile=table["profile"])
+            self.assertEqual(invoke.call_args.args[0][-3:], ["table", "--profile", table["profile"]])
+            self.assertIn("kernels/kernel-semantics.json", staged)
+            self.assertEqual(json.loads((dist / "kernels/kernel-semantics.json").read_text()), table)
+            script = (dist / "kernels/kernel-mirror.js").read_text()
+            self.assertTrue(script.startswith("globalThis.__gaiusKernelSemantics = "))
+            self.assertIn('"enabled": false', script)
+            self.assertTrue(script.endswith((WEB / "kernels/kernel-mirror.js").read_text()))
+            inline, hashes = PORTABLE.runtime_bootstrap(ROOT, dist=dist)
+            self.assertIn(script, inline)
+            self.assertIn("kernels/kernel-mirror.js", hashes)
 
     def test_stage_copies_runtime_and_kernels(self) -> None:
         with tempfile.TemporaryDirectory(prefix="gaius-stage-") as temporary:

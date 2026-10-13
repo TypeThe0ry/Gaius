@@ -9,6 +9,12 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# run_shader_link, the GLSL front-end of the blaze3d profiles (26.2, 1.21.11): about 50 KB raw,
+# 12 KB brotli of the module. A 26.3-only build can leave it out (--no-default-features).
+default = ["link"]
+link = []
+
 [dependencies]
 gaius-kernel-abi = { path = "../../gaius-kernel-abi" }
 gaius-shaderxlat = { path = ".." }

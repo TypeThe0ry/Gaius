@@ -2,16 +2,20 @@ package org.teavm.classlib.java.util.concurrent;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import dev.gaius.browser.HostLoop;
+import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 
 public class TCompletableFuture<T> implements TFuture<T>, TCompletionStage<T> {
     private static final TExecutor DIRECT_EXECUTOR = command -> command.run();
 
     private final List<Runnable> listeners = new ArrayList<>();
+    private final List<Thread> waiters = new ArrayList<>();
     private boolean done;
     private boolean cancelled;
     private T value;
@@ -146,6 +150,11 @@ public class TCompletableFuture<T> implements TFuture<T>, TCompletionStage<T> {
 
     @Override
     public T get(long timeout, TTimeUnit unit) throws TExecutionException, TTimeoutException {
+        if (!done && HostLoop.isWasmGc()) {
+            long timeoutMillis = unit.toMillis(timeout);
+            long deadline = System.currentTimeMillis() + Math.max(0L, timeoutMillis);
+            awaitDone(deadline);
+        }
         if (!done) {
             throw new TTimeoutException("future is not complete");
         }
@@ -499,7 +508,15 @@ public class TCompletableFuture<T> implements TFuture<T>, TCompletionStage<T> {
     }
 
     private void finish() {
-        done = true;
+        List<Thread> pendingWaiters;
+        synchronized (this) {
+            done = true;
+            pendingWaiters = new ArrayList<>(waiters);
+            waiters.clear();
+        }
+        for (Thread waiter : pendingWaiters) {
+            LockSupport.unpark(waiter);
+        }
         List<Runnable> pending = new ArrayList<>(listeners);
         listeners.clear();
         for (Runnable listener : pending) {
@@ -517,7 +534,35 @@ public class TCompletableFuture<T> implements TFuture<T>, TCompletionStage<T> {
 
     private void ensureDone() {
         if (!done) {
-            throw new IllegalStateException("blocking on an incomplete future is unavailable");
+            if (!HostLoop.isWasmGc()) {
+                throw new IllegalStateException("blocking on an incomplete future is unavailable");
+            }
+            synchronized (this) {
+                if (!done) {
+                    waiters.add(Thread.currentThread());
+                }
+            }
+            while (!done) {
+                LockSupport.park(this);
+            }
+        }
+    }
+
+    private void awaitDone(long deadline) {
+        synchronized (this) {
+            if (!done) {
+                waiters.add(Thread.currentThread());
+            }
+        }
+        while (!done) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                synchronized (this) {
+                    waiters.remove(Thread.currentThread());
+                }
+                return;
+            }
+            LockSupport.parkNanos(this, remaining * 1_000_000L);
         }
     }
 

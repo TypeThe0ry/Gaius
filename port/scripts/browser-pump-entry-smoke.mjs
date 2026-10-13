@@ -2,20 +2,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { memberText, patcherSource } from "./patcher-sources.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const patcherPath = path.join(
-  repository,
-  "port",
-  "tools",
-  "src",
-  "main",
-  "java",
-  "dev",
-  "gaius",
-  "tools",
-  "MinecraftClientPatcher.java",
-);
 const networkPath = path.join(
   repository,
   "port",
@@ -28,7 +17,8 @@ const networkPath = path.join(
   "BrowserClientNetwork.java",
 );
 
-const patcher = fs.readFileSync(patcherPath, "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = patcherSource("MinecraftClientPatcher");
 const network = fs.readFileSync(networkPath, "utf8");
 
 function block(source, startMarker, endMarker) {
@@ -38,11 +28,8 @@ function block(source, startMarker, endMarker) {
   return source.slice(start, end);
 }
 
-const connectionPatch = block(
-  patcher,
-  "private static void patchConnectionBrowserWebSocket",
-  "private static void patchGlx",
-);
+const connectionPatch = memberText(patcher, "patchConnectionBrowserWebSocket");
+assert.ok(connectionPatch, "missing block: patchConnectionBrowserWebSocket");
 assert.doesNotMatch(
   connectionPatch,
   /io\/netty\/channel\/browser\/BrowserWebSocketChannel[\s\S]*pumpAll/,
@@ -59,11 +46,8 @@ assert.match(
   "Connection WebSocket connect replacement must remain installed",
 );
 
-const helper = block(
-  patcher,
-  "private static MethodInsnNode pumpBrowserChannels()",
-  "private static InsnList minecraftStateReport",
-);
+const helper = memberText(patcher, "pumpBrowserChannels");
+assert.ok(helper, "missing block: pumpBrowserChannels");
 assert.match(helper, /dev\/gaius\/browser\/BrowserClientNetwork/);
 assert.match(helper, /pumpBrowserChannelsAtFrameBoundary/);
 assert.doesNotMatch(helper, /io\/netty\/channel\/browser\/BrowserWebSocketChannel/);
@@ -100,7 +84,7 @@ assert.match(asyncPump, /continuationHint\s*&&\s*BrowserWebSocketChannel\.hasPum
 const runTickHook = block(
   patcher,
   'method.name.equals("runTick") && method.desc.equals("(Z)V")',
-  "private static MethodInsnNode pumpBrowserChannels()",
+  '} else if (method.name.equals("debugClientMetricsStart")',
 );
 assert.match(runTickHook, /MethodInsnNode pumpClientChannels = pumpBrowserChannels\(\)/);
 assert.match(runTickHook, /beginClientPacketFrame/);

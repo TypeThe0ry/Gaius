@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
@@ -89,8 +90,8 @@ const helperSource = join(repositoryRoot, "port", "src", "main", "java", "dev", 
 const fixtureSource = join(repositoryRoot, "port", "scripts", "fixtures", "BrowserZipResourcePatcherFixture.java");
 const patcherSource = join(toolsSource, "dev", "gaius", "tools", "MinecraftClientPatcher.java");
 const profiles = [
-  {id: "26.2", jar: join(repositoryRoot, "port", "work", "26.2", "client-named.jar"), cpFile: join(repositoryRoot, "port", "work", "26.2", "classpath.txt")},
-  {id: "1.21.11", jar: join(repositoryRoot, "port", "work", "1.21.11", "client-named.jar"), cpFile: join(repositoryRoot, "port", "work", "1.21.11", "classpath.txt")},
+  {id: CANONICAL_PROFILE.id, jar: join(repositoryRoot, "port", "work", CANONICAL_PROFILE.id, "client-named.jar"), cpFile: join(repositoryRoot, "port", "work", CANONICAL_PROFILE.id, "classpath.txt")},
+  {id: LEGACY_PROFILE.id, jar: join(repositoryRoot, "port", "work", LEGACY_PROFILE.id, "client-named.jar"), cpFile: join(repositoryRoot, "port", "work", LEGACY_PROFILE.id, "classpath.txt")},
 ];
 const profileFromPath = (value) => String(value).replaceAll("\\", "/").split("/").pop()?.replace(/\.json$/, "");
 const requestedProfile = process.env.GAIUS_MINECRAFT_VERSION

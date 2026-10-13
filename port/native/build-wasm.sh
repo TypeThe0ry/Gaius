@@ -11,8 +11,9 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=wasm32-unknown-unknown
-OUT="$HERE/target/$TARGET/release"
-BASELINE_OUT="$HERE/target/wasm-baseline/$TARGET/release"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$HERE/target}"
+OUT="$TARGET_ROOT/$TARGET/release"
+BASELINE_OUT="$TARGET_ROOT/wasm-baseline/$TARGET/release"
 # crate name : run_<kind> exports it must provide (the first one runs the probe jobs) : probe
 # example (named per crate, since cargo examples share one output directory)
 KERNELS=(
@@ -42,10 +43,10 @@ packages=()
 for entry in "${KERNELS[@]}"; do
     packages+=(-p "${entry%%:*}")
 done
-cargo build --release --locked --target "$TARGET" "${packages[@]//_/-}"
+cargo build --release --offline --locked --target "$TARGET" "${packages[@]//_/-}"
 # The baseline build for engines without SIMD gets its own target directory.
-CARGO_TARGET_DIR="$HERE/target/wasm-baseline" CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=-simd128" \
-    cargo build --release --locked --target "$TARGET" "${packages[@]//_/-}"
+CARGO_TARGET_DIR="$TARGET_ROOT/wasm-baseline" CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=-simd128" \
+    cargo build --release --offline --locked --target "$TARGET" "${packages[@]//_/-}"
 
 for entry in "${KERNELS[@]}"; do
     for dir in "$OUT" "$BASELINE_OUT"; do
@@ -59,11 +60,11 @@ if (( check )); then
     command -v node > /dev/null || die "node not found (needed for --check)"
     for entry in "${KERNELS[@]}"; do
         crate="${entry%%:*}"
-        probe="$HERE/target/wasm-probe/$crate"
+        probe="$TARGET_ROOT/wasm-probe/$crate"
         rm -rf "$probe"
         rest="${entry#*:}"
         example="${rest##*:}"
-        cargo run --quiet --locked -p "${crate//_/-}" --example "$example" -- "$probe"
+        cargo run --quiet --offline --locked -p "${crate//_/-}" --example "$example" -- "$probe"
         IFS=',' read -r -a exports <<< "${rest%%:*}"
         for dir in "$OUT" "$BASELINE_OUT"; do
             node "$HERE/wasm-check.mjs" "$dir/$crate.wasm" "$probe" "${exports[@]}"

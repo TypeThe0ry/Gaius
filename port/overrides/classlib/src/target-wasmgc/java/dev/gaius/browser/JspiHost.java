@@ -11,11 +11,11 @@ import org.teavm.jso.core.JSString;
  * Host imports of the WebAssembly GC JSPI mode ({@code gaius.teavm.jspi}).
  *
  * <p>Every Java thread is one {@code WebAssembly.promising} activation of the
- * {@code gaius.jspi.run} export. {@link #park} and {@link #yieldNow} are installed as
- * {@code new WebAssembly.Suspending(fn)}, so a call suspends the whole wasm stack of the
- * calling activation (no coroutine transformation is involved) and the host resumes it from
- * its run queue. The other imports are plain calls. Handles are small integers that the
- * class library allocates per thread; 0 is the main thread.
+ * {@code gaius.jspi.run} export. {@link #park}, {@link #yieldNow} and {@link #frame} are
+ * installed as {@code new WebAssembly.Suspending(fn)}, so a call suspends the whole wasm
+ * stack of the calling activation (no coroutine transformation is involved) and the host
+ * resumes it from its run queue. The other imports are plain calls. Handles are small
+ * integers that the class library allocates per thread; 0 is the main thread.
  *
  * <p>Only numbers cross this boundary. A suspending import must be called from wasm code
  * whose stack reaches a promising entry without a JS frame in between: from a JS callback
@@ -25,7 +25,8 @@ import org.teavm.jso.core.JSString;
  * also when the callback runs synchronously inside an activation.
  */
 public final class JspiHost {
-    private static final Object INIT = new Object();
+    // No field with an initializer: JspiHost has no class initializer, so calls from the class
+    // initialization guards (TJspiThreadSupport.clinitEnter/clinitExit) request none.
     private static Threads threads;
 
     private JspiHost() {
@@ -45,6 +46,8 @@ public final class JspiHost {
         AsyncCallback<Object> newResult();
 
         Object awaitResult(AsyncCallback<Object> result);
+
+        void awaitFrame(int interval);
     }
 
     /** Called once by the class library when its JSPI support initializes. */
@@ -81,6 +84,15 @@ public final class JspiHost {
         return services().awaitResult(result);
     }
 
+    /**
+     * Suspends the current thread until the browser is ready for the next frame (the frame
+     * boundary of HostLoop.awaitAnimationFrame): {@code interval} is the swap interval of the
+     * last present, 0 for uncapped. Returns at once in a JS callback.
+     */
+    public static void awaitFrame(int interval) {
+        services().awaitFrame(interval);
+    }
+
     private static Threads services() {
         Threads services = threads;
         if (services == null) {
@@ -95,8 +107,9 @@ public final class JspiHost {
 
     /** Any patched monitor entry initializes java.lang.JspiThreadSupport, which calls install. */
     private static void initializeSupport() {
-        synchronized (INIT) {
-            INIT.notifyAll();
+        Object lock = new Object();
+        synchronized (lock) {
+            lock.notifyAll();
         }
     }
 
@@ -127,9 +140,39 @@ public final class JspiHost {
      * Lets the other runnable activations run first. Returns at once, without suspending,
      * when the run queue is empty and the current slice of the host's run queue is not over;
      * after a slice the thread suspends even with an empty queue, so the browser gets a turn.
+     * Returns 1 when the thread suspended, 0 when it did not.
      */
     @Import(module = "gaiusJspi", name = "yield")
     public static native int yieldNow(int handle);
+
+    /**
+     * Suspends the activation of {@code handle} until the browser is ready for the next frame,
+     * a suspending import like {@link #park}. gaius-jspi.js (awaitFrame) decides from
+     * {@code interval} and the page: after the next animation frame when the last present was
+     * synchronized to the display or the game shows a menu, after one macrotask for uncapped
+     * presents in a world, after 50 ms while the page is hidden.
+     */
+    @Import(module = "gaiusJspi", name = "awaitFrame")
+    public static native int frame(int handle, int interval);
+
+    /** {@link #clinitEvent}: an activation suspended with a class initializer on its stack. */
+    public static final int CLINIT_SUSPEND = 0;
+    /** {@link #clinitEvent}: an activation waited for a class that another one initializes. */
+    public static final int CLINIT_WAIT = 1;
+    /**
+     * {@link #clinitEvent}: a JS callback into Java reached a class that an activation
+     * initializes; it cannot wait and sees the class half-initialized.
+     */
+    public static final int CLINIT_UNWAITABLE = 2;
+
+    /**
+     * Counts a class-initialization event in the run-queue telemetry: the gaius-jspi.js
+     * scheduler stats clinitSuspend, clinitWait and clinitUnwaitable, and
+     * globalThis.__gaiusClinitSuspensions for CLINIT_SUSPEND, the counter of the JavaScript
+     * build (patched thread.js) that the acceptance reports read.
+     */
+    @Import(module = "gaiusJspi", name = "clinitEvent")
+    public static native void clinitEvent(int kind);
 
     /** Queues a new activation that runs the thread of {@code handle}. */
     @Import(module = "gaiusJspi", name = "start")
@@ -153,4 +196,8 @@ public final class JspiHost {
      */
     @Import(module = "gaiusJspi", name = "callbackDepth")
     public static native int callbackDepth();
+
+    /** Name of the synchronous JS callback currently calling into Java, when known. */
+    @Import(module = "gaiusJspi", name = "callbackName")
+    public static native String callbackName();
 }

@@ -1,3 +1,4 @@
+import dev.gaius.tools.VersionProfile;
 import java.util.zip.ZipFile;
 import java.util.ArrayList;
 import java.util.List;
@@ -456,7 +457,8 @@ public final class GaiusChunkLayerBytecodeVerifier {
         }
         require(handlerActiveCleared && handlerYieldCleared && rethrowsSame,
                 "scheduleLayer Throwable cleanup/rethrow changed");
-        if (profile.equals("26.2")) {
+        if (VersionProfile.forId(profile).modernPatchSet()
+                && !VersionProfile.forId(profile).renderpearl()) {
             verifySuccessfulHolderPulsePaths(layer, node.name);
             System.out.println("PROFILE_CFG_OK " + profile + " " + node.name);
         }
@@ -768,7 +770,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
                 verifyLayerBarrierCfg(node, profile);
             }
         }
-        if (profile.equals("1.21.11")) {
+        if (VersionProfile.forId(profile).legacyPatchSet()) {
             verifyNoBrowserWorldgenSchedulerCalls(node, profile);
         }
         System.out.println("BASIC_VERIFIER_OK " + name);
@@ -779,18 +781,18 @@ public final class GaiusChunkLayerBytecodeVerifier {
      * (identical target bytecode), so both are checked against the modern layer-barrier CFG.
      */
     private static boolean isModernProfile(String profile) {
-        return profile.equals("26.2") || profile.equals("26.3");
+        return VersionProfile.forId(profile).modernPatchSet();
     }
 
     public static void main(String[] args) throws Exception {
         require(args.length == 2,
-                "usage: GaiusChunkLayerBytecodeVerifier <client.jar> <1.21.11|26.2|26.3>");
+                "usage: GaiusChunkLayerBytecodeVerifier <client.jar> <profile-id>");
         String profile = args[1];
-        require(profile.equals("1.21.11") || isModernProfile(profile),
+        require(VersionProfile.forId(profile).legacyPatchSet() || isModernProfile(profile),
                 "unsupported Minecraft profile: " + profile);
         try (ZipFile jar = new ZipFile(args[0])) {
             verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class", profile);
-            if (profile.equals("1.21.11")) {
+            if (VersionProfile.forId(profile).legacyPatchSet()) {
                 verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class", profile);
             } else {
                 require(jar.getEntry("dev/gaius/browser/BrowserChunkGenerationYield.class") != null,

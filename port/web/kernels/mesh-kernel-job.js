@@ -109,6 +109,7 @@
   }
 
   function ready() {
+    if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled(KERNEL)) return false;
     if (disabledReason || readSwitch()) return false;
     const codec = global.GaiusMeshJob;
     if (!codec || !codec.enabled()) return false;
@@ -131,6 +132,7 @@
   }
 
   function setTable(bytes, length, epoch) {
+    if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled(KERNEL)) return false;
     const codec = global.GaiusMeshJob;
     if (!codec) return false;
     const count = length >>> 0;

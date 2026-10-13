@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "comment": "When the frozen JavaScript fallback of a release must be rebuilt (build-release-matrix.sh). A trigger fires when a listed profile field differs from the frozen build's sidecar, or when a listed path changed between the commit the frozen build came from and the tree being released. security never fires by itself: name it with --js-trigger security.",
+  "triggers": {
+    "storage": {
+      "profileFields": ["storage"],
+      "paths": [
+        "port/overrides/classlib/src/main/java/dev/gaius/browser/BrowserFilePersistence.java",
+        "port/web/singleplayer/server-worker-bootstrap.js"
+      ]
+    },
+    "save": {
+      "profileFields": ["worldVersion"],
+      "paths": [
+        "port/overrides/classlib/src/main/java/dev/gaius/browser/BrowserFilePersistence.java"
+      ]
+    },
+    "relay": {
+      "profileFields": [],
+      "paths": [
+        "port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser"
+      ]
+    },
+    "worker": {
+      "comment": "One singleplayer Worker bootstrap serves both server runtimes of a site (build-pages-site.py), so the frozen JavaScript server must speak the current page/Worker protocol.",
+      "profileFields": [],
+      "paths": [
+        "port/web/singleplayer/server-worker-bootstrap.js",
+        "port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java",
+        "port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java"
+      ]
+    },
+    "security": {
+      "profileFields": [],
+      "paths": []
+    }
+  }
+}

@@ -1,12 +1,15 @@
 //! Bit-exact parity against the golden fixtures dumped from the real client
 //! jars (`port/native/fixtures/<profile>/*.jsonl`, written by
-//! `port/native/golden/run-golden.sh`).
+//! `port/native/golden/run-golden.sh`). Every version profile of
+//! `port/versions/*.json` must have fixtures; each is evaluated with the
+//! profile's declared kernel semantics.
 //!
 //! `GAIUS_FIXTURES` overrides the fixture directory.
 
 mod support;
 
-use gaius_noise::Profile;
+use gaius_noise::semantics::profiles;
+use gaius_noise::Semantics;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,10 +40,10 @@ fn fixtures_dir() -> PathBuf {
     }
 }
 
-fn fixture_files(root: &Path) -> Vec<(Profile, PathBuf)> {
+fn fixture_files(root: &Path) -> Vec<(&'static str, Semantics, PathBuf)> {
     let mut files = Vec::new();
-    for profile in Profile::ALL {
-        let Ok(entries) = fs::read_dir(root.join(profile.name())) else {
+    for (profile, semantics) in profiles() {
+        let Ok(entries) = fs::read_dir(root.join(profile)) else {
             continue;
         };
         let mut paths: Vec<PathBuf> = entries
@@ -48,7 +51,7 @@ fn fixture_files(root: &Path) -> Vec<(Profile, PathBuf)> {
             .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
             .collect();
         paths.sort();
-        files.extend(paths.into_iter().map(|path| (profile, path)));
+        files.extend(paths.into_iter().map(|path| (profile, semantics, path)));
     }
     files
 }
@@ -84,12 +87,11 @@ fn golden_fixtures_match_bit_for_bit() {
         "no golden fixtures under {} (expected <profile>/*.jsonl for {:?}); generate them with \
          port/native/golden/run-golden.sh",
         root.display(),
-        Profile::ALL.map(Profile::name),
+        profiles().map(|(profile, _)| profile).collect::<Vec<_>>(),
     );
-    let missing: Vec<&str> = Profile::ALL
-        .into_iter()
-        .filter(|profile| !files.iter().any(|(p, _)| p == profile))
-        .map(Profile::name)
+    let missing: Vec<&str> = profiles()
+        .map(|(profile, _)| profile)
+        .filter(|profile| !files.iter().any(|(p, _, _)| p == profile))
         .collect();
     assert!(
         missing.is_empty(),
@@ -97,15 +99,14 @@ fn golden_fixtures_match_bit_for_bit() {
         root.display(),
     );
 
-    let absent: Vec<String> = Profile::ALL
-        .into_iter()
-        .flat_map(|profile| KINDS.map(move |kind| (profile, kind)))
+    let absent: Vec<String> = profiles()
+        .flat_map(|(profile, _)| KINDS.map(move |kind| (profile, kind)))
         .filter(|(profile, kind)| {
             !files
                 .iter()
-                .any(|(p, path)| p == profile && path.file_stem().unwrap() == *kind)
+                .any(|(p, _, path)| p == profile && path.file_stem().unwrap() == *kind)
         })
-        .map(|(profile, kind)| format!("{}/{kind}.jsonl", profile.name()))
+        .map(|(profile, kind)| format!("{profile}/{kind}.jsonl"))
         .collect();
     assert!(
         absent.is_empty(),
@@ -115,9 +116,9 @@ fn golden_fixtures_match_bit_for_bit() {
 
     let mut report = String::new();
     let (mut total_cases, mut total_outputs, mut failed_cases) = (0usize, 0usize, 0usize);
-    for (profile, path) in &files {
+    for (profile, semantics, path) in &files {
         let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let label = format!("{}/{}", profile.name(), path.file_name().unwrap().to_string_lossy());
+        let label = format!("{profile}/{}", path.file_name().unwrap().to_string_lossy());
         let mut cases = Vec::new();
         for (number, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
             match Case::parse(line) {
@@ -142,7 +143,7 @@ fn golden_fixtures_match_bit_for_bit() {
         for (line, case) in &cases {
             total_cases += 1;
             total_outputs += case.outputs.len();
-            let problem = match support::evaluate(*profile, case) {
+            let problem = match support::evaluate(*semantics, case) {
                 Ok(actual) if actual == case.outputs => None,
                 Ok(actual) => Some(describe_mismatch(case, &case.outputs, &actual)),
                 Err(error) => Some(error),

@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
 import path from "node:path";
+import {patcherSource} from "./patcher-sources.mjs";
 
 const scheduler = await readFile(new URL(
   "../src/main/java/dev/gaius/browser/BrowserPacketScheduler.java",
   import.meta.url,
 ), "utf8");
-const patcher = await readFile(new URL(
-  "../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
-  import.meta.url,
-), "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = patcherSource("MinecraftClientPatcher");
 
 const shouldStart = scheduler.indexOf("public static boolean shouldProcessNext()");
 const shouldEnd = [
@@ -117,11 +117,11 @@ const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
 const profileId = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
-    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
+    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : CANONICAL_PROFILE.id));
 // PacketProcessor and patchPacketProcessorBrowserSlice are identical for 26.2 and 26.3
 // (the 26.3 class is byte-identical modulo the constant pool); 1.21.11 is not covered.
-if (!["26.2", "26.3"].includes(profileId)) {
-  throw new Error(`PacketProcessor accounting smoke covers 26.2 and 26.3; got profile ${profileId}`);
+if (![CANONICAL_PROFILE.id, RENDERPEARL_PROFILE.id].includes(profileId)) {
+  throw new Error(`PacketProcessor accounting smoke covers ${CANONICAL_PROFILE.id} and ${RENDERPEARL_PROFILE.id}; got profile ${profileId}`);
 }
 const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY ||
   `${repository}/port/work/overlays/${profileId}`);

@@ -26,7 +26,10 @@ pub mod op {
     pub const EXT_INST_IMPORT: u16 = 11;
     pub const EXT_INST: u16 = 12;
     pub const ENTRY_POINT: u16 = 15;
+    pub const TYPE_VOID: u16 = 19;
+    pub const TYPE_BOOL: u16 = 20;
     pub const TYPE_INT: u16 = 21;
+    pub const TYPE_FLOAT: u16 = 22;
     pub const TYPE_VECTOR: u16 = 23;
     pub const TYPE_IMAGE: u16 = 25;
     pub const TYPE_SAMPLER: u16 = 26;
@@ -49,13 +52,19 @@ pub mod op {
     pub const DECORATE: u16 = 71;
     pub const MEMBER_DECORATE: u16 = 72;
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
+    pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const COMPOSITE_INSERT: u16 = 82;
     pub const SAMPLED_IMAGE: u16 = 86;
     pub const IMAGE_FETCH: u16 = 95;
     pub const IMAGE: u16 = 100;
     pub const IMAGE_QUERY_SIZE: u16 = 104;
+    pub const CONVERT_S_TO_F: u16 = 111;
+    pub const CONVERT_U_TO_F: u16 = 112;
     pub const BITCAST: u16 = 124;
     pub const I_ADD: u16 = 128;
+    pub const F_ADD: u16 = 129;
     pub const I_MUL: u16 = 132;
+    pub const F_MUL: u16 = 133;
     pub const SHIFT_RIGHT_LOGICAL: u16 = 194;
     pub const SHIFT_RIGHT_ARITHMETIC: u16 = 195;
     pub const SHIFT_LEFT_LOGICAL: u16 = 196;
@@ -69,6 +78,8 @@ pub mod op {
 
 pub mod storage {
     pub const UNIFORM_CONSTANT: u32 = 0;
+    pub const INPUT: u32 = 1;
+    pub const UNIFORM: u32 = 2;
     pub const OUTPUT: u32 = 3;
     pub const PRIVATE: u32 = 6;
     pub const STORAGE_BUFFER: u32 = 12;
@@ -77,6 +88,7 @@ pub mod storage {
 pub mod decoration {
     pub const BLOCK: u32 = 2;
     pub const ARRAY_STRIDE: u32 = 6;
+    pub const BUILT_IN: u32 = 11;
     pub const NON_WRITABLE: u32 = 24;
     pub const LOCATION: u32 = 30;
     pub const BINDING: u32 = 33;
@@ -84,8 +96,13 @@ pub mod decoration {
     pub const OFFSET: u32 = 35;
 }
 
+/// Image dimensionalities (`OpTypeImage` operand 2).
+pub const DIM_2D: u32 = 1;
+pub const DIM_CUBE: u32 = 3;
 /// Image dimensionality `Buffer` (texel buffers).
 pub const DIM_BUFFER: u32 = 5;
+/// `BuiltIn Position`.
+pub const BUILT_IN_POSITION: u32 = 0;
 
 /// One instruction: its opcode and every word after the first.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,7 +120,10 @@ impl Inst {
     pub fn result_id(&self) -> Option<u32> {
         match self.op {
             op::EXT_INST_IMPORT
+            | op::TYPE_VOID
+            | op::TYPE_BOOL
             | op::TYPE_INT
+            | op::TYPE_FLOAT
             | op::TYPE_VECTOR
             | op::TYPE_IMAGE
             | op::TYPE_SAMPLER
@@ -126,7 +146,14 @@ impl Inst {
             | op::SAMPLED_IMAGE
             | op::IMAGE_FETCH
             | op::IMAGE
-            | op::IMAGE_QUERY_SIZE => self.ops.get(1).copied(),
+            | op::IMAGE_QUERY_SIZE
+            | op::COMPOSITE_EXTRACT
+            | op::COMPOSITE_INSERT
+            | op::CONVERT_S_TO_F
+            | op::CONVERT_U_TO_F
+            | op::BITCAST
+            | op::F_ADD
+            | op::F_MUL => self.ops.get(1).copied(),
             _ => None,
         }
     }
@@ -253,6 +280,16 @@ impl Module {
         id
     }
 
+    /// `OpTypeFloat width`, declared if missing.
+    pub fn type_float(&mut self, width: u32) -> u32 {
+        if let Some(i) = self.find(op::TYPE_FLOAT, |i| i.ops[1] == width) {
+            return self.insts[i].ops[0];
+        }
+        let id = self.fresh_id();
+        self.append_globals([Inst::new(op::TYPE_FLOAT, vec![id, width])]);
+        id
+    }
+
     pub fn type_sampler(&mut self) -> u32 {
         if let Some(i) = self.find(op::TYPE_SAMPLER, |_| true) {
             return self.insts[i].ops[0];
@@ -285,6 +322,13 @@ impl Module {
             .iter()
             .find(|i| i.op == op::CONSTANT && i.ops.get(1) == Some(&id))
             .and_then(|i| i.ops.get(2).copied())
+    }
+
+    /// The `OpMemberDecorate` instructions on struct `target`.
+    pub fn member_decorations(&self, target: u32) -> impl Iterator<Item = &Inst> {
+        self.insts
+            .iter()
+            .filter(move |i| i.op == op::MEMBER_DECORATE && i.ops[0] == target)
     }
 
     pub fn decorations(&self, target: u32) -> impl Iterator<Item = &Inst> {
@@ -332,6 +376,30 @@ impl Module {
             .iter()
             .find(|i| i.op == op::NAME && i.ops[0] == target)
             .map(|i| decode_string(&i.ops[1..]))
+    }
+
+    /// Removes `id` from the interface of every entry point.
+    pub fn remove_from_interface(&mut self, id: u32) {
+        for inst in self.insts.iter_mut().filter(|i| i.op == op::ENTRY_POINT) {
+            let start = interface_start(&inst.ops);
+            let mut at = start;
+            while at < inst.ops.len() {
+                if inst.ops[at] == id {
+                    inst.ops.remove(at);
+                } else {
+                    at += 1;
+                }
+            }
+        }
+    }
+
+    /// The interface ids of the single entry point (empty without one).
+    pub fn interface(&self) -> Vec<u32> {
+        self.insts
+            .iter()
+            .find(|i| i.op == op::ENTRY_POINT)
+            .map(|i| i.ops[interface_start(&i.ops)..].to_vec())
+            .unwrap_or_default()
     }
 
     /// Appends `ids` to the interface of every entry point that lists `like`.

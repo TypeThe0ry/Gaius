@@ -9,19 +9,25 @@
 //! Pipeline:
 //! 1. SPIR-V patches ([`passes`]): strip debug info, drop `gl_PointSize`
 //!    writes, texel buffers to storage buffers, split combined image samplers,
-//!    split output arrays;
-//! 2. naga's SPIR-V reader (clip space unchanged unless
-//!    [`Options::flip_vertex_y`]; the depth range already matches through
-//!    `RENDERPEARL_DEPTH_IS_ZERO_TO_ONE`);
-//! 3. the WebGPU binding layout ([`wgsl_binding`]);
+//!    split output arrays, and with [`Options::gl_depth_remap`] map GL's depth
+//!    range at the vertex output (1.21.11; 26.2 and 26.3 already target 0..w);
+//! 2. naga's SPIR-V reader ([`Options::flip_vertex_y`] negates the vertex
+//!    position's y);
+//! 3. the WebGPU binding layout ([`BindingLayout`]);
 //! 4. naga validation and the WGSL writer.
 //!
-//! The WGSL binding layout is a pure function of the vanilla uniform index,
-//! so both stages of a pipeline agree without seeing each other: group 0,
-//! binding `2 * index` for the uniform buffer, texture or storage buffer of
-//! uniform `index`, `2 * index + 1` for the sampler of a combined image
-//! sampler.
+//! The WGSL binding layout is a pure function of the vanilla uniform index
+//! and the kind of resource, so both stages of a pipeline agree without
+//! seeing each other. The default [`BindingLayout::Split`] puts uniform
+//! buffer `i` at `@group(0) @binding(i)` (bound with a dynamic offset) and
+//! texture or texel buffer `i` at `@group(1) @binding(2i)`, its split-off
+//! sampler at `@group(1) @binding(2i + 1)`.
+//!
+//! The 26.2 and 1.21.11 backends receive GLSL instead of bound SPIR-V: their
+//! shaderc output goes through [`frontend::link`] first (vanilla 26.2
+//! reflection and rebind, plus the GL compatibility passes of 1.21.11).
 
+pub mod frontend;
 pub mod passes;
 pub mod spirv;
 
@@ -74,15 +80,78 @@ impl TexelFormat {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// Where [`translate`] puts the resources of a pipeline's vanilla uniform list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BindingLayout {
+    /// The v0.4.0 layout (DECISIONS 2.2): uniform buffer `i` at `@group(0) @binding(i)`,
+    /// which the backend binds from its uniform ring with a dynamic offset; texture or texel
+    /// buffer (read-only storage buffer) `i` at `@group(1) @binding(2i)` and the sampler split
+    /// off a combined image sampler at `@group(1) @binding(2i + 1)`. Group 1 can be cached
+    /// per texture combination while draws only move group 0's offsets.
+    #[default]
+    Split,
+    /// The S4 spike's single group: every resource of uniform `i` at `@group(0)
+    /// @binding(2i)`, its sampler at `2i + 1`. Kept to compare with the S4 corpus output.
+    Flat,
+}
+
+/// What a resource binding holds, as far as its WGSL slot is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    UniformBuffer,
+    /// A texture or a texel buffer's storage buffer.
+    Resource,
+    /// The sampler split off a combined image sampler.
+    Sampler,
+}
+
+impl BindingLayout {
+    /// `(group, binding)` of vanilla uniform `uniform`.
+    pub const fn place(self, uniform: u32, slot: Slot) -> (u32, u32) {
+        match (self, slot) {
+            (BindingLayout::Split, Slot::UniformBuffer) => (0, uniform),
+            (BindingLayout::Split, Slot::Resource) => (1, uniform * 2),
+            (BindingLayout::Split, Slot::Sampler) => (1, uniform * 2 + 1),
+            (BindingLayout::Flat, Slot::Sampler) => (0, uniform * 2 + 1),
+            (BindingLayout::Flat, _) => (0, uniform * 2),
+        }
+    }
+
+    /// The vanilla uniform index of a binding placed by [`BindingLayout::place`].
+    pub const fn uniform(self, group: u32, binding: u32) -> u32 {
+        match (self, group) {
+            (BindingLayout::Split, 0) => binding,
+            _ => binding / 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Options {
     /// Texel format of each texel buffer, by vanilla uniform index.
     pub texel_buffers: Vec<(u32, TexelFormat)>,
-    /// Negate the vertex position's y (naga's `adjust_coordinate_space`). A backend that
+    /// Negate the vertex position's y (naga's `adjust_coordinate_space`). The v0.4.0 backend
     /// renders with GL's row order (row 0 = bottom of clip space, as the GL backend and
-    /// every `gl_FragCoord`/`texelFetch` in the vanilla shaders assume) sets it, flips the
-    /// front face and flips once when presenting; see the crate README.
+    /// every `gl_FragCoord`/`texelFetch` in the vanilla shaders assume): it sets this flag,
+    /// uses `frontFace: "cw"` and flips once when presenting; see the crate README.
     pub flip_vertex_y: bool,
+    pub binding_layout: BindingLayout,
+    /// Remap GL's clip-space depth (`-w..w`) to WebGPU's `0..w` at the vertex output:
+    /// `z = (z + w) / 2` ([`passes::depth_remap`]). For profiles whose projection does not ask
+    /// the device for its depth range (1.21.11).
+    pub gl_depth_remap: bool,
+}
+
+impl Default for Options {
+    /// The v0.4.0 convention: [`BindingLayout::Split`] and `flip_vertex_y`, no depth remap.
+    fn default() -> Self {
+        Options {
+            texel_buffers: Vec::new(),
+            flip_vertex_y: true,
+            binding_layout: BindingLayout::Split,
+            gl_depth_remap: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +227,8 @@ pub enum Error {
     Validate(String),
     /// naga's WGSL writer.
     Write(String),
+    /// The GLSL front-end's reflection and rebind ([`frontend::link`]).
+    Link(String),
 }
 
 impl Error {
@@ -171,6 +242,7 @@ impl Error {
             Error::Parse(_) => "parse",
             Error::Validate(_) => "validate",
             Error::Write(_) => "write",
+            Error::Link(_) => "link",
         }
     }
 }
@@ -182,16 +254,12 @@ impl fmt::Display for Error {
             Error::Parse(m) => write!(f, "naga spv-in: {m}"),
             Error::Validate(m) => write!(f, "naga validation: {m}"),
             Error::Write(m) => write!(f, "naga wgsl-out: {m}"),
+            Error::Link(m) => write!(f, "link: {m}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
-
-/// WGSL binding of vanilla uniform `uniform` (`sampler`: the split-off sampler).
-pub const fn wgsl_binding(uniform: u32, sampler: bool) -> u32 {
-    uniform * 2 + sampler as u32
-}
 
 /// Step 1: the SPIR-V patches. Returns the patched words.
 pub fn patch_spirv(spirv: &[u8], options: &Options) -> Result<Vec<u32>, Error> {
@@ -202,6 +270,9 @@ pub fn patch_spirv(spirv: &[u8], options: &Options) -> Result<Vec<u32>, Error> {
     passes::texel_buffer::run(&mut module, &options.texel_buffers)?;
     passes::split_sampler::run(&mut module)?;
     passes::output_array::run(&mut module)?;
+    if options.gl_depth_remap {
+        passes::depth_remap::run(&mut module)?;
+    }
     Ok(module.emit())
 }
 
@@ -217,8 +288,9 @@ pub fn parse(words: &[u32], options: &Options) -> Result<naga::Module, Error> {
         .map_err(|e| Error::Parse(format!("{e}")))
 }
 
-/// Step 3: moves every resource to its WGSL binding.
-pub fn assign_bindings(module: &mut naga::Module) -> Result<(), Error> {
+/// Step 3: moves every resource (descriptor set 0, binding = vanilla uniform index) to its
+/// WGSL group and binding.
+pub fn assign_bindings(module: &mut naga::Module, layout: BindingLayout) -> Result<(), Error> {
     for (_, global) in module.global_variables.iter_mut() {
         let Some(binding) = global.binding.as_mut() else {
             continue;
@@ -226,8 +298,14 @@ pub fn assign_bindings(module: &mut naga::Module) -> Result<(), Error> {
         if binding.group != 0 {
             return Err(Error::Validate(format!("resource in descriptor set {}", binding.group)));
         }
-        let sampler = matches!(module.types[global.ty].inner, naga::TypeInner::Sampler { .. });
-        binding.binding = wgsl_binding(binding.binding, sampler);
+        let slot = match (&module.types[global.ty].inner, global.space) {
+            (naga::TypeInner::Sampler { .. }, _) => Slot::Sampler,
+            (naga::TypeInner::Image { .. }, _) => Slot::Resource,
+            (_, naga::AddressSpace::Uniform) => Slot::UniformBuffer,
+            (_, naga::AddressSpace::Storage { .. }) => Slot::Resource,
+            (_, other) => return Err(Error::Validate(format!("unexpected resource space {other:?}"))),
+        };
+        (binding.group, binding.binding) = layout.place(binding.binding, slot);
     }
     Ok(())
 }
@@ -256,8 +334,12 @@ pub fn write_wgsl(module: &naga::Module, info: &ModuleInfo) -> Result<String, Er
         .map_err(|e| Error::Write(format!("{e}")))
 }
 
-/// Describes the bindings of the module's single entry point.
-pub fn reflect(module: &naga::Module, info: &ModuleInfo) -> Result<(Stage, Vec<Binding>), Error> {
+/// Describes the bindings of the module's single entry point (placed by `layout`).
+pub fn reflect(
+    module: &naga::Module,
+    info: &ModuleInfo,
+    layout: BindingLayout,
+) -> Result<(Stage, Vec<Binding>), Error> {
     let entry = module
         .entry_points
         .first()
@@ -318,7 +400,7 @@ pub fn reflect(module: &naga::Module, info: &ModuleInfo) -> Result<(Stage, Vec<B
         bindings.push(Binding {
             group: binding.group,
             binding: binding.binding,
-            uniform: binding.binding / 2,
+            uniform: layout.uniform(binding.group, binding.binding),
             kind,
             used,
         });
@@ -331,9 +413,9 @@ pub fn reflect(module: &naga::Module, info: &ModuleInfo) -> Result<(Stage, Vec<B
 pub fn translate(spirv: &[u8], options: &Options) -> Result<Translation, Error> {
     let words = patch_spirv(spirv, options)?;
     let mut module = parse(&words, options)?;
-    assign_bindings(&mut module)?;
+    assign_bindings(&mut module, options.binding_layout)?;
     let info = validate(&module)?;
     let wgsl = write_wgsl(&module, &info)?;
-    let (stage, bindings) = reflect(&module, &info)?;
+    let (stage, bindings) = reflect(&module, &info, options.binding_layout)?;
     Ok(Translation { stage, wgsl, bindings })
 }

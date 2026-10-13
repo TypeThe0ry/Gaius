@@ -39,7 +39,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
     public static void main(String[] args) throws Exception {
         if (args.length != 3) {
             throw new IllegalArgumentException(
-                    "usage: <1.21.11|26.2|26.3> <input.jar> <output-root>");
+                    "usage: <profile id> <input.jar> <output-root>");
         }
         ProfileShape shape = ProfileShape.forId(args[0]);
         Path outputRoot = Path.of(args[2]);
@@ -306,13 +306,18 @@ public final class MinecraftChunkDrawTelemetryPatcher {
         private static final String BLAZE3D_DRAW = "com/mojang/blaze3d/systems/RenderPass$Draw";
         private static final String RENDERPEARL = "com/mojang/renderpearl/";
 
+        /**
+         * The shape of the profile's client, chosen by its version profile fields: the legacy
+         * patch set, or the modern one with a blaze3d or a renderpearl render API.
+         */
         private static ProfileShape forId(String id) {
+            VersionProfile profile = VersionProfile.forId(id);
             String returnType =
                     "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;";
             String lambdaDescriptor =
                     "(I[Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
                             + "Lcom/mojang/blaze3d/systems/RenderPass$UniformUploader;)V";
-            if (id.equals("1.21.11")) {
+            if (profile.legacyPatchSet()) {
                 return new ProfileShape(
                         "prepareChunkRenders",
                         "(Lorg/joml/Matrix4fc;DDD)" + returnType,
@@ -338,7 +343,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
                         "Lnet/minecraft/client/multiplayer/ClientLevel;",
                         RENDERPEARL + "api/device/GpuDevice.class");
             }
-            if (id.equals("26.2")) {
+            if (profile.modernPatchSet() && !profile.renderpearl()) {
                 return new ProfileShape(
                         "prepareChunkRenders",
                         "(Lorg/joml/Matrix4fc;)" + returnType,
@@ -364,7 +369,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
                         "Lnet/minecraft/client/renderer/state/level/LevelRenderState;",
                         RENDERPEARL + "api/device/GpuDevice.class");
             }
-            if (id.equals("26.3")) {
+            if (profile.modernPatchSet() && profile.renderpearl()) {
                 // Registration: extractSectionDrawGroups keeps the render origin (BlockPos) in
                 // local 14 and stores sectionInfos.size() into local 15. Draw: the frontend
                 // loop keeps the current RenderPass$Draw in local 9 and issues it through the

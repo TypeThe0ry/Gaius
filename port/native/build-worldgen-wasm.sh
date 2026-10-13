@@ -9,9 +9,10 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=wasm32-unknown-unknown
-OUT="$HERE/target/wasm-worldgen"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$HERE/target}"
+OUT="$TARGET_ROOT/wasm-worldgen"
 CRATE=gaius_worldgen_wasm
-EXPORTS=(memory alloc dealloc release gaius_abi_version run_load_generator run_biomes run_terrain run_surface)
+EXPORTS=(memory alloc dealloc release gaius_abi_version run_load_generator run_biomes run_terrain run_surface run_ore)
 
 check=0
 case "${1:-}" in
@@ -33,10 +34,10 @@ mkdir -p "$OUT"
 # Each variant keeps its own target directory so the feature flags never share artifacts.
 build() {
     local variant="$1" flags="$2"
-    CARGO_TARGET_DIR="$HERE/target/wg-$variant" \
+    CARGO_TARGET_DIR="$TARGET_ROOT/wg-$variant" \
         CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="$flags" \
-        cargo build --release --target "$TARGET" -p gaius-worldgen-wasm
-    cp "$HERE/target/wg-$variant/$TARGET/release/$CRATE.wasm" "$OUT/$CRATE.$variant.wasm"
+        cargo build --release --offline --locked --target "$TARGET" -p gaius-worldgen-wasm
+    cp "$TARGET_ROOT/wg-$variant/$TARGET/release/$CRATE.wasm" "$OUT/$CRATE.$variant.wasm"
     printf '%-36s %8d bytes\n' "$CRATE.$variant.wasm" "$(wc -c < "$OUT/$CRATE.$variant.wasm")"
 }
 build simd "-C target-feature=+simd128"

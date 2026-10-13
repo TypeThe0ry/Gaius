@@ -2,10 +2,10 @@
 
 use super::json::{enc_f64, expect_param_bits, Case, Outcome};
 use gaius_noise::synth64::{BlendedNoise, ImprovedNoise, NormalNoise, PerlinNoise, SimplexNoise};
-use gaius_noise::Profile;
+use gaius_noise::Semantics;
 
-pub fn improved_noise(profile: Profile, case: &Case) -> Outcome {
-    let noise = ImprovedNoise::new(&mut case.random()?, profile.floor_mode());
+pub fn improved_noise(semantics: Semantics, case: &Case) -> Outcome {
+    let noise = ImprovedNoise::new(&mut case.random()?, semantics.floor_mode);
     expect_param_bits(case, "xo", noise.xo)?;
     expect_param_bits(case, "yo", noise.yo)?;
     expect_param_bits(case, "zo", noise.zo)?;
@@ -24,8 +24,8 @@ pub fn improved_noise(profile: Profile, case: &Case) -> Outcome {
     }
 }
 
-pub fn perlin_noise(profile: Profile, case: &Case) -> Outcome {
-    let floor = profile.floor_mode();
+pub fn perlin_noise(semantics: Semantics, case: &Case) -> Outcome {
+    let floor = semantics.floor_mode;
     let mut random = case.random()?;
     let noise = match case.str("ctor")? {
         "create" => PerlinNoise::create(
@@ -52,8 +52,8 @@ pub fn perlin_noise(profile: Profile, case: &Case) -> Outcome {
         .collect())
 }
 
-pub fn normal_noise(profile: Profile, case: &Case) -> Outcome {
-    let floor = profile.floor_mode();
+pub fn normal_noise(semantics: Semantics, case: &Case) -> Outcome {
+    let floor = semantics.floor_mode;
     let mut random = case.random()?;
     let first_octave = case.i32("first_octave")?;
     let amplitudes = case.f64_list("amplitudes")?;
@@ -69,8 +69,8 @@ pub fn normal_noise(profile: Profile, case: &Case) -> Outcome {
         .collect())
 }
 
-pub fn simplex_noise(profile: Profile, case: &Case) -> Outcome {
-    let noise = SimplexNoise::new(&mut case.random()?, profile.floor_mode());
+pub fn simplex_noise(semantics: Semantics, case: &Case) -> Outcome {
+    let noise = SimplexNoise::new(&mut case.random()?, semantics.floor_mode);
     expect_param_bits(case, "xo", noise.xo)?;
     expect_param_bits(case, "yo", noise.yo)?;
     expect_param_bits(case, "zo", noise.zo)?;
@@ -89,7 +89,7 @@ pub fn simplex_noise(profile: Profile, case: &Case) -> Outcome {
     }
 }
 
-pub fn blended_noise(profile: Profile, case: &Case) -> Outcome {
+pub fn blended_noise(semantics: Semantics, case: &Case) -> Outcome {
     if case.str("method")? != "compute" {
         return Err(format!("unknown method \"{}\"", case.str("method")?));
     }
@@ -100,7 +100,7 @@ pub fn blended_noise(profile: Profile, case: &Case) -> Outcome {
         case.f64("xz_factor")?,
         case.f64("y_factor")?,
         case.f64("smear_scale_multiplier")?,
-        profile.floor_mode(),
+        semantics.floor_mode,
     );
     Ok(case
         .i32_rows(3)?

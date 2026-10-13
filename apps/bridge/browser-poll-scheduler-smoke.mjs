@@ -7,6 +7,7 @@
  * timer behaviour without turning a noisy desktop into a false pass.
  */
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE, RENDERPEARL_PROFILE} from "../../port/scripts/verification-profiles.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { monitorEventLoopDelay } from "node:perf_hooks";
@@ -108,7 +109,7 @@ assert.match(source,
 // twenty-tick cadence.  This is a narrow diagnostic hint only; it must never
 // relax or replace the strict packet/tick/callback gates.
 assert.match(source,
-    /ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID\s*=\s*["']26\.2["']/u,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID\s*=\s*CANONICAL_PROFILE\.id/u,
     "periodic server-sync profile contract drifted");
 assert.match(source,
     /ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION\s*=\s*776/u,
@@ -1582,7 +1583,7 @@ const POLL_PHASE_SEGMENTS = Object.freeze([
 const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
     "gaius.browser-client-arrival-periodic-server-sync.v1";
 const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
-const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = "26.2";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = CANONICAL_PROFILE.id;
 const ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION = 776;
 const ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID = 113;
 const ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS = 1000;
@@ -1860,21 +1861,21 @@ function retainPollPhaseSample(state, candidate) {
     // sync label.  Every nearby/non-canonical case stays unknown; the hint is
     // diagnostic and carries no strict-pass semantics.
     assert.equal(classifyPeriodicServerSyncArrival({
-        profileId: "26.2",
+        profileId: CANONICAL_PROFILE.id,
         protocolVersion: 776,
         packetId: 113,
         decodedGapMillis: 1000,
     }), ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
-    "canonical 26.2 packet 113 cadence was not classified");
+    "canonical " + CANONICAL_PROFILE.id + " packet 113 cadence was not classified");
     assert.equal(classifyPeriodicServerSyncArrival({
-        profileId: "26.2",
+        profileId: CANONICAL_PROFILE.id,
         protocolVersion: 776,
         packetId: 113,
         decodedGapMillis: 1004.5,
     }), ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
-    "near-one-second 26.2 packet 113 cadence was not classified");
+    "near-one-second " + CANONICAL_PROFILE.id + " packet 113 cadence was not classified");
     assert.equal(classifyPeriodicServerSyncArrival({
-        profileId: "26.2",
+        profileId: CANONICAL_PROFILE.id,
         protocolVersion: 776,
         packetId: 113,
         decodedGapMillis: 1000,
@@ -1882,7 +1883,7 @@ function retainPollPhaseSample(state, candidate) {
     }), "unknown-arrival-gap",
     "packet 113 outside PLAY must not receive a cadence hint");
     assert.equal(classifyPeriodicServerSyncArrival({
-        profileId: "26.2",
+        profileId: CANONICAL_PROFILE.id,
         protocolVersion: 776,
         packetId: 113,
         decodedGapMillis: 1000,
@@ -1891,22 +1892,22 @@ function retainPollPhaseSample(state, candidate) {
     }), "unknown-arrival-gap",
     "a slow local segment must not be hidden by a cadence hint");
     for (const candidate of [
-        { profileId: "1.21.11", protocolVersion: 774, packetId: 113,
+        { profileId: LEGACY_PROFILE.id, protocolVersion: 774, packetId: 113,
             decodedGapMillis: 1000 },
-        { profileId: "26.2", protocolVersion: 776, packetId: 112,
+        { profileId: CANONICAL_PROFILE.id, protocolVersion: 776, packetId: 112,
             decodedGapMillis: 1000 },
-        { profileId: "26.2", protocolVersion: 776, packetId: 113,
+        { profileId: CANONICAL_PROFILE.id, protocolVersion: 776, packetId: 113,
             decodedGapMillis: 800 },
-        { profileId: "26.2", protocolVersion: 776, packetId: 113,
+        { profileId: CANONICAL_PROFILE.id, protocolVersion: 776, packetId: 113,
             decodedGapMillis: 1201 },
-        { profileId: "26.2", protocolVersion: 775, packetId: 113,
+        { profileId: CANONICAL_PROFILE.id, protocolVersion: 775, packetId: 113,
             decodedGapMillis: 1000 },
         // 26.3/777 has no canonical cadence contract.  Its PLAY id 113 is
         // set_simulation_distance and set_time moved to 115, so neither may
         // inherit the 26.2 hint.
-        { profileId: "26.3", protocolVersion: 777, packetId: 113,
+        { profileId: RENDERPEARL_PROFILE.id, protocolVersion: 777, packetId: 113,
             decodedGapMillis: 1000 },
-        { profileId: "26.3", protocolVersion: 777, packetId: 115,
+        { profileId: RENDERPEARL_PROFILE.id, protocolVersion: 777, packetId: 115,
             decodedGapMillis: 1000 },
     ]) {
         assert.equal(classifyPeriodicServerSyncArrival(candidate),

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import {VERSION_PROFILES} from "./verification-profiles.mjs";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
 
@@ -80,7 +81,7 @@ function hydrate(records, predicate) {
   return files;
 }
 
-const profileIds = ["1.21.11", "26.2", "26.3"];
+const profileIds = VERSION_PROFILES.map(profile => profile.id);
 for (const profileId of profileIds) {
   const worldRoot = `/gaius/saves/${profileId}/`;
   const worldGenPath = `${worldRoot}data/minecraft/world_gen_settings.dat`;

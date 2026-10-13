@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
@@ -5,12 +6,12 @@ import vm from "node:vm";
 // This harness does not select a profile. Keep it on the safe, current
 // default storage namespace rather than reopening the removed v1 database.
 const DEFAULT_STORAGE_CONFIG = Object.freeze({
-  profileId: "26.2",
+  profileId: CANONICAL_PROFILE.id,
   worldVersion: 4903,
   storageSchema: 2,
-  storageDatabaseName: "gaius-fs-v2-26.2",
-  storagePrefix: "gaius.fs.v2:26.2:",
-  storageOpfsDirectory: "regions-v2-26.2",
+  storageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+  storagePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+  storageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
 });
 
 const bootstrapUrl = new URL("../web/singleplayer/server-worker-bootstrap.js", import.meta.url);

@@ -20,13 +20,18 @@ from the real client jars.
 | `crates/gaius-mesher-wasm` | the `load_model_table` / `mesh_section` kernels and `mesh_trim` (cdylib); jobs encoded by `port/web/kernels/mesh-job.js` |
 | `crates/gaius-light` | sky and block light of one chunk column plus a one-block ring of its neighbours, following the 26.2 / 26.3 light engine |
 | `crates/gaius-light-wasm` | the `light_column` kernel and `light_trim` (cdylib); jobs encoded by `port/web/kernels/light-job.js` and by `BrowserLightKernel` on the Java side |
+| `crates/gaius-png` | bounded PNG decoding with the current Java STB override's channel, transparency and grayscale semantics |
+| `crates/gaius-png-wasm` | the opt-in synchronous `png_decode` kernel; deliberately excluded from the default worker manifest |
+| `golden/png/` | offline all-asset PNG byte parity against the current Java decoder and native/Node benchmarks |
 | `golden/worldgen/` | vanilla comparison: exports the overworld IR and dumps density, biomes, blocks and heightmaps from the real 26.3 / 26.2 classes, then runs `tests/vanilla_reference.rs` |
+| `worldgen-perf-reference.mjs`, `crates/gaius-worldgen-wasm/examples/perf_ir.rs` | manifest-selected offline JVM references and native core/framed stage benchmarks |
+| `worldgen-perf.mjs`, `worldgen-perf-paired.mjs`, `worldgen-perf-summary.mjs` | Node baseline/SIMD throughput, interleaved before/after pairs and byte-exact result checks |
 | `fixtures/<profile>/*.jsonl` | golden data, written by `golden/run-golden.sh` |
 | `build-wasm.sh`, `wasm-check.mjs` | release wasm build of the noise and mesher kernels, and the check that every probe job answers like the native build |
 | `build-light-wasm.sh`, `build-worldgen-wasm.sh` | SIMD and baseline builds of the light and worldgen kernels, with their node checks |
-| `build-wasm-variants.sh`, `js/kernel-manifest.mjs` | every `crates/gaius-*-wasm` kernel in both builds plus the `kernels.json` manifest the kernel runtime loads |
+| `build-wasm-variants.sh`, `js/kernel-manifest.mjs` | default worker kernels in both builds plus the `kernels.json` manifest the kernel runtime loads |
 | `wasm-fixture-check.mjs`, `js/fixture-jobs.mjs` | the built wasm against the golden fixtures, jobs encoded by `port/web/kernels/noise-job.js` |
-| `golden/strict/` | JVM proof that the `StrictMath263` worldgen rewrite of the TeaVM path keeps vanilla results |
+| `golden/strict/` | JVM proof that the worldgen float rewrite (`WorldgenStrictMath`) of the TeaVM path keeps vanilla results |
 | `teavm-fixture-check.mjs`, `js/teavm-*.mjs` | the golden fixtures through the TeaVM-compiled Java noise of a client build |
 | `check.sh` | everything above plus the kernel pool smokes, in one command |
 
@@ -42,7 +47,7 @@ cargo test --workspace     # unit tests, golden parity for all profiles, kernel 
 ./build-wasm.sh --check    # build, then check exports and native == wasm output (needs node)
 node wasm-fixture-check.mjs                       # wasm module vs golden fixtures
 node ../scripts/native-noise-pool-smoke.mjs       # wasm module through the kernel pool (worker threads)
-./golden/strict/strict-math-check.sh              # StrictMath263 rewrite still dumps the 26.3 fixtures on the JVM
+./golden/strict/strict-math-check.sh              # WorldgenStrictMath rewrite still dumps the 26.3 fixtures on the JVM
 ./build-worldgen-wasm.sh --check                   # worldgen kernel, simd128 and baseline builds, exports checked
 ./build-light-wasm.sh --check                      # light kernel, both builds, through ../scripts/light-kernel-smoke.mjs
 ./build-wasm-variants.sh [--out DIR]               # all kernels, both builds, and kernels.json (default target/kernels)
@@ -54,8 +59,59 @@ node teavm-fixture-check.mjs [classes.js]         # 26.3 fixtures through a TeaV
 are missing or older than the golden harness or the client jar; `--golden`
 forces it and `--no-golden` skips it.
 
+PNG is an optional WasmGC startup path, not a default worker kernel. Its build,
+staging, runtime switch, fallback rules and offline parity commands are in
+[INTEGRATION.md](crates/gaius-png/INTEGRATION.md). Setting `GAIUS_PNG_OUT` to an
+absolute output directory also enables the PNG check in `check.sh`.
+
 The parity test reads `GAIUS_FIXTURES` instead of `fixtures/` when set, and
 fails if any profile has no fixtures.
+
+## Offline worldgen performance
+
+See [the Chinese throughput report](docs/worldgen-throughput.md) for measured
+before/after results, the Java hook coverage map and the remaining acceptance
+gates. The tools need only cached jars, Cargo and Node; no client TeaVM build or
+browser is required.
+
+Set `OUT` to a dedicated output directory and `PROFILE_ID` to an ID read from
+`../versions/*.json`. Keep build artifacts outside shared `port/work`.
+
+```sh
+node worldgen-perf-reference.mjs "$OUT/reference"
+CARGO_TARGET_DIR="$OUT/native" cargo run --release --offline --locked -j 2 \
+  -p gaius-worldgen-wasm --example perf_ir -- \
+  "$OUT/reference/$PROFILE_ID" "$OUT/jobs/$PROFILE_ID" 7 6
+node worldgen-perf.mjs "$WASM" "$OUT/jobs/$PROFILE_ID" 7 6
+node worldgen-perf-paired.mjs "$BEFORE_WASM" "$AFTER_WASM" "$OUT/jobs/$PROFILE_ID" 21 6
+```
+
+The reference runner copies harness sources into the output directory and uses
+`javac -J-Xmx3g` and `java -Xmx3g`. Unknown profiles and adapter mismatches fail
+before a misleading successful measurement can be reported. Build wasm with
+`--offline --locked -j 2` and target features `-simd128` / `+simd128` for the
+baseline / SIMD variants.
+
+`terrain` includes aquifers and block filling; `combined` uses the existing
+surface/biome flags. LOAD, Worker messaging, Java result installation and the
+complete chunk status chain are outside these timers. Independent-process
+results are susceptible to shared-machine load; use the paired runner to
+check a small change without treating offline jobs/s as browser chunks/s.
+
+## Kernel semantics
+
+Kernels never see a Minecraft version. Each version profile declares its
+`kernelSemantics` in `port/versions/<id>.json`: the wire `code` that job and IR
+headers carry (noise job byte 0, generator IR header, model table header), the
+`floorMode` (`cast-adjust` or `math-floor`), the `synth` classes (`f64` or
+`f32`), the `densityGraph` (`router-f64` or `sampler-f32`) and the generator
+`irVersion`. `crates/gaius-noise/build.rs` compiles those declarations into
+`Semantics::from_code` and `semantics::profiles()`, so the decoders accept
+exactly the declared codes, the parity tests run every profile with its
+declared semantics, and `check.sh`, `golden/run-golden.sh` and
+`js/fixture-jobs.mjs` enumerate the same profiles. A new profile whose
+semantics match an existing one reuses its code and needs no Rust change; a
+declaration the kernels do not implement fails the build.
 
 ## Parity rules
 
@@ -87,9 +143,9 @@ double precision: `teavm-fixture-check.mjs --report` on such a build shows
 the octaves add up), and the normalization factor of 15 of the 146
 `NormalNoise` lines off by an ulp.
 
-`StrictMath263` (in the 26.3 patch chain, `port/tools`) therefore rewrites the
-worldgen classes (`levelgen`, `biome`, `data/worldgen`, `valueproviders`,
-`Mth`, `RandomSource`) to call `dev.gaius.browser.BrowserStrictMath` after
+`WorldgenStrictMath` (patch `StrictMath263.roundWorldgenArithmetic` of the 26.3 chain,
+`port/tools`) therefore rewrites the worldgen classes (`levelgen`, `biome`,
+`data/worldgen`, `valueproviders`, `Mth`, `RandomSource`) to call `dev.gaius.browser.BrowserStrictMath` after
 every float operation (`Math.fround`), for every float conversion and cast, for
 floats entering from outside that scope, and for `DoubleStream.sum()`.
 `golden/strict/strict-math-check.sh` proves on the JVM that the rewritten
@@ -122,6 +178,7 @@ kernel family:
 | `0x0202` | `run_mesh_section` | mesher |
 | `0x0301` | `run_light_column` | light |
 | `0x0401` to `0x0404` | `run_load_generator`, `run_biomes`, `run_terrain`, `run_surface` | worldgen |
+| `0x0701` | `run_png_decode` | PNG (opt-in, synchronous WasmGC startup path) |
 
 A kernel may also export `trim` or `<name>_trim` (`mesh_trim`, `light_trim`):
 under memory pressure the kernel runtime asks every worker to call them, and

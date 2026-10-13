@@ -1,6 +1,7 @@
 package dev.gaius.browser;
 
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
@@ -24,6 +25,34 @@ public final class BrowserFuturePump {
         recordPoll(true, queue.size());
         TModernRuntimeSupport.yieldToEventLoop(1);
         return queue.poll();
+    }
+
+    /**
+     * {@code future.join()} for a Worker thread that waits for work it handed to the server
+     * thread: vanilla {@code ServerChunkCache.getChunk} called off the server thread runs
+     * {@code CompletableFuture.supplyAsync(task, mainThreadProcessor).join()}, which blocks
+     * that thread on the JVM until the server thread has run the task. World generation does
+     * this, for example when a structure places an entity whose variant spawn condition
+     * (StructureCheck) looks up the structures at its position through the ServerLevel.
+     * TeaVM's browser CompletableFuture cannot block and throws on an incomplete future, so
+     * this thread yields to the event loop until the future is done: the server thread runs
+     * the task in one of its turns, as the blocked JVM thread waits for it.
+     *
+     * <p>A frame that cannot suspend (a class initializer, a method compiled synchronously or
+     * a plain JavaScript callback) returns from the yield at once; a macrotask posted before
+     * the yield tells the two cases apart, and the wait then ends at {@code join()}, which
+     * reports the incomplete future as before instead of spinning.</p>
+     */
+    public static <T> T joinFromWorker(CompletableFuture<T> future) {
+        while (!future.isDone() && !TModernRuntimeSupport.inClassInitializer() && HostLoop.canSuspend()) {
+            boolean[] yielded = new boolean[1];
+            TModernRuntimeSupport.postRunnableMacrotask(() -> yielded[0] = true);
+            TModernRuntimeSupport.yieldToEventLoop(0);
+            if (!yielded[0]) {
+                break;
+            }
+        }
+        return future.join();
     }
 
     @JSBody(params = {"empty", "queueDepth"}, script = """

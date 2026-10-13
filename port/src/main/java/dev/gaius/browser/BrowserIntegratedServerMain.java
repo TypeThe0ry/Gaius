@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import net.minecraft.server.Main;
@@ -16,6 +17,8 @@ import net.minecraft.server.network.ServerConnectionListener;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.TickTask;
 import net.minecraft.server.players.PlayerList;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
@@ -959,6 +962,26 @@ public final class BrowserIntegratedServerMain {
                 : net.minecraft.util.datafix.DataFixers.getDataFixer();
     }
 
+    /**
+     * The Optional&lt;GameRules&gt; that vanilla's integrated server receives next to its
+     * WorldStem when the world is created from the Create World screen. The patched dedicated
+     * server factory passes it to the DedicatedServer constructor, which applies it with
+     * GameRules.setAll before the levels load.
+     */
+    public static Optional<GameRules> initialGameRules(FeatureFlagSet enabledFeatures) {
+        Optional<GameRules> rules;
+        try {
+            rules = BrowserGameRulesHandoff.decode(workerInitialGameRules(), enabledFeatures);
+        } catch (RuntimeException exception) {
+            reportRuntimeEvent("runtime-start-failed", "invalid-initial-game-rules");
+            throw exception;
+        }
+        if (rules.isPresent()) {
+            reportRuntimeEvent("initial-game-rules", "applied");
+        }
+        return rules;
+    }
+
     static void reportRuntimeEvent(String event, String detail) {
         if (isWorkerRuntime()) {
             report(event, detail);
@@ -1395,12 +1418,17 @@ public final class BrowserIntegratedServerMain {
     @JSBody(script = "return String(globalThis.__gaiusServerSeed || '');")
     private static native String workerSeed();
 
+    @JSBody(script = "return String(globalThis.__gaiusServerInitialGameRules || '');")
+    private static native String workerInitialGameRules();
+
     @JSBody(script = "return Number(globalThis.__gaiusServerViewDistance || 8) | 0;")
     private static native int workerViewDistance();
 
     @JSBody(script = "return Number(globalThis.__gaiusServerSimulationDistance || 6) | 0;")
     private static native int workerSimulationDistance();
 
+    // The storage allow-list rows of this script are generated from port/versions/*.json by
+    // port/tools/profilegen (node port/tools/profilegen/profilegen.mjs); edit the profiles instead.
     @JSBody(params = {"maxBytes", "maxEntries"}, script = """
             try {
               const root = globalThis;
@@ -1714,7 +1742,9 @@ public final class BrowserIntegratedServerMain {
               return 0;
             }
             """)
-    private static native long integratedServerStorageFlushElapsedMillis();
+    // double, not long: the script returns a JS number, and the WebAssembly GC target passes a
+    // long through an i64 that only accepts a BigInt (TypeError "Cannot convert 1 to a BigInt").
+    private static native double integratedServerStorageFlushElapsedMillis();
 
     @JSBody(script = """
             try {

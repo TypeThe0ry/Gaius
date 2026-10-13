@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {existsSync} from "node:fs";
@@ -7,6 +8,7 @@ import {copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promise
 import {homedir, tmpdir} from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const nativePath = (value) => {
@@ -22,19 +24,19 @@ const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
 const version = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
-    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
+    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : CANONICAL_PROFILE.id));
 // Per-profile class shapes.  26.2 runs MinecraftClientPatcher on the vanilla client jar;
 // 26.3 (renderpearl GL backend) checks the patched client jar that build-overlays.sh wrote
 // (a GAIUS_BRINGUP=1 build is enough), because the full 26.3 patch chain only runs there.
 const PROFILE_SHAPES = {
-  "26.2": {
+  [CANONICAL_PROFILE.id]: {
     gl: "com.mojang.blaze3d.opengl",
     transientMemory: "com.mojang.blaze3d.systems.TransientMemory",
     lwjglVersion: "3.4.1",
     lwjglCoreJar: "lwjgl-3.4.1-unsafe.jar",
     patchVanillaJar: true,
   },
-  "26.3": {
+  [RENDERPEARL_PROFILE.id]: {
     gl: "com.mojang.renderpearl.backend.opengl",
     transientMemory: "com.mojang.renderpearl.api.buffers.TransientMemory",
     lwjglVersion: "3.4.3",
@@ -135,7 +137,8 @@ function method(bytecode, signature, nextSignature) {
   return bytecode.slice(start, end === -1 ? bytecode.length : end);
 }
 
-const patcher = await readFile(patcherSource, "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = stepSource("MinecraftClientPatcher");
 const browserOpenGl = await readFile(browserOpenGlSource, "utf8");
 
 function jsBodyBefore(declaration) {
@@ -291,6 +294,7 @@ try {
       "dev.gaius.tools.MinecraftClientPatcher",
       baseClient,
       patchedClasses,
+      version,
     ], {stdio: ["ignore", "pipe", "pipe"]});
   }
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {createHash} from "node:crypto";
@@ -23,9 +25,9 @@ const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
 const version = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
-    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
-if (version !== "26.2") {
-  throw new Error(`MappableRingBuffer telemetry smoke is 26.2-only; got ${version}`);
+    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : CANONICAL_PROFILE.id));
+if (version !== CANONICAL_PROFILE.id) {
+  throw new Error(`MappableRingBuffer telemetry smoke is ${CANONICAL_PROFILE.id}-only; got ${version}`);
 }
 
 const clientCandidates = [
@@ -34,10 +36,10 @@ const clientCandidates = [
     && path.join(nativePath(process.env.GAIUS_BUILD_ROOT), "client-named.jar"),
   process.env.GAIUS_OVERLAY_DIRECTORY
     && path.join(nativePath(process.env.GAIUS_OVERLAY_DIRECTORY),
-      "client-named-26.2-gaius.jar"),
-  path.join(repositoryRoot, "port/work/26.2/client-named.jar"),
-  path.join(repositoryRoot, "port/work/overlays/26.2/client-named-26.2-gaius.jar"),
-  path.join(repositoryRoot, "port/work/overlays/client-named-26.2-gaius.jar"),
+      "client-named-" + CANONICAL_PROFILE.id + "-gaius.jar"),
+  path.join(repositoryRoot, "port/work/" + CANONICAL_PROFILE.id + "/client-named.jar"),
+  path.join(repositoryRoot, "port/work/overlays/" + CANONICAL_PROFILE.id + "/client-named-" + CANONICAL_PROFILE.id + "-gaius.jar"),
+  path.join(repositoryRoot, "port/work/overlays/client-named-" + CANONICAL_PROFILE.id + "-gaius.jar"),
 ].filter(Boolean);
 let rawClient = null;
 for (const candidate of clientCandidates) {
@@ -50,13 +52,13 @@ for (const candidate of clientCandidates) {
   }
 }
 if (!rawClient) {
-  throw new Error(`missing exact 26.2 client-named.jar; checked ${clientCandidates.join(", ")}`);
+  throw new Error(`missing exact ${CANONICAL_PROFILE.id} client-named.jar; checked ${clientCandidates.join(", ")}`);
 }
 const rawClientSha256 = createHash("sha256")
   .update(await readFile(rawClient))
   .digest("hex");
 console.log(`CLIENT_NAMED_SHA256 ${rawClientSha256} ${rawClient}`);
-const raw121Client = path.join(repositoryRoot, "port/work/1.21.11/client-named.jar");
+const raw121Client = path.join(repositoryRoot, "port/work/" + LEGACY_PROFILE.id + "/client-named.jar");
 await access(raw121Client);
 const raw121ClientSha256 = createHash("sha256")
   .update(await readFile(raw121Client))
@@ -101,7 +103,7 @@ function selectJavaTools() {
       // Try the next configured JDK.
     }
   }
-  throw new Error("26.2 MappableRingBuffer JVM verification requires JDK 25 or newer");
+  throw new Error("" + CANONICAL_PROFILE.id + " MappableRingBuffer JVM verification requires JDK 25 or newer");
 }
 
 const javaTools = selectJavaTools();
@@ -118,27 +120,28 @@ await Promise.all([
   access(asmAnalysis),
 ]);
 
-const [patcherText, browserOpenGlText] = await Promise.all([
-  readFile(patcherSource, "utf8"),
-  readFile(browserOpenGlSource, "utf8"),
-]);
-const featureStart = patcherText.indexOf(
-  "private static void patchMappableRingBufferTelemetry(",
+// MinecraftClientPatcher with its domain classes (port/tools/patchkit/README.md, "Domains"); the
+// feature text is the telemetry patch method up to the next member of its class.
+const patcherText = stepSource("MinecraftClientPatcher");
+const browserOpenGlText = await readFile(browserOpenGlSource, "utf8");
+const featureStart = patcherText.search(
+  /\n    (?:private |public )?static void patchMappableRingBufferTelemetry\(/,
 );
-const featureEnd = patcherText.indexOf(
-  "private static void patchStagedVertexBufferGpuPoolCache(",
-  featureStart,
-);
+const nextMember = /\n    (?:(?:private|public|protected) )?static [^\n]*\(/g;
+nextMember.lastIndex = featureStart + 1;
+const nextMatch = featureStart >= 0 ? nextMember.exec(patcherText) : null;
+const featureEnd = nextMatch ? nextMatch.index : -1;
 assert.ok(featureStart >= 0 && featureEnd > featureStart,
   "missing isolated MappableRingBuffer telemetry patch");
 const featureText = patcherText.slice(featureStart, featureEnd);
-// The call in main() runs under the modern-profile guard (26.2 and 26.3,
-// never 1.21.11), wrapped in PatchRegistry.run so 26.3 bring-up can skip it.
+// The call in main() runs under the modern-profile guard (the profiles whose
+// patchSet is modern, never 1.21.11), wrapped in PatchRegistry.run so a bring-up
+// can skip it.
 assert.match(patcherText,
-  /static boolean isModernProfile\(String minecraftVersion\) \{\s*return "26\.2"\.equals\(minecraftVersion\) \|\| "26\.3"\.equals\(minecraftVersion\);\s*\}/,
-  "isModernProfile must name exactly the modern profiles 26.2 and 26.3");
+  /static boolean isModernProfile\(String minecraftVersion\) \{\s*return VersionProfile\.forId\(minecraftVersion\)\.modernPatchSet\(\);\s*\}/,
+  "isModernProfile must read the profile's patchSet");
 assert.match(patcherText,
-  /if \(isModernProfile\(minecraftVersion\)\) \{\s*PatchRegistry\.run\("MinecraftClientPatcher\.patchMappableRingBufferTelemetry", \(\) -> patchMappableRingBufferTelemetry\(/,
+  /if \(isModernProfile\(minecraftVersion\)\) \{\s*PatchRegistry\.run\("MinecraftClientPatcher\.patchMappableRingBufferTelemetry", "[^"]+", \(\) -> (?:TelemetryPatches\.)?patchMappableRingBufferTelemetry\(/,
   "MappableRingBuffer telemetry must remain gated to the modern profiles");
 for (const required of [
   "currentBuffer",
@@ -459,10 +462,10 @@ try {
     "dev.gaius.tools.MinecraftClientPatcher",
     rawClient,
     patchedClasses,
-    "26.2",
+    CANONICAL_PROFILE.id,
   ], {stdio: ["ignore", "pipe", "pipe"]});
   assert.match(patchOutput,
-    /Instrumented 26\.2 MappableRingBuffer\.currentBuffer fence-result telemetry/,
+    /Instrumented blaze3d MappableRingBuffer\.currentBuffer fence-result telemetry/,
     "exact 26.2 jar did not run the MappableRingBuffer telemetry patch");
 
   const patched121Classes = path.join(temporaryRoot, "patched-12111-classes");
@@ -472,7 +475,7 @@ try {
     "dev.gaius.tools.MinecraftClientPatcher",
     raw121Client,
     patched121Classes,
-    "1.21.11",
+    LEGACY_PROFILE.id,
   ], {stdio: ["ignore", "pipe", "pipe"]});
   assert.doesNotMatch(patch121Output, /MappableRingBuffer\.currentBuffer/,
     "1.21.11 unexpectedly ran the 26.2 MappableRingBuffer patch");

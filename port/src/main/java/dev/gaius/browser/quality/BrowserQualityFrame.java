@@ -5,7 +5,7 @@ import org.teavm.jso.JSBody;
 
 /**
  * Per-frame hooks of the 26.3 graphics quality tiers, installed by
- * {@code dev.gaius.tools.quality.QualityPatches263}. The work happens in the page's quality
+ * {@code dev.gaius.tools.patches.render.QualityTierPatches}. The work happens in the page's quality
  * runtime ({@code port/web/runtime/quality/quality-runtime.js}); every call degrades to the
  * vanilla behaviour when that runtime is not loaded.
  *
@@ -19,7 +19,7 @@ import org.teavm.jso.JSBody;
  *   <li>{@link #endLevel} right after {@code LevelRenderer.render}: ends the scaled section and
  *       lets the runtime run the post-processing chain and upscale the sub-rectangle to the full
  *       target, before the hand, the entity-outline blit, post effects and the GUI.</li>
- *   <li>Inventory screens (every profile: {@code QualityPatches263} on 26.3,
+ *   <li>Inventory screens (every profile: {@code QualityTierPatches} on 26.3,
  *       {@code MinecraftClientPatcher.patchGameRendererBrowserInventoryWorldRenderThrottle} on
  *       26.2 and 1.21.11): {@link #shouldSkipWorldRender} replaces
  *       {@code BrowserOpenGL.shouldSkipWorldRenderForScreen}. Instead of skipping the world

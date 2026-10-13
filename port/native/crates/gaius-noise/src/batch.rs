@@ -4,7 +4,7 @@
 //! scalar sampler; a SIMD specialisation can override `sample_points` per
 //! type as long as it stays bit-identical to `sample`.
 
-use crate::{synth32, synth64, Profile, RandomSource};
+use crate::{synth32, synth64, RandomSource, Semantics};
 
 pub trait PointSampler {
     /// One sample; float results (26.3) are widened exactly to `f64`.
@@ -40,7 +40,7 @@ point_sampler!(synth32::SmearedPerlinNoise, |s, x, y, z| s.get(x, y, z) as f64);
 point_sampler!(synth32::SimplexNoise, |s, x, y, z| s.get(x, y, z) as f64);
 point_sampler!(synth32::NoiseStack, |s, x, y, z| s.get(x, y, z) as f64);
 
-/// A `NormalNoise` of any profile, ready to sample.
+/// A `NormalNoise` of any semantics, ready to sample.
 #[derive(Clone, Debug)]
 pub enum ProfileNormalNoise {
     /// 1.21.11 / 26.2.
@@ -50,10 +50,10 @@ pub enum ProfileNormalNoise {
 }
 
 impl ProfileNormalNoise {
-    /// Pre-26.3 `NoiseParameters(firstOctave, amplitudes)`; on 26.3 this is
-    /// `NormalNoise.createParity(firstOctave, amplitudes).create(random)`.
-    pub fn parity(profile: Profile, random: &mut RandomSource, first_octave: i32, amplitudes: &[f64]) -> Self {
-        if profile.uses_synth32() {
+    /// Pre-26.3 `NoiseParameters(firstOctave, amplitudes)`; with float synth classes (26.3)
+    /// this is `NormalNoise.createParity(firstOctave, amplitudes).create(random)`.
+    pub fn parity(semantics: Semantics, random: &mut RandomSource, first_octave: i32, amplitudes: &[f64]) -> Self {
+        if semantics.uses_synth32() {
             let params = synth32::NormalNoiseParameters::parity(first_octave, amplitudes);
             ProfileNormalNoise::Float(synth32::NormalNoise::new(params).create(random))
         } else {
@@ -61,7 +61,7 @@ impl ProfileNormalNoise {
                 random,
                 first_octave,
                 amplitudes,
-                profile.floor_mode(),
+                semantics.floor_mode,
             ))
         }
     }
@@ -96,9 +96,9 @@ mod tests {
 
     #[test]
     fn batch_matches_scalar() {
-        for profile in Profile::ALL {
+        for &semantics in Semantics::all() {
             let mut random = RandomSource::new(RandomKind::Xoroshiro, 1234);
-            let noise = ProfileNormalNoise::parity(profile, &mut random, -7, &[1.0, 1.0, 0.0, 2.0]);
+            let noise = ProfileNormalNoise::parity(semantics, &mut random, -7, &[1.0, 1.0, 0.0, 2.0]);
             let xyz: Vec<f64> = (0..30).map(|i| i as f64 * 13.37 - 100.0).collect();
             let mut out = vec![0.0; 10];
             noise.sample_points(&xyz, &mut out);
@@ -106,7 +106,7 @@ mod tests {
                 assert_eq!(o.to_bits(), noise.sample(p[0], p[1], p[2]).to_bits());
             }
             assert!(out.iter().all(|v| v.is_finite()));
-            assert!(out.iter().any(|&v| v != 0.0), "{profile:?} produced only zeros");
+            assert!(out.iter().any(|&v| v != 0.0), "{semantics:?} produced only zeros");
         }
     }
 }

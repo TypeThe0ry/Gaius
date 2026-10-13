@@ -179,6 +179,7 @@
       this.stats = {
         submitted: 0, completed: 0, failed: 0, cancelled: 0, superseded: 0, deduped: 0, stale: 0,
         dropped: 0, retried: 0, crashes: 0, spawned: 0, respawns: 0, retired: 0,
+        transferMs: 0, maxTransferMs: 0,
       };
       this.kindStats = new Map();
       this.reconcile(false);
@@ -205,6 +206,9 @@
     // --- submission -------------------------------------------------------------------------
 
     submit(kind, payload, opts = {}) {
+      if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.allowed(kind, opts.kernel, this.options.profileId)) {
+        return Promise.reject(new KernelPoolError("needs-vanilla", "NEEDS_VANILLA: kernel mirror is disabled", {kind}));
+      }
       if (this.terminated) return Promise.reject(new KernelPoolError("terminated", `kernel pool ${this.name} is terminated`));
       if (this.halted) return Promise.reject(this.halted);
       if (this.kinds && !this.kinds.has(kind)) {
@@ -242,6 +246,7 @@
       if (key !== null) this.byKey.set(key, job);
       if (opts.signal) this.watchSignal(job, opts.signal);
       this.stats.submitted++;
+      this.kindStat(kind).submitted++;
       this.enqueue(job, priority);
       this.schedulePump();
       return job.promise;
@@ -347,6 +352,7 @@
         job.payload = keepCopy ? buffer.slice(0) : null;
       }
       slot.inflight.set(job.id, job);
+      const transferStarted = now();
       try {
         slot.worker.postMessage({type: "job", id: job.id, kind: job.kind, payload: buffer},
           job.transfer ? [buffer] : []);
@@ -355,6 +361,9 @@
         this.fail(job, new KernelPoolError("post-failed", String(error && error.message || error), {kind: job.kind}));
         return;
       }
+      const transferMs = Math.max(0, now() - transferStarted);
+      this.stats.transferMs += transferMs;
+      this.stats.maxTransferMs = Math.max(this.stats.maxTransferMs, transferMs);
       if (slot.watchdog === null) this.armWatchdog(slot);
     }
 
@@ -534,6 +543,8 @@
     // then spawns; when shrinking, idle workers go first and busy ones drain.
     reconcile(respawn) {
       if (this.terminated) return;
+      if (!global.GaiusKernelMirror || !this.kinds
+        || ![...this.kinds].some((kind) => global.GaiusKernelMirror.allowed(kind, null, this.options.profileId))) return;
       const target = this.targetSize;
       let active = this.activeSlots().length;
       for (const slot of this.slots) {
@@ -623,7 +634,7 @@
     kindStat(kind) {
       let stat = this.kindStats.get(kind);
       if (!stat) {
-        stat = {completed: 0, failed: 0, totalMs: 0, maxMs: 0, totalExecMs: 0, maxExecMs: 0};
+        stat = {submitted: 0, completed: 0, failed: 0, totalMs: 0, maxMs: 0, totalExecMs: 0, maxExecMs: 0};
         this.kindStats.set(kind, stat);
       }
       return stat;
@@ -633,7 +644,7 @@
       const kinds = {};
       for (const [kind, stat] of this.kindStats) {
         kinds[kind] = {
-          completed: stat.completed,
+          submitted: stat.submitted, completed: stat.completed,
           failed: stat.failed,
           meanMs: stat.completed ? stat.totalMs / stat.completed : 0,
           maxMs: stat.maxMs,

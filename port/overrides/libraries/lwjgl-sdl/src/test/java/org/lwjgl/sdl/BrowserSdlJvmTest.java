@@ -32,8 +32,12 @@ import org.lwjgl.system.MemoryUtil;
  *   <li>SDL_PollEvent / SDL_FlushEvents / SDL_GetKeyboardState through the patched
  *       {@code SDLEvents}/{@code SDLKeyboard} classes: the keyboard state mirror, text
  *       payload lifetime, re-entrant polling and the flush resync.</li>
+ *   <li>The game-loop boundary (BrowserSdlDom.loopBoundary) is reached once per drain cycle
+ *       of SDL_PollEvent, not per event and not for SDL_PollEvent(NULL).</li>
  *   <li>Pure-Java entry points through the redirected bodies: SDL.getLibrary() without a
  *       native library, key names, GL attributes, GetProcAddress, displays.</li>
+ *   <li>The present yield's rule for frames presented from a JavaScript callback: only
+ *       TeaVM's refusal to suspend outside a TeaVM thread is skipped.</li>
  * </ul>
  * Exits with status 1 on the first failed check.
  */
@@ -50,7 +54,9 @@ public final class BrowserSdlJvmTest {
         mouseEventFields();
         windowEventFields();
         pollFlushAndKeyboardState();
+        loopBoundaryPerDrainCycle();
         redirectedEntryPoints();
+        nonThreadingPresentYield();
         System.out.println("BrowserSdlJvmTest passed: " + checks + " checks");
     }
 
@@ -92,6 +98,7 @@ public final class BrowserSdlJvmTest {
         final Deque<Rec> queue = new ArrayDeque<>();
         final byte[] keys = new byte[512];
         Rec current;
+        int loopBoundaries;
 
         void apply(Rec rec) {
             if (rec.type == BrowserSdlEvents.SDL_EVENT_KEY_DOWN || rec.type == BrowserSdlEvents.SDL_EVENT_KEY_UP) {
@@ -159,6 +166,11 @@ public final class BrowserSdlJvmTest {
         @Override
         public int keyState(int scancode) {
             return keys[scancode & 511];
+        }
+
+        @Override
+        public void loopBoundary() {
+            loopBoundaries++;
         }
     }
 
@@ -441,5 +453,47 @@ public final class BrowserSdlJvmTest {
         check(SDLVideo.SDL_SyncWindow(1L), "SDL_SyncWindow");
 
         SDLStdinc.SDL_free((PointerBuffer) null);
+    }
+
+    // ------------------------------------------------------------------ loop boundary
+
+    private static void loopBoundaryPerDrainCycle() {
+        FakeSource source = new FakeSource();
+        BrowserSdlEvents.useSource(source);
+        source.queue.add(Rec.of(BrowserSdlEvents.SDL_EVENT_KEY_DOWN, 4, 97, 0, 0, 65, 0, 0, 0, null));
+        source.queue.add(Rec.of(BrowserSdlEvents.SDL_EVENT_KEY_UP, 4, 97, 0, 0, 65, 0, 0, 0, null));
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            SDL_Event event = SDL_Event.malloc(stack);
+            int polled = 0;
+            while (SDLEvents.SDL_PollEvent(event)) {
+                polled++;
+            }
+            equal(2, polled, "both events of the first cycle");
+            equal(1, source.loopBoundaries, "one boundary for a cycle of two events and the empty answer");
+            check(!SDLEvents.SDL_PollEvent(null), "SDL_PollEvent(NULL) on an empty queue");
+            equal(1, source.loopBoundaries, "SDL_PollEvent(NULL) is no boundary");
+            check(!SDLEvents.SDL_PollEvent(event), "an empty cycle");
+            equal(2, source.loopBoundaries, "an empty cycle is one boundary");
+            source.queue.add(Rec.of(BrowserSdlEvents.SDL_EVENT_TEXT_INPUT, 0, 0, 0, 0, 0, 0, 0, 0, "a"));
+            check(SDLEvents.SDL_PollEvent(event), "the next cycle's event");
+            check(!SDLEvents.SDL_PollEvent(event), "the next cycle drained");
+            equal(3, source.loopBoundaries, "one boundary per cycle");
+        }
+        BrowserSdlEvents.useSource(null);
+    }
+
+    // ------------------------------------------------------------------ present yield
+
+    private static void nonThreadingPresentYield() {
+        // The message TeaVM's runtime throws, wrapped the way a JavaScript Error reaches Java.
+        check(BrowserSdlDom.isNonThreadingSuspension(new RuntimeException(
+                "(JavaScript) Error: Suspension point reached from non-threading context (perhaps, from"
+                        + " native JS method). See https://teavm.org/docs/runtime/coroutines.html"
+                        + " ('Interaction with JavaScript' section)")),
+                "a frame presented from a JavaScript callback skips its yield");
+        check(!BrowserSdlDom.isNonThreadingSuspension(new RuntimeException("Invalid recorded state")),
+                "other coroutine failures still propagate");
+        check(!BrowserSdlDom.isNonThreadingSuspension(new IllegalStateException()),
+                "a failure without a message still propagates");
     }
 }

@@ -1,0 +1,52 @@
+{
+  "exceptions": [
+    {
+      "paths": ["port/mc/shared/canonical/src/java/dev/gaius/browser/kernel/mesh/Blaze3dMeshOps.java", "port/mc/shared/renderpearl-1/src/java/dev/gaius/browser/kernel/mesh/RenderpearlMeshOps.java"],
+      "reason": "Tiny generation adapters intentionally share an interface; every operation has a different vanilla contract. Keep the callers single-source."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/src/java/dev/gaius/browser/kernel/light/DampeningLightOps.java", "port/mc/shared/legacy-12111/src/java/dev/gaius/browser/kernel/light/LightBlockLightOps.java"],
+      "reason": "Tiny generation adapters intentionally share an interface; every operation names a different vanilla member. Keep the light kernel bridge single-source."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/client/java/net/minecraft/client/sounds/SoundEngineExecutor.java", "port/mc/shared/legacy-12111/client/java/net/minecraft/client/sounds/SoundEngineExecutor.java"],
+      "reason": "Legacy executor constructor ABI differs; retained compatibility implementation."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/client/java/dev/gaius/browser/BrowserTextureSlotsCompat.java", "port/mc/shared/legacy-12111/client/java/dev/gaius/browser/BrowserTextureSlotsCompat.java"],
+      "reason": "Legacy texture binding signatures differ; retained compatibility implementation."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/client/java/net/minecraft/server/packs/VanillaPackResources.java", "port/mc/shared/legacy-12111/client/java/net/minecraft/server/packs/VanillaPackResources.java"],
+      "reason": "Legacy pack-resource contract differs; retained compatibility implementation."
+    },
+    {
+      "paths": ["port/mc/shared/legacy-12111/client/java/net/minecraft/server/packs/VanillaPackResources.java", "port/mc/shared/renderpearl-1/client/java/net/minecraft/server/packs/FixedPathPackResources.java"],
+      "reason": "Legacy pack-resource contract differs from the newer fixed-path resource type."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/client/java/net/minecraft/client/resources/model/BrowserModelDependencyScheduler.java", "port/mc/shared/legacy-12111/client/java/net/minecraft/client/resources/model/BrowserModelDependencyScheduler.java"],
+      "reason": "Legacy model-dependency task ABI differs; retained compatibility implementation."
+    },
+    {
+      "paths": ["port/mc/shared/legacy-12111/src/java/dev/gaius/browser/BrowserScreens.java", "port/src/main/java/dev/gaius/browser/BrowserScreens.java"],
+      "reason": "Legacy screen entry points differ; retained compatibility implementation."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/src/java/dev/gaius/browser/kernel/worldgen/WorldgenKernelHooks262.java", "port/mc/shared/renderpearl-1/src/java/dev/gaius/browser/kernel/worldgen/ChunkGeneratorKernelHooks263.java"],
+      "reason": "Patcher-injected hook interfaces of two generations. WorldgenKernelPatches adds each one by class name to a different vanilla generator class and renames different vanilla methods: the NoiseBasedChunkGenerator hooks of the separate-step generation declare the renamed fillFromNoise and createBiomes, the ChunkGenerator hook of the merged-terrain generation declares only createBiomes. Names and member sets are the patch contract of each generation, and the files are about 15 lines."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/src/java/dev/gaius/browser/kernel/worldgen/WorldgenSeedSource262.java", "port/src/main/java/dev/gaius/browser/kernel/mesh/MeshBiomeAccess.java"],
+      "reason": "Unrelated one-method accessor interfaces that two patchers add by name to two different vanilla classes (WorldgenKernelPatches gives StructureManager the world seed, MeshKernelPatches gives BiomeManager the biome zoom seed). Names and members are patch contracts; the score comes from ten lines of boilerplate."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/src/java/dev/gaius/browser/kernel/worldgen/WorldgenKernel262.java", "port/mc/shared/renderpearl-1/src/java/dev/gaius/browser/kernel/worldgen/WorldgenKernel263.java"],
+      "reason": "Different vanilla worldgen algorithms behind the same kernel facade. The separate-step generation hooks fillFromNoise (keeping the noise chunk in the facade), createBiomes and the surface step (kept-noise bookkeeping and surface diff application), and leaves the carvers to vanilla; the merged-terrain generation hooks buildTerrain, whose carvers run on a kernel-filled chunk through the generator bridge interface. Hook signatures, exporter calls, eligibility checks and the biome fill differ per vanilla contract."
+    },
+    {
+      "paths": ["port/mc/shared/canonical/client/java/net/minecraft/server/packs/VanillaPackResources.java", "port/mc/shared/renderpearl-1/client/java/net/minecraft/server/packs/FixedPathPackResources.java"],
+      "reason": "Client overrides of two differently named vanilla classes. The newer generation moved the PackResources implementation into FixedPathPackResources and left VanillaPackResources a plain holder that builds the resource provider view itself, so each file has to declare the vanilla class it replaces (the replacement has no asProvider and names itself in its class loader lookups). Sharing the body through a helper class would change the compiled overlay classes of the JS overlay gate."
+    }
+  ]
+}

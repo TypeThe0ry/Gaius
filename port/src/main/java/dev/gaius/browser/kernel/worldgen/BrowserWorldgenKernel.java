@@ -37,7 +37,7 @@ public final class BrowserWorldgenKernel {
 
     /** Whether new jobs may go to the kernel. Cheap enough to call per chunk. */
     public static boolean available() {
-        return !disabled && facadeUsable();
+        return !disabled && dev.gaius.browser.kernel.KernelMirror.enabled("worldgen") && facadeUsable();
     }
 
     /** Keeps every later chunk on the Java path. */
@@ -69,7 +69,7 @@ public final class BrowserWorldgenKernel {
 
     /** Registers a generator IR under {@code key} and starts the pool. */
     public static boolean registerGenerator(int key, byte[] ir) {
-        if (!facadeUsable()) {
+        if (!available()) {
             return false;
         }
         boolean ok = registerGeneratorNative(key, ir);
@@ -112,17 +112,25 @@ public final class BrowserWorldgenKernel {
      */
     public static void submitTerrain(int key, int chunkX, int chunkZ, int flags, int[] beard, int[] ringBiomes,
             ChunkCallback onResult, ErrorCallback onError) {
+        if (!available()) {
+            onError.accept("transient:needs-vanilla:NEEDS_VANILLA");
+            return;
+        }
         submitTerrainNative(key, chunkX, chunkZ, flags, beard, ringBiomes == null ? NO_RING : ringBiomes,
                 onResult, onError);
     }
 
     public static void submitBiomes(int key, int chunkX, int chunkZ, IdsCallback onResult, ErrorCallback onError) {
+        if (!available()) {
+            onError.accept("transient:needs-vanilla:NEEDS_VANILLA");
+            return;
+        }
         submitBiomesNative(key, chunkX, chunkZ, onResult, onError);
     }
 
     /** Whether the facade can run the surface rules on a kept noise chunk. */
     public static boolean surfaceSupported() {
-        return surfaceSupportedNative();
+        return available() && surfaceSupportedNative();
     }
 
     /**
@@ -133,6 +141,10 @@ public final class BrowserWorldgenKernel {
      */
     public static void submitSurface(int key, int token, int chunkX, int chunkZ, int[] beard, int[] ringBiomes,
             ChunkCallback onResult, ErrorCallback onError) {
+        if (!available()) {
+            onError.accept("transient:needs-vanilla:NEEDS_VANILLA");
+            return;
+        }
         submitSurfaceNative(key, token, chunkX, chunkZ, beard, ringBiomes == null ? NO_RING : ringBiomes,
                 onResult, onError);
     }
@@ -180,6 +192,11 @@ public final class BrowserWorldgenKernel {
         if (length < 0) {
             return null;
         }
+        if (JsArrays.LINEAR_MEMORY) {
+            // WebAssembly GC: one copy out of the result (a typed-array view of a Java array is
+            // itself a copy there, and readBack copies once more).
+            return int32Field(chunk, field).copyToJavaArray();
+        }
         int[] out = new int[length];
         copyInts(chunk, field, out);
         return out;
@@ -188,6 +205,9 @@ public final class BrowserWorldgenKernel {
     /** Copies the section index array (u16 values, read them with {@code & 0xFFFF}). */
     public static short[] chunkIndices(KernelChunk chunk) {
         int length = arrayLength(chunk, "indices");
+        if (JsArrays.LINEAR_MEMORY) {
+            return length > 0 ? int16Field(chunk, "indices").copyToJavaArray() : new short[0];
+        }
         short[] out = new short[Math.max(0, length)];
         if (length > 0) {
             copyShorts(chunk, "indices", out);
@@ -197,6 +217,9 @@ public final class BrowserWorldgenKernel {
 
     public static byte[] chunkBytes(KernelChunk chunk, String field) {
         int length = arrayLength(chunk, field);
+        if (JsArrays.LINEAR_MEMORY) {
+            return length > 0 ? int8Field(chunk, field).copyToJavaArray() : new byte[0];
+        }
         byte[] out = new byte[Math.max(0, length)];
         if (length > 0) {
             copyBytes(chunk, field, out);
@@ -207,6 +230,9 @@ public final class BrowserWorldgenKernel {
     /** Copies a biome id result. */
     public static int[] ids(JSObject ids) {
         int length = typedLength(ids);
+        if (JsArrays.LINEAR_MEMORY) {
+            return length > 0 ? int32View(ids).copyToJavaArray() : new int[0];
+        }
         int[] out = new int[Math.max(0, length)];
         if (length > 0) {
             copyTypedInts(ids, out);
@@ -315,6 +341,28 @@ public final class BrowserWorldgenKernel {
 
     @JSBody(params = "a", script = "return a ? a.length : -1;")
     private static native int typedLength(JSObject a);
+
+    // WebAssembly GC result reads: the field as a typed array of the Java element type, with the
+    // conversion of the JavaScript build's out.set(field) (unsigned arrays are reinterpreted,
+    // which is the same two's complement wrap).
+    @JSBody(params = {"chunk", "field"}, script = "var a = chunk[field];"
+            + "return a instanceof Int32Array ? a : a instanceof Uint32Array"
+            + " ? new Int32Array(a.buffer, a.byteOffset, a.length) : new Int32Array(a);")
+    private static native Int32Array int32Field(KernelChunk chunk, String field);
+
+    @JSBody(params = {"chunk", "field"}, script = "var a = chunk[field];"
+            + "return a instanceof Int16Array ? a : a instanceof Uint16Array"
+            + " ? new Int16Array(a.buffer, a.byteOffset, a.length) : new Int16Array(a);")
+    private static native Int16Array int16Field(KernelChunk chunk, String field);
+
+    @JSBody(params = {"chunk", "field"}, script = "var a = chunk[field];"
+            + "return a instanceof Int8Array ? a : (a instanceof Uint8Array || a instanceof Uint8ClampedArray)"
+            + " ? new Int8Array(a.buffer, a.byteOffset, a.length) : new Int8Array(a);")
+    private static native Int8Array int8Field(KernelChunk chunk, String field);
+
+    @JSBody(params = "a", script = "return a instanceof Int32Array ? a : a instanceof Uint32Array"
+            + " ? new Int32Array(a.buffer, a.byteOffset, a.length) : new Int32Array(a);")
+    private static native Int32Array int32View(JSObject a);
 
     @JSBody(params = {"a", "out"}, script = "out.set(a);")
     private static native void copyTypedIntsJs(JSObject a, Int32Array out);

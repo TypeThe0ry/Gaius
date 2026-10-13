@@ -14,6 +14,7 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultChannelConfig;
 import io.netty.channel.EventLoop;
+import io.netty.channel.local.LocalAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.channels.AlreadyConnectedException;
@@ -535,7 +536,22 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 return address.getAddress().getHostAddress();
             }
         }
-        throw new ChannelException("Unsupported browser remote address: " + remote);
+        throw unsupportedRemote(remote);
+    }
+
+    /**
+     * A netty LocalAddress is vanilla's in-page integrated server. Singleplayer runs in the
+     * integrated server Worker (BrowserSingleplayerClient) and its client connects to a
+     * client-&lt;session&gt;.gaius-local host instead, so a local address means that path was
+     * bypassed.
+     */
+    private static ChannelException unsupportedRemote(SocketAddress remote) {
+        if (remote instanceof LocalAddress) {
+            return new ChannelException("Unsupported browser remote address: " + remote
+                    + " (the in-page integrated server is not supported; singleplayer runs in the"
+                    + " integrated server Worker)");
+        }
+        return new ChannelException("Unsupported browser remote address: " + remote);
     }
 
     /** Returns the current integrated-server client host, or an empty string when none is active. */
@@ -644,7 +660,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         if (remote instanceof InetSocketAddress address) {
             return address.getPort();
         }
-        throw new ChannelException("Unsupported browser remote address: " + remote);
+        throw unsupportedRemote(remote);
     }
 
     private static void addChannel(BrowserWebSocketChannel channel) {
@@ -2500,6 +2516,14 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               }
               const control = {type: 'connect', host: entry.host, port: entry.port};
               const tunnelRole = localTunnelRole(entry.host);
+              if (!candidate.direct && !tunnelRole) {
+                if (entry.relayProtocolDeclaration === undefined) {
+                  entry.relayProtocolDeclaration = globalThis.__gaiusRelayProtocolDeclaration || null;
+                }
+                if (entry.relayProtocolDeclaration) {
+                  control.protocolTable = entry.relayProtocolDeclaration;
+                }
+              }
               if (tunnelRole) {
                 const skin = localSkinDescriptor(tunnelRole);
                 if (skin) control.skinDescriptor = skin;
@@ -2551,6 +2575,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   }
                   if (message && message.type === 'connected') {
                     if (entry.connected) return;
+                    if (!candidate.direct && message.protocolTable !== undefined &&
+                        (!entry.relayProtocolDeclaration || !message.protocolTable ||
+                         message.protocolTable.formatVersion !== entry.relayProtocolDeclaration.formatVersion ||
+                         message.protocolTable.sha256 !== entry.relayProtocolDeclaration.sha256)) {
+                      state.failInbound(entry, 'RelayNode protocol table acknowledgement mismatch');
+                      return;
+                    }
                     const attestationPresent = typeof message.host === 'string' &&
                       Number.isInteger(Number(message.port));
                     const attestationMatches = attestationPresent &&

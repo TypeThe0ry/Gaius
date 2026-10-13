@@ -3,9 +3,9 @@ package dev.gaius.browser.kernel.light;
 import net.minecraft.world.level.ChunkPos;
 
 /**
- * Added to {@code ThreadedLevelLightEngine} by {@code dev.gaius.tools.kernel.LightKernelPatches}:
- * the private pieces of the vanilla engine that the light kernel path needs. Cast the engine
- * through {@code Object} to reach them.
+ * Added to {@code ThreadedLevelLightEngine} by
+ * {@code dev.gaius.tools.patches.light.LightKernelPatches}: the private pieces of the vanilla
+ * engine that the light kernel path needs. Cast the engine through {@code Object} to reach them.
  */
 public interface BrowserLightEngineHooks {
     /** {@code ThreadedLevelLightEngine$TaskType} ordinals for {@link #gaius$addLightTask}. */

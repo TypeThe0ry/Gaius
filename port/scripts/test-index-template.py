@@ -10,13 +10,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+from verification_profiles import CANONICAL_ID, LEGACY_ID
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "port" / "web" / "launcher" / "index.template.html"
 POSTPROCESS = ROOT / "port" / "scripts" / "postprocess-index-html.py"
 PROFILES = (
-    ROOT / "port" / "versions" / "26.2.json",
-    ROOT / "port" / "versions" / "1.21.11.json",
+    ROOT / "port" / "versions" / ("" + CANONICAL_ID + ".json"),
+    ROOT / "port" / "versions" / ("" + LEGACY_ID + ".json"),
 )
 
 
@@ -132,12 +134,12 @@ def main() -> int:
         raise AssertionError("tracked launcher template must not be the redirect wrapper")
     require(template, "function decodeGaiusVanillaAssets(source)", "template")
     for forbidden in (
-        "26.2",
-        "1.21.11",
+        CANONICAL_ID,
+        LEGACY_ID,
         "gaius.fs.v2:",
         "gaius-fs-v2-",
         "regions-v2-",
-        'window.__gaiusProfileId = "26.2";',
+        ('window.__gaiusProfileId = "' + CANONICAL_ID + '";'),
         'window.__gaiusWorldVersion = 4903;',
         '"--assetIndex", "32",',
     ):

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
@@ -44,19 +45,19 @@ const source = await readFile(script, "utf8");
 const benchmarkSource = await readFile(benchmarkScript, "utf8");
 const fixtureRoot = await mkdtemp(join(tmpdir(), "gaius-release-suite-smoke-"));
 const fixtureProfileBytes = new Map();
-for (const profileId of ["26.2", "1.21.11"]) {
+for (const profileId of [CANONICAL_PROFILE.id, LEGACY_PROFILE.id]) {
   const profilePath = fileURLToPath(new URL(`../versions/${profileId}.json`, import.meta.url));
   const profileBytes = await readFile(profilePath);
   fixtureProfileBytes.set(profileId, createHash("sha256").update(profileBytes).digest("hex"));
 }
 const suiteManifestIdentities = new Map([
-  ["26.2", {
+  [CANONICAL_PROFILE.id, {
     ...releaseManifestFixtureIdentity,
-    profileSha256: fixtureProfileBytes.get("26.2"),
+    profileSha256: fixtureProfileBytes.get(CANONICAL_PROFILE.id),
   }],
-  ["1.21.11", {
+  [LEGACY_PROFILE.id, {
     ...legacyReleaseManifestFixtureIdentity,
-    profileSha256: fixtureProfileBytes.get("1.21.11"),
+    profileSha256: fixtureProfileBytes.get(LEGACY_PROFILE.id),
   }],
 ]);
 for (const identity of suiteManifestIdentities.values()) {
@@ -67,11 +68,11 @@ for (const identity of suiteManifestIdentities.values()) {
     `${JSON.stringify(makeManifestIdentityFixture(identity), null, 2)}\n`,
   );
 }
-const suiteExecOptions = (identityOrExtra = suiteManifestIdentities.get("26.2"), extra = {}) => {
+const suiteExecOptions = (identityOrExtra = suiteManifestIdentities.get(CANONICAL_PROFILE.id), extra = {}) => {
   const usesIdentity = identityOrExtra?.profileId != null;
   const identity = usesIdentity
     ? identityOrExtra
-    : suiteManifestIdentities.get("26.2");
+    : suiteManifestIdentities.get(CANONICAL_PROFILE.id);
   const options = usesIdentity ? extra : identityOrExtra;
   return {
     encoding: "utf8",
@@ -1256,12 +1257,12 @@ const benchmarkConfigurationFor = (identity) => JSON.parse(execFileSync(
   suiteExecOptions(identity),
 ));
 for (const [profileId, expected] of [
-  ["26.2", {
+  [CANONICAL_PROFILE.id, {
     protocolVersion: 776,
     worldVersion: 4903,
     worldgenTelemetryMode: "task-pulsed",
   }],
-  ["1.21.11", {
+  [LEGACY_PROFILE.id, {
     protocolVersion: 774,
     worldVersion: 4671,
     worldgenTelemetryMode: "checkpoint-only",
@@ -1300,10 +1301,10 @@ const configuration = JSON.parse(execFileSync(
   suiteExecOptions(),
 ));
 assert.equal(configuration.buildIdentity.coherent, true);
-assert.equal(configuration.activeProfile.id, "26.2");
-assert.equal(configuration.activeProfile.path, "versions/26.2.json");
+assert.equal(configuration.activeProfile.id, CANONICAL_PROFILE.id);
+assert.equal(configuration.activeProfile.path, "versions/" + CANONICAL_PROFILE.id + ".json");
 assert.equal(configuration.activeProfile.worldgenTelemetryMode, "task-pulsed");
-assert.equal(configuration.buildIdentity.profilePath, "versions/26.2.json");
+assert.equal(configuration.buildIdentity.profilePath, "versions/" + CANONICAL_PROFILE.id + ".json");
 assert.equal(configuration.buildIdentity.nestedProfile.worldVersion, 4903);
 assert.equal(configuration.buildIdentity.worldVersion, 4903);
 assert.equal(configuration.buildIdentity.worldgenTelemetryMode, "task-pulsed");
@@ -1333,19 +1334,19 @@ assert.equal(configuration.releaseEvidence, false);
 assert.ok(
   configuration.profiles.length > 0
     && configuration.profiles.every((profile) => profile.releaseEvidence === true),
-  "strict 26.2 suite profiles must remain release-gating",
+  "strict " + CANONICAL_PROFILE.id + " suite profiles must remain release-gating",
 );
 
 const legacyConfiguration = JSON.parse(execFileSync(
   process.execPath,
   [script, "--print-config"],
-  suiteExecOptions(suiteManifestIdentities.get("1.21.11")),
+  suiteExecOptions(suiteManifestIdentities.get(LEGACY_PROFILE.id)),
 ));
-assert.equal(legacyConfiguration.activeProfile.id, "1.21.11");
-assert.equal(legacyConfiguration.activeProfile.path, "versions/1.21.11.json");
+assert.equal(legacyConfiguration.activeProfile.id, LEGACY_PROFILE.id);
+assert.equal(legacyConfiguration.activeProfile.path, "versions/" + LEGACY_PROFILE.id + ".json");
 assert.equal(legacyConfiguration.activeProfile.worldVersion, 4671);
 assert.equal(legacyConfiguration.activeProfile.worldgenTelemetryMode, "checkpoint-only");
-assert.equal(legacyConfiguration.buildIdentity.profilePath, "versions/1.21.11.json");
+assert.equal(legacyConfiguration.buildIdentity.profilePath, "versions/" + LEGACY_PROFILE.id + ".json");
 assert.equal(legacyConfiguration.buildIdentity.nestedProfile.worldVersion, 4671);
 assert.equal(legacyConfiguration.buildIdentity.worldgenTelemetryMode, "checkpoint-only");
 assert.deepEqual(
@@ -1355,7 +1356,7 @@ assert.deepEqual(
 assert.ok(
   legacyConfiguration.profiles.length > 0
     && legacyConfiguration.profiles.every((profile) => profile.releaseEvidence === true),
-  "strict 1.21.11 suite profiles must remain release-gating",
+  "strict " + LEGACY_PROFILE.id + " suite profiles must remain release-gating",
 );
 
 const matrixConfiguration = JSON.parse(execFileSync(

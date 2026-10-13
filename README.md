@@ -43,6 +43,21 @@ reloading the page. The 1.21.11 client has no in-game profile editor. The file
 contains the browser launcher and its Worker payloads; there is no separate web
 server to start for this mode.
 
+### Runtime and browser requirements
+
+Release sites select the runtime automatically. When the browser provides
+WebAssembly GC, `try_table` exception handling, JSPI, and the profile's Wasm
+modules, Gaius uses the WasmGC client and integrated server. Otherwise it loads
+the frozen JavaScript runtime. WebGPU is selected when a working adapter and
+the profile's shader assets are available; a missing adapter or failed startup
+uses WebGL2. The diagnostic query switches are `?runtime=wasm|js|auto`,
+`?serverRuntime=wasm`, and `?gpu=webgpu|webgl2`.
+
+Use a current Chrome or Chromium. Portable `file://` pages do not have Service
+Worker control, so the launcher inflates gzip modules in the page and uses the
+IndexedDB storage fallback where needed. Browsers without the WasmGC or JSPI
+features can still run the frozen JavaScript client with WebGL2.
+
 ### Joining a server
 
 1. Open the downloaded `Gaius-1.21.11.html`, `Gaius-26.2.html` or
@@ -95,6 +110,8 @@ Then open `/dist/1.21.11/`, `/dist/26.2/` or `/dist/26.3/` in Chrome.
 - `packages/` — browser protocol and local-world support code.
 - `port/web/dist/<profile>/` — generated profile output; it is not hand-edited.
 - `docs/` — design notes, release checks, RelayNode notes, and screenshots.
+- `docs/architecture-v0.4.md` — contributor architecture for runtime selection,
+  generation seams, Rust kernels, parity gates, and bring-up.
 - `tools/` — repository checks and release helpers.
 
 ## Multiplayer

@@ -11,8 +11,8 @@
 //   ?gaiusRenderScale=1|0.85|0.75|0.67|0.6|0.5|auto   world render scale (default 1)
 //   ?gaiusTargetFps=<n>             frame-rate target of the automatic render scale (default 60)
 //   ?gaiusSharpness=0..2            RCAS sharpening in stops (0 = strongest, default 0.25)
-//   ?gaiusMaxDpr=<number>           canvas device-pixel-ratio cap (default per tier on 26.3,
-//                                   1 on the other profiles)
+//   ?gaiusMaxDpr=<number>           canvas device-pixel-ratio cap (default per tier on the
+//                                   renderpearl generations, 1 on the blaze3d profiles)
 //   ?gaiusOit=0|1                   force improved transparency (OIT) off/on
 //   ?gaiusInventoryWorldFps=<n>     world refresh rate behind inventory screens (0 = freeze)
 //   ?gaiusPresetReplay=1            vanilla behaviour: re-apply the graphics preset at startup
@@ -25,11 +25,16 @@
 
   const SETTINGS_KEY = "gaius.quality.settings.v1";
   const SCALE_STEPS = Object.freeze([0.5, 0.6, 0.67, 0.75, 0.85, 1]);
+  const PROFILE_CAPABILITIES = Object.freeze({
+    "1.21.11": Object.freeze({renderSeam: "blaze3d-direct-0", patchSet: "legacy-12111", terrainSectionUniformBlock: false}),
+    "26.2": Object.freeze({renderSeam: "blaze3d-backend-1", patchSet: "modern", terrainSectionUniformBlock: true}),
+    "26.3": Object.freeze({renderSeam: "renderpearl-1", patchSet: "modern", terrainSectionUniformBlock: true}),
+  });
 
   // Per-tier defaults. maxDpr caps the canvas allocation (the GUI always renders at the canvas
   // resolution): low and mid keep the v0.3 1x cap, because a native-ratio backing store
   // quadruples every world, GUI and post pass on a 2x display; high and ultra may go above it
-  // on 26.3 only (resolve() keeps the 1x cap on the other profiles).
+  // on the renderpearl generations only (resolve() keeps the 1x cap on the blaze3d profiles).
   // renderScale only scales the 3D world, which is then upscaled with EASU/RCAS. The tone
   // mapper is off on every tier (it compresses highlights and lifts saturation, changing the
   // vanilla look); the composite pass then only adds SSAO and bloom and clamps.
@@ -145,9 +150,14 @@
     return root.__gaiusGpuCaps || null;
   }
 
+  // Profile defaults are generated from port/versions/*.json; the page value is a diagnostic override.
   function renderPearlProfile() {
     try {
-      return String(root.__gaiusProfileId || "").trim() === "26.3";
+      const profile = PROFILE_CAPABILITIES[String(root.__gaiusProfileId || "").trim()];
+      const override = root.__gaiusRenderSeam;
+      const seam = typeof override === "string" && override.trim()
+        ? override : profile ? profile.renderSeam : "";
+      return /^renderpearl-\d+$/.test(String(seam).trim());
     } catch (error) {
       return false;
     }
@@ -155,7 +165,32 @@
 
   function tierName(caps) {
     const name = caps && caps.tier ? String(caps.tier) : "mid";
-    return TIER_DEFAULTS[name] ? name : "mid";
+    const gpuTier = TIER_DEFAULTS[name] ? name : "mid";
+    const p = params();
+    const override = p && p.get("gaiusMemoryTier");
+    const deviceMemory = Number(root.navigator && root.navigator.deviceMemory);
+    const heapLimit = Number(root.performance && root.performance.memory
+        && root.performance.memory.jsHeapSizeLimit);
+    const constrained = (deviceMemory > 0 && deviceMemory <= 4)
+        || (heapLimit > 0 && heapLimit <= 1024 * 1024 * 1024);
+    const selected = root.__gaiusRuntimeSelection && root.__gaiusRuntimeSelection.selected;
+    const wasm = selected ? selected === "wasm"
+        : !!(root.__gaiusWasmTimings || root.__gaiusWasmMemory
+            || (p && p.get("runtime") === "wasm"));
+    const enabled = wasm && override !== "off" && override !== "0";
+    const lowMemory = enabled && (override === "low" || constrained);
+    root.__gaiusMemoryTier = {
+      chosenTier: lowMemory ? "low" : gpuTier,
+      gpuTier: gpuTier,
+      reason: lowMemory ? (override === "low" ? "override"
+          : deviceMemory > 0 && deviceMemory <= 4 ? "device-memory" : "heap-limit") : "gpu",
+      deviceMemoryGiB: deviceMemory > 0 ? deviceMemory : null,
+      heapLimitBytes: heapLimit > 0 ? heapLimit : null,
+      lowMemory: !!lowMemory,
+      vanillaDefaults: lowMemory ? {renderDistance: 6, simulationDistance: 4,
+        mipmapLevels: 2, particles: "decreased", graphics: "fast", oit: false} : null
+    };
+    return root.__gaiusMemoryTier.chosenTier;
   }
 
   function resolve() {
@@ -195,8 +230,9 @@
       renderScale = quantizeScale(number(scaleSetting, 1, SCALE_STEPS[0], 1));
     }
 
-    // Only 26.3 has the world render scale and EASU path behind a large backing store; 26.2 and
-    // 1.21.11 share the canvas code but keep the v0.3 1x cap unless ?gaiusMaxDpr asks otherwise.
+    // Only the renderpearl generations have the world render scale and EASU path behind a large
+    // backing store; the blaze3d profiles share the canvas code but keep the v0.3 1x cap unless
+    // ?gaiusMaxDpr asks otherwise.
     const dprParam = get("gaiusMaxDpr");
     const profileDpr = renderPearlProfile() ? base.maxDpr : Math.min(base.maxDpr, 1);
     const maxDpr = number(dprParam, profileDpr, 0.5, 4);
@@ -216,6 +252,7 @@
     const settings = {
       tier: tier,
       tierIndex: ["low", "mid", "high", "ultra"].indexOf(tier),
+      memoryTier: root.__gaiusMemoryTier,
       postTier: postTier,
       maxDpr: maxDpr,
       renderScaleMode: scaleMode,

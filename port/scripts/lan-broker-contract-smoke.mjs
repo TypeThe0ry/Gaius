@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
+import {patcherSource} from "./patcher-sources.mjs";
+import {loadProfiles, sourceFile} from "../tools/sourcesets/sourcesets.mjs";
 
 const root = new URL("../..", import.meta.url);
 const source = async relative => readFile(new URL(relative, root), "utf8");
 
-const listenerPatcher = await source("port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java");
+// MinecraftClientPatcher with its domain classes (port/tools/patchkit/README.md, "Domains").
+const listenerPatcher = patcherSource("MinecraftClientPatcher");
 const nettyPatcher = await source("port/tools/src/main/java/dev/gaius/tools/NettyBrowserPatcher.java");
 const server = await source("port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java");
 const lan = await source("port/src/main/java/dev/gaius/browser/BrowserLanSession.java");
@@ -32,17 +35,20 @@ assert.match(server, /BrowserWebSocketChannel\.beginRelayOnlySession\(sessionId\
 assert.match(server, /BrowserWebSocketChannel\.endRelayOnlySession\(sessionId\)/);
 assert.match(server, /max-players=8/);
 assert.match(lan, /UUID\.randomUUID\(\)/);
-assert.match(lan, /publishLanInvite\(brokerSessionId\)/);
-// The 26.3 copy (port/src/versions/26.3) also passes the running client version as the
-// invite's version fallback; the broker contract is otherwise the same.
-const lan263 = await source("port/src/versions/26.3/java/dev/gaius/browser/BrowserLanSession.java");
-assert.match(lan263, /UUID\.randomUUID\(\)/);
-assert.match(lan263, /BrowserSingleplayerClient\.requestLanServerConnection\(brokerSessionId\)/);
-assert.match(lan263, /publishLanInvite\(brokerSessionId, clientVersionId\(\)\)/);
-assert.match(lan263, /private static native void publishLanInvite\(String brokerSessionId, String clientVersionId\)/);
-for (const copy of [lan, lan263]) {
-  assert.match(copy, /__gaiusOpenToLan/);
-  assert.match(copy, /brokerSessionId/);
+assert.match(lan, /BrowserSingleplayerClient\.requestLanServerConnection\(brokerSessionId\)/);
+// BrowserLanSession is one source for every profile (no copy in a source set): the invite's profile
+// fallback is the running client's own version id, never a version literal, and the pause-menu
+// column span comes from the profile's VersionOps.
+assert.match(lan, /publishLanInvite\(brokerSessionId, clientVersionId\(\)\)/);
+assert.match(lan, /private static native void publishLanInvite\(String brokerSessionId, String clientVersionId\)/);
+assert.match(lan, /SharedConstants\.getCurrentVersion\(\)\.id\(\)/);
+assert.match(lan, /VersionOps\.INSTANCE\.pauseMenuLanButtonColumns\(\)/);
+assert.doesNotMatch(lan, /__gaiusProfileId \|\| '\d/, "no fixed profile id as the invite fallback");
+assert.match(lan, /__gaiusOpenToLan/);
+assert.match(lan, /brokerSessionId/);
+for (const profile of loadProfiles()) {
+  assert.equal(sourceFile(profile, "src", "dev/gaius/browser/BrowserLanSession.java")?.origin, "shared",
+    `profile ${profile.id} compiles the shared BrowserLanSession, not a source set copy`);
 }
 assert.match(launcher, /brokerSessionId/);
 assert.match(launcher, /client-" \+ brokerSessionId \+ "\.gaius-local:25565/);

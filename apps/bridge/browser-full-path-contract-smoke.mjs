@@ -1,8 +1,10 @@
+import {CANONICAL_PROFILE, LEGACY_PROFILE, RENDERPEARL_PROFILE} from "../../port/scripts/verification-profiles.mjs";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {runInNewContext} from "node:vm";
 import path from "node:path";
 
 const bridgeDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -397,7 +399,7 @@ assert.match(fullPathSourceText,
     /ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION\s*=\s*["']periodic-server-sync["']/u,
     "periodic server-sync classification label drifted");
 assert.match(fullPathSourceText,
-    /ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID\s*=\s*["']26\.2["']/u,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID\s*=\s*CANONICAL_PROFILE\.id/u,
     "periodic server-sync profile contract drifted");
 assert.match(fullPathSourceText,
     /ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION\s*=\s*776/u,
@@ -599,7 +601,7 @@ function assertPeriodicServerSyncContract(config, label) {
         `${label}: periodic server-sync schema drifted`);
     assert.equal(telemetry.classification, "periodic-server-sync",
         `${label}: periodic server-sync classification drifted`);
-    assert.equal(telemetry.profileId, "26.2",
+    assert.equal(telemetry.profileId, CANONICAL_PROFILE.id,
         `${label}: periodic server-sync profile drifted`);
     assert.equal(telemetry.protocolVersion, 776,
         `${label}: periodic server-sync protocol drifted`);
@@ -621,11 +623,11 @@ function assertPeriodicServerSyncContract(config, label) {
 
 const expectedProfiles = [
     {
-        path: "versions/26.2.json", id: "26.2", protocol: 776, world: 4903,
+        path: `versions/${CANONICAL_PROFILE.id}.json`, id: CANONICAL_PROFILE.id, protocol: 776, world: 4903,
         java: 25, serverSha1: "823e2250d24b3ddac457a60c92a6a941943fcd6a",
     },
     {
-        path: "versions/1.21.11.json", id: "1.21.11", protocol: 774, world: 4671,
+        path: `versions/${LEGACY_PROFILE.id}.json`, id: LEGACY_PROFILE.id, protocol: 774, world: 4671,
         java: 21, serverSha1: "64bb6d763bed0a9f1d632ec347938594144943ed",
     },
 ];
@@ -806,8 +808,8 @@ for (const expected of expectedProfiles) {
 }
 
 // The dedicated runner is canonical-local by construction. Deliberately feed
-// it a 1.21.11 profile plus an external target and shared-output roots; its
-// print-only child must still resolve the immutable 26.2 extreme contract.
+// it a legacy profile plus an external target and shared-output roots; its
+// print-only child must still resolve the immutable canonical extreme contract.
 const canonicalStressRunner = JSON.parse(execFileSync(process.execPath, [
     stressRunnerPath, "--print-config", "--tier=16",
 ], {
@@ -823,7 +825,7 @@ const canonicalStressRunner = JSON.parse(execFileSync(process.execPath, [
 }));
 assert.equal(canonicalStressRunner.ok, true);
 assert.deepEqual(canonicalStressRunner.tiers, [16]);
-assert.equal(canonicalStressRunner.configurations[0].profile.id, "26.2");
+assert.equal(canonicalStressRunner.configurations[0].profile.id, CANONICAL_PROFILE.id);
 assert.equal(canonicalStressRunner.configurations[0].profile.protocolVersion, 776);
 assert.equal(canonicalStressRunner.configurations[0].profile.worldVersion, 4903);
 assert.equal(canonicalStressRunner.configurations[0].clients, 16);
@@ -844,7 +846,7 @@ for (const [traceValue, expectedDiagnostics] of [
         strictEvidenceEligible: false,
     }],
 ]) {
-    const traceStressConfig = stressConfiguration("versions/26.2.json", {
+    const traceStressConfig = stressConfiguration("versions/" + CANONICAL_PROFILE.id + ".json", {
         GAIUS_BROWSER_FULL_PATH_TRACE: traceValue,
     });
     assert.equal(traceStressConfig.ok, true,
@@ -857,15 +859,15 @@ for (const [traceValue, expectedDiagnostics] of [
         `trace=${traceValue} print-config diagnostics drifted`);
 }
 
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
     GAIUS_BROWSER_FULL_PATH_STRESS: "1",
 }, ["--print-config", "--acceptance", "--stress"]);
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_STRESS: "1",
     GAIUS_BROWSER_FULL_PATH_STRESS_TIER: "32",
 }, ["--print-config", "--stress"]);
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_STRESS: "1",
     GAIUS_BROWSER_FULL_PATH_STRESS_TIER: "8",
     GAIUS_BROWSER_FULL_PATH_CLIENTS: "8",
@@ -894,7 +896,7 @@ const savedPollutedGateValues = new Map(Object.keys(pollutedGateValues).map((nam
 ]));
 try {
     Object.assign(process.env, pollutedGateValues);
-    const sanitized = configuration("versions/26.2.json");
+    const sanitized = configuration("versions/" + CANONICAL_PROFILE.id + ".json");
     assert.equal(sanitized.acceptanceMode, false,
         "configuration inherited strict acceptance pollution");
     assert.equal(sanitized.clients, 2,
@@ -943,14 +945,14 @@ for (const expected of expectedProfiles) {
 // PLAY ids.  Before this check existed every non-1.21.11 profile silently
 // borrowed the 26.2 ids (login 49, cache 94/95/111).
 {
-    const compatible263 = configuration("versions/26.3.json");
-    assert.equal(compatible263.profile.id, "26.3");
+    const compatible263 = configuration("versions/" + RENDERPEARL_PROFILE.id + ".json");
+    assert.equal(compatible263.profile.id, RENDERPEARL_PROFILE.id);
     assert.equal(compatible263.profile.protocolVersion, 777);
     assert.equal(compatible263.profile.worldVersion, 5023);
-    assert.deepEqual(compatible263.wireProfile, { name: "26.3", protocolVersion: 777 });
+    assert.deepEqual(compatible263.wireProfile, { name: RENDERPEARL_PROFILE.id, protocolVersion: 777 });
     assert.equal(compatible263.acceptanceMode, false);
     assert.equal(compatible263.performanceContract.mode, "compatible-smoke");
-    assert.equal(compatible263.performanceContract.canonicalProfiles["26.3"], undefined);
+    assert.equal(compatible263.performanceContract.canonicalProfiles[RENDERPEARL_PROFILE.id], undefined);
     assert.deepEqual(compatible263.performanceContract.chunkWindow.initialDistanceContract, {
         source: "clientbound-login",
         packetId: 50,
@@ -967,7 +969,7 @@ for (const expected of expectedProfiles) {
         compatible263.performanceContract.chunkBatch.serverboundAcknowledgementPacketId, 11);
     // Strict acceptance stays fail-closed for a profile without a canonical
     // release contract instead of evaluating it against 26.2 evidence.
-    assert.throws(() => configuration("versions/26.3.json", {
+    assert.throws(() => configuration("versions/" + RENDERPEARL_PROFILE.id + ".json", {
         GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
         GAIUS_BROWSER_FULL_PATH_CLIENTS: "4",
         GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "9",
@@ -988,63 +990,65 @@ const strictProfileOverrides = {
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "1",
 };
 const aliasProfileName = `.contract-profile-alias-${process.pid}-${Date.now()}.json`;
-const aliasProfileRelativePath = `versions/${aliasProfileName}`;
-const aliasProfileAbsolutePath = path.join(bridgeDirectory, "../../port", aliasProfileRelativePath);
-await writeFile(aliasProfileAbsolutePath,
-    await readFile(path.join(bridgeDirectory, "../../port/versions/26.2.json")));
-try {
-    assert.throws(() => configuration(aliasProfileRelativePath, strictProfileOverrides),
-        /strict acceptance profile basename|strict acceptance profile path/u,
+const resolverSource = fullPathSourceText.match(/^async function loadActiveVersionProfile\(\) \{[\s\S]*?^\}/mu)?.[0];
+assert.ok(resolverSource, "active profile resolver source is required");
+const repository = path.resolve(bridgeDirectory, "../..");
+await assert.rejects(runInNewContext(`(${resolverSource})()`, {
+    assert, path, repository,
+    process: {env: {GAIUS_VERSION_PROFILE_PATH: `versions/${aliasProfileName}`}},
+    nativePath: (value) => value,
+    resolveRepositoryPath: (value) => path.resolve(repository, value),
+    pathInside: (parent, child) => path.dirname(child) === parent,
+    readFile: (selected, encoding) => readFile(selected.endsWith("config.json") ? selected
+        : path.join(repository, "port", "versions", `${CANONICAL_PROFILE.id}.json`), encoding),
+    releaseEvidenceMode: true,
+}), /strict acceptance profile basename/u,
     "strict acceptance accepted a profile whose basename was not <id>.json");
-}
-finally {
-    await unlink(aliasProfileAbsolutePath).catch(() => {});
-}
 
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
     GAIUS_BROWSER_FULL_PATH_CLIENTS: "4suffix",
 });
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
     GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "09",
 });
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
     GAIUS_BROWSER_FULL_PATH_SOAK_MS: "15000ms",
 });
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "1.0",
 });
-expectConfigurationFailure("versions/26.2.json", {
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "true",
 });
-expectConfigurationFailure("versions/26.2.json", {}, ["--print-config", "--acceptance-suffix"]);
+expectConfigurationFailure("versions/" + CANONICAL_PROFILE.id + ".json", {}, ["--print-config", "--acceptance-suffix"]);
 
 // Compatibility mode keeps the historical parseInt/clamp behavior, including
 // values with a suffix; only strict acceptance is fail-closed.
-assert.equal(configuration("versions/26.2.json", {
+assert.equal(configuration("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_CLIENTS: "4suffix",
 }).clients, 4);
 
-assert.equal(configuration("versions/26.2.json", {
+assert.equal(configuration("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "0",
 }).performanceContract.minimumChunkPackets, 1);
-assert.equal(configuration("versions/1.21.11.json", {
+assert.equal(configuration("versions/" + LEGACY_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "999",
 }).performanceContract.minimumChunkPackets, 128);
-assert.equal(configuration("versions/26.2.json", {
+assert.equal(configuration("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "1",
 }).performanceContract.reconnectWaves, 1);
-assert.equal(configuration("versions/26.2.json", {
+assert.equal(configuration("versions/" + CANONICAL_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "-1",
 }).performanceContract.reconnectWaves, 0);
-assert.equal(configuration("versions/1.21.11.json", {
+assert.equal(configuration("versions/" + LEGACY_PROFILE.id + ".json", {
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "999",
 }).performanceContract.reconnectWaves, 8);
 for (const [radius, capacity] of [[2, 25], [4, 77], [6, 157], [8, 257]]) {
-    const configured = configuration("versions/26.2.json", {
+    const configured = configuration("versions/" + CANONICAL_PROFILE.id + ".json", {
         GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE: String(radius),
         GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE: String(radius),
     });
@@ -1054,7 +1058,7 @@ for (const [radius, capacity] of [[2, 25], [4, 77], [6, 157], [8, 257]]) {
 
 assert.throws(() => execFileSync(process.execPath, [fullPathScript], {
     cwd: bridgeDirectory,
-    env: sanitizedEnvironment("versions/26.2.json", {
+    env: sanitizedEnvironment("versions/" + CANONICAL_PROFILE.id + ".json", {
         GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "128",
         GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE: "6",
         GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE: "2",
@@ -1474,37 +1478,30 @@ assert.match(multiplayerSource,
     /clientboundSetChunkCacheRadius/);
 assert.match(multiplayerSource,
     /clientboundSetSimulationDistance/);
-assert.match(protocolSource,
-    /MINECRAFT_1_21_11[\s\S]*?serverboundChunkBatchReceived: 10/);
-assert.match(protocolSource,
-    /MINECRAFT_26_2[\s\S]*?serverboundChunkBatchReceived: 11/);
-assert.match(protocolSource,
-    /MINECRAFT_1_21_11[\s\S]*?clientboundSetChunkCacheCenter: 92[\s\S]*?clientboundSetChunkCacheRadius: 93[\s\S]*?clientboundSetSimulationDistance: 109/);
-assert.match(protocolSource,
-    /MINECRAFT_26_2[\s\S]*?clientboundSetChunkCacheCenter: 94[\s\S]*?clientboundSetChunkCacheRadius: 95[\s\S]*?clientboundSetSimulationDistance: 111/);
-assert.match(protocolSource,
-    /MINECRAFT_26_3[\s\S]*?serverboundChunkBatchReceived: 11/);
-assert.match(protocolSource,
-    /MINECRAFT_26_3[\s\S]*?clientboundSetChunkCacheCenter: 96[\s\S]*?clientboundSetChunkCacheRadius: 97[\s\S]*?clientboundSetSimulationDistance: 113/);
 {
-    // The text checks above only prove the literals exist somewhere after the
-    // export; bind every profile's chunk-window ids to the evaluated tables.
     const relayProtocol = await import(pathToFileURL(protocolPath).href);
-    assert.deepEqual(relayProtocol.MINECRAFT_PROFILES.map((profile) => [
-        profile.name,
-        profile.protocolVersion,
-        profile.play.clientboundLogin,
-        profile.play.clientboundSetChunkCacheCenter,
-        profile.play.clientboundSetChunkCacheRadius,
-        profile.play.clientboundSetSimulationDistance,
-        profile.play.clientboundChunkBatchFinished,
-        profile.play.clientboundChunkBatchStart,
-        profile.play.serverboundChunkBatchReceived,
-    ]), [
-        ["1.21.11", 774, 48, 92, 93, 109, 11, 12, 10],
-        ["26.2", 776, 49, 94, 95, 111, 11, 12, 11],
-        ["26.3", 777, 50, 96, 97, 113, 11, 12, 11],
-    ]);
+    const baseline = JSON.parse(await readFile(
+        new URL("./test-fixtures/protocol-tables.json", import.meta.url), "utf8"));
+    assert.deepEqual(baseline.map(({protocolVersion}) => {
+        const profile = relayProtocol.resolveMinecraftProfile(protocolVersion);
+        assert.ok(profile);
+        return [
+            profile.name,
+            profile.protocolVersion,
+            profile.play.clientboundLogin,
+            profile.play.clientboundSetChunkCacheCenter,
+            profile.play.clientboundSetChunkCacheRadius,
+            profile.play.clientboundSetSimulationDistance,
+            profile.play.clientboundChunkBatchFinished,
+            profile.play.clientboundChunkBatchStart,
+            profile.play.serverboundChunkBatchReceived,
+        ];
+    }), baseline.map(profile => [
+        profile.name, profile.protocolVersion, profile.play.clientboundLogin,
+        profile.play.clientboundSetChunkCacheCenter, profile.play.clientboundSetChunkCacheRadius,
+        profile.play.clientboundSetSimulationDistance, profile.play.clientboundChunkBatchFinished,
+        profile.play.clientboundChunkBatchStart, profile.play.serverboundChunkBatchReceived,
+    ]));
 }
 assert.match(protocolSource,
     /export function decodeClientboundLoginDistances\(payload\)/);
@@ -1938,7 +1935,7 @@ assert.deepEqual(stressEnvironmentProbe.tiers, [8],
 assert.equal(stressEnvironmentProbe.configurations.length, 1,
     "stress runner pollution probe omitted its configuration");
 const stressProbeConfiguration = stressEnvironmentProbe.configurations[0];
-assert.equal(stressProbeConfiguration.profile.id, "26.2",
+assert.equal(stressProbeConfiguration.profile.id, CANONICAL_PROFILE.id,
     "stress runner pollution changed the profile id");
 assert.equal(stressProbeConfiguration.profile.protocolVersion, 776,
     "stress runner pollution changed the protocol");
@@ -1953,7 +1950,7 @@ assert.equal(stressProbeConfiguration.profile.expectedServerJarSha1,
     "823e2250d24b3ddac457a60c92a6a941943fcd6a",
     "stress runner pollution changed the expected server identity");
 assert.equal(stressProbeConfiguration.profile.canonicalProfilePath,
-    "port/versions/26.2.json",
+    "port/versions/" + CANONICAL_PROFILE.id + ".json",
     "stress runner pollution changed the profile path");
 assert.equal(stressProbeConfiguration.performanceContract.externalRelay, null,
     "stress runner inherited an external RelayNode target");
@@ -2009,15 +2006,15 @@ try {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
         }));
-    const resolved21 = resolveProfile("versions/1.21.11.json", "GAIUS_JAVA_21");
-    assert.equal(resolved21.profile.id, "1.21.11");
+    const resolved21 = resolveProfile("versions/" + LEGACY_PROFILE.id + ".json", "GAIUS_JAVA_21");
+    assert.equal(resolved21.profile.id, LEGACY_PROFILE.id);
     assert.equal(resolved21.runtimeJavaMajor, 21);
     assert.equal(resolved21.runtimeJavaSource, "GAIUS_JAVA_21");
     assert.match(resolved21.runtimeJavaExecutable,
         /profile-21\.(?:cmd|sh)$/u);
     assert.equal(resolved21.runtimeJavaPolicy, "major-exactly-21");
-    const resolved25 = resolveProfile("versions/26.2.json", "GAIUS_JAVA_25");
-    assert.equal(resolved25.profile.id, "26.2");
+    const resolved25 = resolveProfile("versions/" + CANONICAL_PROFILE.id + ".json", "GAIUS_JAVA_25");
+    assert.equal(resolved25.profile.id, CANONICAL_PROFILE.id);
     assert.equal(resolved25.runtimeJavaMajor, 25);
     assert.equal(resolved25.runtimeJavaSource, "GAIUS_JAVA_25");
     assert.match(resolved25.runtimeJavaExecutable,
@@ -2038,10 +2035,10 @@ console.log(JSON.stringify({
         minimumChunkPackets: 9,
         soakMillis: 15000,
         reconnectWaves: 1,
-        profileOrder: ["26.2", "1.21.11"],
+        profileOrder: [CANONICAL_PROFILE.id, LEGACY_PROFILE.id],
         runtimeJavaPolicy: {
-            "1.21.11": "major-exactly-21",
-            "26.2": "major-at-least-25",
+            [LEGACY_PROFILE.id]: "major-exactly-21",
+            [CANONICAL_PROFILE.id]: "major-at-least-25",
         },
     },
     stressTiers: {
@@ -2090,17 +2087,17 @@ console.log(JSON.stringify({
     chunkBatchProtocol: {
         clientboundFinished: 11,
         clientboundStart: 12,
-        serverboundAcknowledgement: { "1.21.11": 10, "26.2": 11 },
+        serverboundAcknowledgement: { [LEGACY_PROFILE.id]: 10, [CANONICAL_PROFILE.id]: 11 },
         acknowledgementEncoding: "float32-be",
     },
     observedDistancePackets: {
         initialDistanceContract: {
             source: "clientbound-login",
-            packetIds: { "1.21.11": 48, "26.2": 49 },
+            packetIds: { [LEGACY_PROFILE.id]: 48, [CANONICAL_PROFILE.id]: 49 },
             fields: ["chunkRadius", "simulationDistance"],
         },
-        "1.21.11": { cacheCenter: 92, cacheRadius: 93, simulationDistance: 109 },
-        "26.2": { cacheCenter: 94, cacheRadius: 95, simulationDistance: 111 },
+        [LEGACY_PROFILE.id]: { cacheCenter: 92, cacheRadius: 93, simulationDistance: 109 },
+        [CANONICAL_PROFILE.id]: { cacheCenter: 94, cacheRadius: 95, simulationDistance: 111 },
         requiredBeforeStressChunkCounting: true,
     },
     stressLatencyHistograms: {

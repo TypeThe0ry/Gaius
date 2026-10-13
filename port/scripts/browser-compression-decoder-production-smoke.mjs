@@ -5,12 +5,13 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import {memberText, patcherSource} from "./patcher-sources.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const javaPath = path.resolve(here, "../src/main/java/dev/gaius/browser/BrowserCompressionDecoder.java");
-const patcherPath = path.resolve(here, "../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java");
 const java = fs.readFileSync(javaPath, "utf8");
-const patcher = fs.readFileSync(patcherPath, "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = patcherSource("MinecraftClientPatcher");
 for (const marker of [
   "extends CompressionDecoder",
   "OUTPUT_QUANTUM_BYTES = 16 * 1024",
@@ -32,10 +33,7 @@ const websocketPatchCall = patcher.indexOf("patchConnectionBrowserWebSocket(args
 const compressionPatchCall = patcher.indexOf("patchCompressionDecoderBrowser(root.resolve(");
 assert.ok(websocketPatchCall >= 0 && compressionPatchCall > websocketPatchCall,
   "Connection compression patch must run after the browser WebSocket patch");
-const compressionPatchMethod = patcher.slice(
-  patcher.indexOf("private static void patchCompressionDecoderBrowser"),
-  patcher.indexOf("private static void patchGlx", patcher.indexOf("private static void patchCompressionDecoderBrowser")),
-);
+const compressionPatchMethod = memberText(patcher, "patchCompressionDecoderBrowser");
 assert.match(compressionPatchMethod, /ClassNode node = read\(connectionClass\);/,
   "Connection compression patch must continue from the already patched class file");
 assert.doesNotMatch(compressionPatchMethod, /ClassNode node = read\(jar,/,

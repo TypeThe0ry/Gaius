@@ -261,7 +261,16 @@ public final class BrowserChunkDrawTelemetry {
             """)
     private static native void recordZeroDraw();
 
+    /**
+     * Gate by backend (PLAN-DELTA 3.10): under WebGPU ({@code GaiusWebGpu.active}) the core's
+     * {@code contextAvailable()}, otherwise BrowserOpenGL's submission state; without the WebGPU
+     * branch every draw would count as blocked there.
+     */
     @JSBody(script = """
+            const gpu = globalThis.GaiusWebGpu;
+            if (gpu && gpu.active === true && typeof gpu.contextAvailable === 'function') {
+              try { return gpu.contextAvailable() !== true; } catch (error) { return true; }
+            }
             const state = globalThis.__gaiusGL;
             return !state || state.gpuSubmissionBlocked === true
               || state.gpuContextLost === true;

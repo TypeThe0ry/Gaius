@@ -15,6 +15,7 @@
 // is a transient "worldgen-fallback:" refusal), a transient refusal reports "transient:" and keeps
 // the generator, a kernel failure disables the generator, and drain() settles a job the runner
 // never answers.
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {existsSync, readFileSync} from "node:fs";
 import {dirname, join} from "node:path";
@@ -32,6 +33,8 @@ const context = vm.createContext({console, URLSearchParams, WebAssembly, BigInt,
 context.globalThis = context;
 context.location = {search: ""};
 vm.runInContext(readFileSync(join(kernelsDir, "worldgen-job.js"), "utf8"), context, {filename: "worldgen-job.js"});
+context.__gaiusKernelSemantics = {schemaVersion: 1, profile: "fixture", kernels: {worldgen: {enabled: true}}};
+vm.runInContext(readFileSync(join(kernelsDir, "kernel-mirror.js"), "utf8"), context);
 vm.runInContext(readFileSync(join(kernelsDir, "worldgen-kernel.js"), "utf8"), context, {filename: "worldgen-kernel.js"});
 const facade = context.GaiusWorldgenKernel;
 
@@ -87,10 +90,10 @@ function call(submit) {
 }
 
 let checks = 0;
-for (const profile of ["26.3", "26.2"]) {
+for (const profile of [RENDERPEARL_PROFILE.id, CANONICAL_PROFILE.id]) {
   const irPath = join(wasmDir, `${profile}.gwir`);
   if (!existsSync(irPath)) continue;
-  const key = profile === "26.3" ? 1 : 2;
+  const key = profile === RENDERPEARL_PROFILE.id ? 1 : 2;
   assert.equal(facade.usable(), true, "usable with the runtime client");
   assert.equal(facade.registerGenerator(key, new Uint8Array(readFileSync(irPath))), true);
   assert.equal(facade.generatorUsable(key), true);
@@ -114,14 +117,14 @@ for (const profile of ["26.3", "26.2"]) {
   assert.equal(submitted[0].opts.cz, -2);
 
   const biomes = await call((ok, err) => facade.submitBiomes(key, 3, -2, ok, err));
-  assert.ok(biomes.ok, biomes.message);
-  assert.equal(biomes.value.length, chunk.sectionCount * 64);
+  assert.ok(!biomes.ok && biomes.message.startsWith("transient:worldgen-fallback:multi-noise"), biomes.message);
+  assert.equal(facade.generatorUsable(key), true);
 
   // Server-side priority data (BrowserChunkTaskPriority): the job carries a distance hint.
   context.__gaiusChunkPriorityStats = {playerChunk: "0,0", direction: "1,0"};
   submitted.length = 0;
   const hinted = await call((ok, err) => facade.submitBiomes(key, 4, 0, ok, err));
-  assert.ok(hinted.ok, hinted.message);
+  assert.ok(!hinted.ok && hinted.message.startsWith("transient:worldgen-fallback:multi-noise"), hinted.message);
   assert.ok(submitted[0].opts.distance < 4, "a chunk ahead of the player ranks closer than its distance");
   delete context.__gaiusChunkPriorityStats;
 
@@ -155,21 +158,26 @@ for (const profile of ["26.3", "26.2"]) {
   const neighbours = new Map();
   for (let nx = -1; nx <= 1; nx++) {
     for (let nz = -1; nz <= 1; nz++) {
-      if (nx === 0 && nz === 0) continue;
-      const ids = await call((ok, err) => facade.submitBiomes(key, nx, nz, ok, err));
+      const ids = await call((ok, err) => facade.submitTerrain(key, nx, nz,
+        context.GaiusWorldgenJob.FLAG_BIOMES, new Int32Array(9), ok, err));
       assert.ok(ids.ok, ids.message);
-      neighbours.set(nx + "," + nz, ids.value);
+      neighbours.set(nx + "," + nz, ids.value.biomes);
     }
   }
   const quartsY = full.value.sectionCount * 4;
   const ring = [];
+  const stored = [];
   for (let gx = 0; gx < 6; gx++) {
     for (let gz = 0; gz < 6; gz++) {
-      if (gx >= 1 && gx <= 4 && gz >= 1 && gz <= 4) continue;
       const qx = gx - 1;
       const qz = gz - 1;
       const ids = neighbours.get((qx >> 2) + "," + (qz >> 2));
-      for (let y = 0; y < quartsY; y++) ring.push(ids[(y >> 2) * 64 + ((y & 3) * 4 + (qz & 3)) * 4 + (qx & 3)]);
+      const border = gx < 1 || gx > 4 || gz < 1 || gz > 4;
+      for (let y = 0; y < quartsY; y++) {
+        const id = ids[(y >> 2) * 64 + ((y & 3) * 4 + (qz & 3)) * 4 + (qx & 3)];
+        stored.push(id);
+        if (border) ring.push(id);
+      }
     }
   }
   const ringBiomes = new Int32Array(ring);
@@ -178,10 +186,17 @@ for (const profile of ["26.3", "26.2"]) {
   const ringed = await call((ok, err) => facade.submitTerrain(key, 0, 0, 1, new Int32Array(9), ok, err, ringBiomes));
   assert.ok(ringed.ok, ringed.message);
   assert.ok(sameChunk(ringed.value, full.value), "a ring of computed biomes keeps the terrain result");
+  const storedBiomes = new Int32Array(stored);
+  const storedChunk = await call((ok, err) => facade.submitTerrain(key, 0, 0,
+    context.GaiusWorldgenJob.FLAG_SURFACE | context.GaiusWorldgenJob.FLAG_BIOMES,
+    new Int32Array(9), ok, err, storedBiomes));
+  assert.ok(storedChunk.ok, storedChunk.message);
+  assert.ok(sameChunk(storedChunk.value, full.value), "stored center and border biomes keep the terrain result");
+  assert.equal(storedChunk.value.biomes.join(), neighbours.get("0,0").join(), "stored center biomes are returned");
   const keptAgain = await call((ok, err) => facade.submitTerrain(key, 0, 0, keep, new Int32Array(9), ok, err));
   assert.ok(keptAgain.ok, keptAgain.message);
   const ringedDiff = await call((ok, err) => facade.submitSurfaceStored(key, keptAgain.value.token, 0, 0,
-    new Int32Array(9), ok, err, ringBiomes));
+    new Int32Array(9), ok, err, storedBiomes));
   assert.ok(ringedDiff.ok, ringedDiff.message);
   assert.equal(ringedDiff.value.positions.join(), diff.value.positions.join(), "a ring of computed biomes keeps the diff");
   assert.equal(ringedDiff.value.states.join(), diff.value.states.join());
@@ -212,7 +227,7 @@ assert.ok(checks > 0, `no example IR in ${wasmDir}`);
 
 // drain(): a job its runner never answers settles as transient once the capped deadline passes.
 {
-  const irPath = [join(wasmDir, "26.3.gwir"), join(wasmDir, "26.2.gwir")].find(existsSync);
+  const irPath = [join(wasmDir, "" + RENDERPEARL_PROFILE.id + ".gwir"), join(wasmDir, "" + CANONICAL_PROFILE.id + ".gwir")].find(existsSync);
   assert.equal(facade.registerGenerator(9, new Uint8Array(readFileSync(irPath))), true);
   mode = "hang";
   const hung = call((ok, err) => facade.submitBiomes(9, 0, 0, ok, err));

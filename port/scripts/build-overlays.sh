@@ -3,7 +3,10 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/teavm-publication-gate.sh"
-build_lock="$root/port/work/.build-overlays.lock"
+source "$root/port/scripts/overlay-lock.sh"
+# The writer lock of the overlay directory (overlay-lock.sh), taken once the profile names
+# the directory; a caller that holds it (GAIUS_OVERLAY_LOCK_HELD=true) keeps it.
+build_lock=""
 build_lock_owner=""
 build_lock_owned_here=false
 
@@ -11,27 +14,20 @@ release_build_lock() {
   local status="$?"
   trap - EXIT
   if [[ "$build_lock_owned_here" == true && -n "${build_lock_owner:-}" ]]; then
-    gaius_teavm_lock_release "$build_lock" "$build_lock_owner" || true
+    gaius_overlay_lock_release "$build_lock" "$build_lock_owner" || true
   fi
   exit "$status"
 }
 trap release_build_lock EXIT
 
-if [[ "${GAIUS_OVERLAY_LOCK_HELD:-false}" != "true" ]]; then
-  gaius_teavm_lock_acquire "$build_lock"
-  build_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
-  build_lock_owned_here=true
-else
-  lock_pid="$(cat "$build_lock/pid" 2>/dev/null || true)"
-  if [[ ! -d "$build_lock" || "$lock_pid" != "$PPID" ]]; then
-    echo "GAIUS_OVERLAY_LOCK_HELD=true without a lock owned by the caller" >&2
-    exit 1
-  fi
-fi
-
 config="$root/port/config.json"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
+# The storage allow-lists in the sources (page, Worker and file system layers) are generated
+# from port/versions/*.json by port/tools/profilegen; a profile added or changed without
+# regenerating them would build a client that refuses its own storage.
+node "$root/port/tools/profilegen/profilegen.mjs" --check \
+  || { echo "Run node port/tools/profilegen/profilegen.mjs --write and commit the result" >&2; exit 1; }
 gaius_select_java_home
 # `gaius_select_java_home` stores a Windows-native path when `cygpath` is
 # available.  Re-add its Unix view to PATH so Git Bash can resolve jar/java
@@ -85,11 +81,35 @@ for extra_patcher in $GAIUS_EXTRA_PATCHERS; do
   fi
 done
 
+# The profile's renderSeam selects the render seam port/mc/seams/<generation> (the adapter from
+# that Minecraft render SPI to the WebGPU core, see the end of this script), or none.  A seam's
+# profiles are the port/versions/*.json profiles that name it; seam.json lists none of them.
+render_seam="$(jq -r '.renderSeam // empty' "$GAIUS_VERSION_PROFILE" | tr -d '\r')"
+case "$render_seam" in
+  none) ;;
+  "")
+    echo "Version profile $GAIUS_VERSION_PROFILE has no renderSeam (none or a port/mc/seams/<generation>)" >&2
+    exit 1
+    ;;
+  *)
+    render_seam_manifest="$root/port/mc/seams/$render_seam/seam.json"
+    if [[ ! "$render_seam" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ || ! -f "$render_seam_manifest" ]]; then
+      echo "Unknown renderSeam '$render_seam' in $GAIUS_VERSION_PROFILE (no port/mc/seams/$render_seam/seam.json)" >&2
+      exit 1
+    fi
+    if ! jq -e --arg generation "$render_seam" '.generation == $generation' \
+        "$render_seam_manifest" >/dev/null; then
+      echo "$render_seam_manifest does not declare generation $render_seam" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 # Bring-up mode (see gaius_bringup_active in version-profile.sh): with
 # GAIUS_BRINGUP=1 an unfinished profile may skip the patches listed in
 # port/tools/bringup/<profile>.txt.  Without it, a profile that still has a
-# non-empty list fails here and prints what is unfinished.  Release profiles
-# never enter bring-up mode.
+# non-empty list fails here and prints what is unfinished.  A profile whose
+# bringupAllowed is false never enters bring-up mode.
 bringup_list="$(gaius_bringup_list_path "$root")"
 bringup_ids="$(gaius_bringup_ids "$root")"
 bringup_active=false
@@ -98,7 +118,7 @@ if gaius_bringup_active; then
   bringup_active=true
   echo "Bring-up mode for Minecraft $version: $(grep -c . <<<"$bringup_ids" || true) listed patches may be skipped ($bringup_list)"
 elif [[ "${GAIUS_BRINGUP:-}" == "1" ]]; then
-  echo "GAIUS_BRINGUP=1 is ignored for release profile $version" >&2
+  echo "GAIUS_BRINGUP=1 is ignored for profile $version (bringupAllowed is false)" >&2
 fi
 if [[ "$bringup_active" != true && -n "$bringup_ids" ]]; then
   if gaius_bringup_profile_allowed; then
@@ -106,7 +126,7 @@ if [[ "$bringup_active" != true && -n "$bringup_ids" ]]; then
     tr -d '\r' <"$bringup_list" | sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' -e 's/^/  /' >&2
     echo "Build with GAIUS_BRINGUP=1 to skip them for bring-up; release builds refuse bring-up mode." >&2
   else
-    echo "Release profile $version must not have a bring-up list: $bringup_list" >&2
+    echo "Profile $version (bringupAllowed false) must not have a bring-up list: $bringup_list" >&2
   fi
   exit 1
 fi
@@ -139,6 +159,24 @@ bringup_skip() {
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
 overlay_work="$(gaius_overlay_directory "$root")"
+
+# Only one build writes an overlay directory at a time (overlay-lock.sh).  With
+# GAIUS_OVERLAY_LOCK_HELD=true the calling script (the parent process) holds the lock of this
+# directory, which it keeps until its TeaVM compile has closed the jars (build-wasmgc.sh,
+# build-teavm.sh, build-teavm-server-worker.sh, build-platform-smoke.sh).
+if [[ "${GAIUS_OVERLAY_LOCK_HELD:-false}" == "true" ]]; then
+  if ! gaius_overlay_lock_join "$root" "$overlay_work" "$PPID"; then
+    echo "GAIUS_OVERLAY_LOCK_HELD=true without a lock owned by the caller" >&2
+    echo "($GAIUS_OVERLAY_LOCK_PATH does not belong to process $PPID)" >&2
+    exit 1
+  fi
+  build_lock="$GAIUS_OVERLAY_LOCK_PATH"
+else
+  gaius_overlay_lock_acquire "$root" "$overlay_work"
+  build_lock="$GAIUS_OVERLAY_LOCK_PATH"
+  build_lock_owner="$GAIUS_OVERLAY_LOCK_OWNER_TOKEN"
+  build_lock_owned_here=true
+fi
 source_root="$root/port/overrides/classlib/src/main/java"
 classes="$overlay_work/classlib-classes"
 maven_repository="$(gaius_maven_repository "$root")"
@@ -172,7 +210,7 @@ if command -v cygpath >/dev/null 2>&1; then
       # The argument can contain a mixture of Git-Bash `/c/...` entries and
       # already-native `C:/...` entries.  `cygpath -mp` treats drive-letter
       # colons as separators, so normalize each entry before joining with `;`.
-      native_classpath="$(python -c 'import re,sys; s=sys.argv[1]; print(";".join(re.sub(r"^/([A-Za-z])/", lambda m: m.group(1).upper()+":/", p) for p in re.split(r":(?=(?:/|[A-Za-z]:/))", s)))' "$2")"
+      native_classpath="$(cygpath -mp "$2")"
       command java -classpath "$native_classpath" "${@:3}"
     else
       command java "$@"
@@ -328,6 +366,32 @@ for source in \
   fi
   sources+=("$source")
 done
+# JDK API gaps (maint/D14 3.1, P15; port/overrides/jdk/README.md): the src/main/java and
+# src/target-<target>/java roots of every port/overrides/jdk/<release> up to the profile's
+# javaVersion, in ascending release order, compile into the class library overlay. A later
+# root replaces the same relative path of an earlier one; none may repeat a classlib overlay path.
+declare -A jdk_sources=()
+while IFS= read -r jdk_release; do
+  if [[ ! "$jdk_release" =~ ^[0-9]+$ || "$jdk_release" -gt "$GAIUS_JAVA_VERSION" ]]; then
+    continue
+  fi
+  for jdk_source_root in "$root/port/overrides/jdk/$jdk_release/src/main/java" \
+      "$root/port/overrides/jdk/$jdk_release/src/target-$teavm_target/java"; do
+    [[ -d "$jdk_source_root" ]] || continue
+    while IFS= read -r source; do
+      jdk_sources["${source#"$jdk_source_root/"}"]="$source"
+    done < <(find "$jdk_source_root" -type f -name '*.java' -print)
+  done
+done < <(find "$root/port/overrides/jdk" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' \
+  -exec basename {} \; 2>/dev/null | sort -n)
+while IFS= read -r jdk_relative; do
+  [[ -n "$jdk_relative" ]] || continue
+  if [[ -f "$source_root/$jdk_relative" || -f "$classlib_target_root/$jdk_relative" ]]; then
+    echo "port/overrides/jdk and the classlib overlay both define $jdk_relative" >&2
+    exit 1
+  fi
+  sources+=("${jdk_sources[$jdk_relative]}")
+done < <(printf '%s\n' "${!jdk_sources[@]}" | sort)
 if [[ "${#sources[@]}" -eq 0 ]]; then
   echo "No classlib overrides found" >&2
   exit 1
@@ -380,15 +444,106 @@ if command -v cygpath >/dev/null 2>&1; then
   java_classlib_classes="$(cygpath -m "$classes")"
 fi
 
+# Version directories of library overrides are ranges of library versions
+# (maint/D14 3.3, M1 item 7): an exact version (3.4.3), a wildcard (3.4.x) or a
+# Maven interval ([3.4.1,3.5)), with the semantics of port/tools/extrefs
+# ExtRefs.Range.  extrefs_tool runs ExtRefs from classes compiled on first use.
+extrefs_classes="$overlay_work/extrefs-classes"
+mkdir -p "$extrefs_classes"
+find "$extrefs_classes" -type f -delete
+extrefs_native_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+extrefs_tool() {
+  if [[ ! -f "$extrefs_classes/ExtRefs.class" ]]; then
+    javac --release 21 -proc:none -nowarn \
+      -classpath "$java_asm_jar${java_classpath_separator}$java_asm_tree_jar" \
+      -d "$extrefs_classes" "$root/port/tools/extrefs/ExtRefs.java" >&2
+  fi
+  # A colon-separated class path, like the patcher calls: the java shim above converts it on
+  # Windows.
+  java -classpath "$extrefs_classes:$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar:$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar" \
+    ExtRefs "$@"
+}
+
+# select_library_version_dir NAME VERSIONS_ROOT VERSION JAR: prints the version
+# directory of VERSIONS_ROOT whose range selects library VERSION, the narrowest
+# one when several do (an exact version before a wildcard, a longer wildcard
+# before a shorter one, a wildcard before an interval; two equally narrow ones
+# are an error), or VERSIONS_ROOT/VERSION (absent) when none does.  Profiles whose
+# library version no range selects build from the shared sources alone.  The
+# api.lock of the selected directory must still describe the library jar JAR
+# (ExtRefs apilock --check), otherwise the build fails.
+select_library_version_dir() {
+  local name="$1"
+  local versions_root="$2"
+  local library_version="$3"
+  local best=""
+  local best_rank=""
+  local tied=""
+  local candidate range rank
+  local wildcard_range='^[0-9A-Za-z.-]+[.][x*]$'
+  local interval_range='^[[(].*,.*[])]$'
+  if [[ -d "$versions_root" ]]; then
+    for candidate in "$versions_root"/*/; do
+      [[ -d "$candidate" ]] || continue
+      range="$(basename "$candidate")"
+      if [[ "$range" == "$library_version" ]]; then
+        rank=0
+      elif [[ "$range" =~ $wildcard_range ]]; then
+        extrefs_tool apilock --matches "$range" --version "$library_version" >/dev/null || continue
+        rank=$((1000 - ${#range}))
+      elif [[ "$range" =~ $interval_range ]]; then
+        extrefs_tool apilock --matches "$range" --version "$library_version" >/dev/null || continue
+        rank=2000
+      else
+        continue
+      fi
+      if [[ -z "$best_rank" || "$rank" -lt "$best_rank" ]]; then
+        best="${candidate%/}"
+        best_rank="$rank"
+        tied=""
+      elif [[ "$rank" -eq "$best_rank" ]]; then
+        tied="${candidate%/}"
+      fi
+    done
+  fi
+  if [[ -n "$tied" ]]; then
+    echo "Both $best and $tied select $name $library_version; narrow one of the ranges" >&2
+    return 1
+  fi
+  if [[ -z "$best" ]]; then
+    printf '%s\n' "$versions_root/$library_version"
+    return 0
+  fi
+  if [[ -f "$best/api.lock" ]]; then
+    local lock_output
+    if ! lock_output="$(extrefs_tool apilock --jar "$(extrefs_native_path "$4")" \
+        --check "$(extrefs_native_path "$best/api.lock")" --version "$library_version")"; then
+      printf '%s\n' "$lock_output" >&2
+      echo "The API of $name $library_version differs from $best/api.lock: adapt the overrides of $best" >&2
+      echo "and regenerate the lock (bash port/tools/extrefs/extrefs.sh apilock $version --write)," >&2
+      echo "or narrow the range so it no longer selects $library_version." >&2
+      return 1
+    fi
+    echo "$lock_output" >&2
+  fi
+  printf '%s\n' "$best"
+}
+
 # Library overlays merge two source roots, with the same rules as the client
 # overrides: port/overrides/libraries/<name>/src/main/java is shared by every
-# profile, and port/overrides/libraries/<name>/src/versions/<artifact-version>/
-# {java,excludes.txt} applies only to that library version (the Maven version
-# directory of the library jar, for example 3.4.3 or 10.0.77).  A version file
-# replaces the shared file with the same relative path; excludes.txt lists
-# shared relative paths to leave out (format: gaius_version_excludes in
-# version-profile.sh).  Without any Java source the vanilla jar is copied
-# unmodified, so the output jar always exists.
+# profile, and port/overrides/libraries/<name>/src/versions/<range>/
+# {java,excludes.txt} applies only to the library versions its range selects
+# (the Maven version directory of the library jar, for example 3.4.3 or 10.0.77;
+# select_library_version_dir).  A version file replaces the shared file with the
+# same relative path; excludes.txt lists shared relative paths to leave out
+# (format: gaius_version_excludes in version-profile.sh).  Without any Java
+# source the vanilla jar is copied unmodified, so the output jar always exists.
 build_library_overlay() {
   local name="$1"
   local source_jar="$2"
@@ -397,7 +552,8 @@ build_library_overlay() {
   local artifact_version
   artifact_version="$(basename "$(dirname "$source_jar")")"
   local version_dir
-  version_dir="$(dirname "$(dirname "$source_dir")")/versions/$artifact_version"
+  version_dir="$(select_library_version_dir "$name" "$(dirname "$(dirname "$source_dir")")/versions" \
+    "$artifact_version" "$source_jar")" || exit 1
   local version_source_dir="$version_dir/java"
   local version_excludes="$version_dir/excludes.txt"
   local target_source_dir
@@ -413,6 +569,13 @@ build_library_overlay() {
   # The classlib overlay classes (dev.gaius.browser.HostLoop, JsArrays) are shared
   # by every overlay; TeaVM resolves them from the classlib overlay jar.
   local compile_classpath="$java_source_jar${java_classpath_separator}$java_client_jar${java_classpath_separator}$java_classlib_classes${java_classpath_separator}$java_work_classpath"
+  local dependency_classes="${5:-}"
+  if [[ -n "$dependency_classes" ]]; then
+    if command -v cygpath >/dev/null 2>&1; then
+      dependency_classes="$(cygpath -m "$dependency_classes")"
+    fi
+    compile_classpath="$dependency_classes${java_classpath_separator}$compile_classpath"
+  fi
   for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-platform; do
     compile_classpath="$compile_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
   done
@@ -453,6 +616,17 @@ build_library_overlay() {
     while IFS= read -r source; do
       library_sources+=("$source")
     done < <(find "$target_source_dir" -type f -name '*.java' -print | sort)
+  fi
+
+  if [[ "$name" == "lwjgl-opengl" ]]; then
+    local profile_source="$overlay_work/generated-sources/lwjgl-opengl/org/lwjgl/opengl/GaiusProfileCapabilities.java"
+    mkdir -p "$(dirname "$profile_source")"
+    printf 'package org.lwjgl.opengl;\nfinal class GaiusProfileCapabilities {\n' > "$profile_source"
+    printf '    static final String PATCH_SET = "%s";\n' "$GAIUS_PATCH_SET" >> "$profile_source"
+    printf '    static final boolean TERRAIN_SECTION_UNIFORM_BLOCK = %s;\n' \
+      "$(jq -r '.terrainSectionUniformBlock // false' "$GAIUS_VERSION_PROFILE")" >> "$profile_source"
+    printf '}\n' >> "$profile_source"
+    library_sources+=("$profile_source")
   fi
 
   if [[ "${#library_sources[@]}" -eq 0 ]]; then
@@ -535,10 +709,10 @@ asm_jar="$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar"
 asm_tree_jar="$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
 mkdir -p "$tool_classes"
 find "$tool_classes" -type f -delete
-# -sourcepath lets javac pull in the patchers' sub-packages (for example
-# dev.gaius.tools.m263, called by Minecraft263BrowserPatcher).
+# -sourcepath lets javac pull in the patchers' sub-packages (the domain classes of
+# dev.gaius.tools.patches.<domain> that the patcher steps call, and their support package).
 javac --release 21 -proc:none \
-  -classpath "$java_asm_jar${java_classpath_separator}$java_asm_tree_jar" \
+  -classpath "$java_asm_jar${java_classpath_separator}$java_asm_tree_jar${java_classpath_separator}$java_maven_repository/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar" \
   -sourcepath "$root/port/tools/src/main/java" \
   -d "$tool_classes" \
   "$root/port/tools/src/main/java/dev/gaius/tools/"*.java
@@ -1039,7 +1213,8 @@ for module_row in "${lwjgl_module_steps[@]}"; do
       "$lwjgl_module" \
       "$work/libraries/$module_path" \
       "$root/port/overrides/libraries/$lwjgl_module/src/main/java" \
-      "$module_output"
+      "$module_output" \
+      "$overlay_work/library-classes/lwjgl"
   else
     mkdir -p "$(dirname "$module_output")"
     cp "$work/libraries/$module_path" "$module_output"
@@ -1074,9 +1249,8 @@ client_output="$overlay_work/client-named-$version-gaius.jar"
 client_patch_classes="$overlay_work/client-patches"
 client_override_classes="$overlay_work/client-override-classes"
 client_override_root="$root/port/overrides/client/src/main/java"
-client_version_override_root="$root/port/overrides/client/src/versions/$version/java"
-client_version_excludes="$root/port/overrides/client/src/versions/$version/excludes.txt"
 client_target_override_root="$(target_source_root "$client_override_root")"
+client_override_staging="$overlay_work/client-override-sources"
 mkdir -p "$client_patch_classes"
 find "$client_patch_classes" -type f -delete
 cp "$work/client-named.jar" "$client_output"
@@ -1089,34 +1263,22 @@ zip -q -d "$client_output" \
   assets/minecraft/font/include/unifont_pua.json >/dev/null 2>&1 || true
 mkdir -p "$client_override_classes"
 find "$client_override_classes" -type f -delete
-client_override_sources=()
-client_excludes="$(gaius_version_excludes "$client_version_excludes" "$client_override_root")"
-while IFS= read -r source; do
-  relative_source="${source#"$client_override_root/"}"
-  if [[ -f "$client_version_override_root/$relative_source" \
-      || -f "$client_target_override_root/$relative_source" ]]; then
-    continue
-  fi
-  if [[ -n "$client_excludes" ]] \
-      && grep -Fqx -e "$relative_source" <<<"$client_excludes"; then
-    continue
-  fi
-  client_override_sources+=("$source")
-done < <(find "$client_override_root" -type f -name '*.java' -print | sort)
-if [[ -d "$client_version_override_root" ]]; then
-  while IFS= read -r source; do
-    if [[ -f "$client_target_override_root/${source#"$client_version_override_root/"}" ]]; then
-      continue
-    fi
-    client_override_sources+=("$source")
-  done < <(find "$client_version_override_root" -type f -name '*.java' -print | sort)
-fi
+# The client overrides follow the source set rules of generate-pom.sh: the shared
+# port/overrides/client/src/main/java, then the client/ part of every port/mc/shared
+# source set the profile selects (excludes.txt, java/ replacing files with the same
+# relative path, relocations.tsv package moves), then the target root.
+# port/tools/sourcesets/sourcesets.mjs stages the merged tree, which is compiled whole.
+rm -rf "$client_override_staging"
+node "$root/port/tools/sourcesets/sourcesets.mjs" stage --kind client \
+  --profile "$(extrefs_native_path "$GAIUS_VERSION_PROFILE")" --target "$teavm_target" \
+  --out "$(extrefs_native_path "$client_override_staging")" || exit 1
 if [[ -d "$client_target_override_root" ]]; then
   echo "Adding $teavm_target client overrides from $client_target_override_root"
-  while IFS= read -r source; do
-    client_override_sources+=("$source")
-  done < <(find "$client_target_override_root" -type f -name '*.java' -print | sort)
 fi
+client_override_sources=()
+while IFS= read -r source; do
+  client_override_sources+=("$source")
+done < <(find "$client_override_staging" -type f -name '*.java' -print | sort)
 echo "Compiling ${#client_override_sources[@]} Minecraft $version browser overrides"
 client_override_classpath="$java_client_jar${java_classpath_separator}$java_classlib_classes${java_classpath_separator}$java_work_classpath"
 for artifact in teavm-interop teavm-jso teavm-jso-apis; do
@@ -1127,6 +1289,7 @@ javac_with_source_argfile "$overlay_work/client-override-sources.argfile" \
   -classpath "$client_override_classpath" \
   -d "$client_override_classes" \
   -- "${client_override_sources[@]}"
+rm -rf "$client_override_staging"
 jar --update --file "$client_output" -C "$client_override_classes" .
 
 # One client patcher step: run dev.gaius.tools.<Class> with the PatchRegistry
@@ -1199,6 +1362,73 @@ for extra_patcher in $GAIUS_EXTRA_PATCHERS; do
     "$client_patch_classes" \
     "$version"
 done
+
+# WebGPU core and render seam (DESIGN D10/D16).  port/gpu/webgpu-core holds no vanilla symbol: it
+# is compiled for every profile against the TeaVM JSO API alone, so a vanilla reference fails
+# here.  The profile's render seam (renderSeam above) is compiled against the core and the
+# patched client.  Both source roots follow the target rule (src/target-<target>/java replaces and
+# adds files).  With a seam, core and seam classes join the client overlay jar after the
+# patchers; nothing references them until a backend list selects the seam, so the TeaVM output
+# does not change.  Without one nothing could use the core, and the overlay products stay
+# byte-identical (the 26.2 G1 gate).
+#
+# target_merged_sources MAIN_ROOT: the .java files of MAIN_ROOT and its target-specific sibling.
+target_merged_sources() {
+  local main_root="$1"
+  local target_root
+  local source
+  target_root="$(target_source_root "$main_root")"
+  if [[ -d "$main_root" ]]; then
+    while IFS= read -r source; do
+      if [[ ! -f "$target_root/${source#"$main_root/"}" ]]; then
+        printf '%s\n' "$source"
+      fi
+    done < <(find "$main_root" -type f -name '*.java' -print | sort)
+  fi
+  if [[ -d "$target_root" ]]; then
+    find "$target_root" -type f -name '*.java' -print | sort
+  fi
+}
+gpu_jso_classpath=""
+for artifact in teavm-interop teavm-jso teavm-jso-apis; do
+  gpu_jso_classpath="$gpu_jso_classpath${gpu_jso_classpath:+$java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+done
+gpu_core_classes="$overlay_work/gpu-core-classes"
+gpu_seam_classes="$overlay_work/gpu-seam-classes"
+java_gpu_core_classes="$gpu_core_classes"
+java_client_output="$client_output"
+if command -v cygpath >/dev/null 2>&1; then
+  java_gpu_core_classes="$(cygpath -m "$gpu_core_classes")"
+  java_client_output="$(cygpath -m "$client_output")"
+fi
+mkdir -p "$gpu_core_classes" "$gpu_seam_classes"
+find "$gpu_core_classes" "$gpu_seam_classes" -type f -delete
+gpu_core_sources=()
+while IFS= read -r source; do
+  gpu_core_sources+=("$source")
+done < <(target_merged_sources "$root/port/gpu/webgpu-core/src/main/java")
+echo "Compiling ${#gpu_core_sources[@]} WebGPU core sources"
+javac_with_source_argfile "$overlay_work/gpu-core-sources.argfile" \
+  --release 21 -proc:none \
+  -classpath "$gpu_jso_classpath" \
+  -d "$gpu_core_classes" \
+  -- "${gpu_core_sources[@]}"
+if [[ "$render_seam" == none ]]; then
+  echo "Render seam: none for Minecraft $version (the WebGPU core stays out of the client overlay)"
+else
+  jar --update --file "$client_output" -C "$gpu_core_classes" .
+  gpu_seam_sources=()
+  while IFS= read -r source; do
+    gpu_seam_sources+=("$source")
+  done < <(target_merged_sources "$root/port/mc/seams/$render_seam/src/main/java")
+  echo "Compiling ${#gpu_seam_sources[@]} sources of render seam $render_seam for Minecraft $version"
+  javac_with_source_argfile "$overlay_work/gpu-seam-sources.argfile" \
+    --release 21 -proc:none \
+    -classpath "$java_gpu_core_classes${java_classpath_separator}$java_client_output${java_classpath_separator}$java_work_classpath${java_classpath_separator}$gpu_jso_classpath" \
+    -d "$gpu_seam_classes" \
+    -- "${gpu_seam_sources[@]}"
+  jar --update --file "$client_output" -C "$gpu_seam_classes" .
+fi
 
 if [[ "$bringup_active" == true ]]; then
   echo "BRINGUP_STEPS skipped=$bringup_skipped"

@@ -3,7 +3,10 @@ package dev.gaius.browser;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
 
-/** Keeps large one-time client and server initialization batches cooperative in browsers. */
+/**
+ * Keeps large one-time client and server initialization batches cooperative in the JavaScript
+ * build; the WebAssembly GC build only records the progress events.
+ */
 public final class BrowserStartupScheduler {
     private static final int BLOCK_REGISTRATION_BATCH = 64;
     private static final int BLOCK_STATE_CACHE_BATCH = 512;
@@ -87,6 +90,13 @@ public final class BrowserStartupScheduler {
     }
 
     private static void yieldToBrowser() {
+        // The WebAssembly GC build has no artificial startup yields (design D4): the browser
+        // gets its turns at the frame boundary of Minecraft.run and wherever a thread blocks.
+        // The progress events above are still recorded. HostLoop.isWasmGc() is a platform
+        // marker, so the JavaScript build compiles this method as before.
+        if (HostLoop.isWasmGc()) {
+            return;
+        }
         TModernRuntimeSupport.yieldToEventLoop(0);
     }
 

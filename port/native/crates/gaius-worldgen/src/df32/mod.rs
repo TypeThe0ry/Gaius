@@ -664,6 +664,7 @@ impl Program32 {
                     input: self.compile(c, *input)?,
                 }
             }
+            Op::ScaledNoise { .. } => return Err(IrError::new("scaled noise requires a double router")),
             Op::Marker(_, input) => return self.compile(c, *input),
         };
         Ok(self.push(s))

@@ -17,6 +17,8 @@ import {startWorkerProfiler} from "../../tools/chrome-worker-profiler.mjs";
 import {summarizeFlightReadiness} from "../../tools/flight-readiness.mjs";
 import {configureWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
 import {RUNTIME_GUARD_EXPRESSION,clinitSuspensionCount,runtimeGuardFailures} from "../../tools/teavm-runtime-guards.mjs";
+import {chromeIsolationArgs,fileArtifactForRuntime,RUNTIME_TELEMETRY_EXPRESSION,runtimeArgument,runtimeTelemetryFailures} from "./bench/harness-common.mjs";
+import {GL_FRAME_GUARD_SOURCE,GL_FRAME_GUARD_WINDOW_EXPRESSION,glFrameGuardFailures} from "../../tools/gl-frame-guard.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 // Without GAIUS_VERSION_PROFILE_PATH the default profile is port/config.json's
@@ -24,8 +26,36 @@ const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH
   || JSON.parse(readFileSync(resolve(root, "port/config.json"), "utf8")).versionProfile;
 const profileId = basename(profilePath).replace(/\.json$/i, "");
-const artifact = resolve(process.env.GAIUS_FILE_ARTIFACT || `port/web/dist/${profileId}/Gaius.html`);
+// --runtime js|wasm (or GAIUS_RUNTIME) names the runtime the page must run; with GAIUS_FILE_DIST
+// it also picks that runtime's portable page of the dist. The run fails when the page reports
+// another runtime. Without it the artifact runs whatever it was built for (the JS build).
+const requestedRuntime = runtimeArgument();
+const artifact = resolve(process.env.GAIUS_FILE_ARTIFACT
+  || (process.env.GAIUS_FILE_DIST ? fileArtifactForRuntime(resolve(process.env.GAIUS_FILE_DIST), requestedRuntime || "js")
+    : `port/web/dist/${profileId}/Gaius.html`));
+// single | multi | both | title. "title" stops at the title screen: the runtime acceptance of a
+// page that cannot enter a world yet (the WebAssembly GC client before M2).
 const mode = String(process.env.GAIUS_FILE_MODE || "single").toLowerCase();
+// The world seed of every singleplayer run is known and recorded: GAIUS_FILE_WORLD_SEED fixes it
+// (formal runs use FORMAL_WORLD_SEED below unless they name another); without it the harness draws
+// a random seed and types it like a player would, so a failing run can be repeated with the same
+// world. GAIUS_FILE_WORLD_SEED=vanilla leaves the field empty and lets the game pick an unrecorded
+// seed (the flow before seeds were recorded).
+const FORMAL_WORLD_SEED = "20261004";
+function chooseWorldSeed() {
+  const fixed = String(process.env.GAIUS_FILE_WORLD_SEED || "");
+  if (fixed.toLowerCase() === "vanilla") return {value: null, source: "vanilla"};
+  if (fixed) return {value: fixed, source: "env"};
+  if (process.env.GAIUS_FILE_FORMAL === "1") return {value: FORMAL_WORLD_SEED, source: "formal"};
+  // A random signed 64-bit value, as vanilla's own random seed would be.
+  const bytes = new Uint8Array(8);
+  globalThis.crypto.getRandomValues(bytes);
+  let value = 0n;
+  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+  return {value: BigInt.asIntN(64, value).toString(), source: "random"};
+}
+const worldSeed = chooseWorldSeed();
+const networkIsolated = process.env.GAIUS_HARNESS_NETWORK !== "allow";
 const flightRequested = process.env.GAIUS_FILE_FLIGHT === "1";
 const output = resolve(process.env.GAIUS_FILE_OUTPUT || `artifacts/file-entry-${profileId}-${mode}.json`);
 const timeoutMs = Number(process.env.GAIUS_FILE_TIMEOUT_MS || "300000");
@@ -217,6 +247,9 @@ async function waitFor(cdp, expression, ms, label) { const end=Date.now()+ms; le
 async function freePort(){const s=createServer();await new Promise((ok,bad)=>{s.once("error",bad);s.listen(0,"127.0.0.1",ok);});const p=s.address().port;await new Promise(ok=>s.close(ok));return p;}
 async function clickAt(cdp,x,y){await cdp.send("Input.dispatchMouseEvent",{type:"mouseMoved",x,y,button:"none"});await cdp.send("Input.dispatchMouseEvent",{type:"mousePressed",x,y,button:"left",buttons:1,clickCount:1});await cdp.send("Input.dispatchMouseEvent",{type:"mouseReleased",x,y,button:"left",buttons:0,clickCount:1});}
 async function findWidget(cdp,label,ms=60000){const needle=String(label).toLowerCase();const end=Date.now()+ms;while(Date.now()<end){const v=await evaluate(cdp,`(()=>{const s=window.__gaiusMinecraftState||{};const ws=Array.isArray(s.screenWidgets)?s.screenWidgets:[];const n=${JSON.stringify(needle)};const w=ws.find(x=>x&&x.visible!==false&&x.active!==false&&String(x.text||'').trim().toLowerCase()===n)||ws.find(x=>x&&x.visible!==false&&x.active!==false&&String(x.text||'').toLowerCase().includes(n));const c=document.querySelector('canvas');const r=c&&c.getBoundingClientRect();const z=s.screenSize;if(!w||!r||!z||!z.width||!z.height)return null;return {text:String(w.text||''),x:r.left+(Number(w.x)+Number(w.width)/2)*r.width/Number(z.width),y:r.top+(Number(w.y)+Number(w.height)/2)*r.height/Number(z.height),screen:s.screen||null};})()`);if(v)return v;await sleep(250);}return null;}
+// The title screen, or the boot error that rules it out (either runtime sets __gaiusBootError; the
+// WebAssembly GC loader also __gaiusThreadError), so a page that cannot boot fails at once.
+async function waitForTitle(cdp,ms){const end=Date.now()+ms;while(Date.now()<end){let s=null;try{s=await evaluate(cdp,"(()=>{const e=window.__gaiusThreadError||window.__gaiusBootError;return {title:String(window.__gaiusMinecraftState?.screen||'').endsWith('TitleScreen'),error:e?String(e.stack||e).slice(0,2000):null};})()");}catch(e){if(cdp?.closed||cdp?.state!=="open")throw new Error(`CDP unavailable while waiting for Minecraft title screen: ${e.message}`,{cause:e});}if(s?.title)return;if(s?.error)throw new Error(`boot failed before the Minecraft title screen: ${s.error}`);await sleep(250);}throw new Error("timeout waiting for Minecraft title screen");}
 async function clickWidget(cdp,label,ms=60000){const w=await findWidget(cdp,label,ms);if(!w)throw new Error(`visible widget not found: ${label}`);await clickAt(cdp,w.x,w.y);return w;}
 
 async function preferCreativeWorld(cdp) {
@@ -799,29 +832,34 @@ async function runCleanupCommand(command,args,options={}) {
   });
 }
 
-function parsePidList(outputText) {
-  return String(outputText||"").split(",")
-    .map(value=>value.trim()).filter(Boolean)
-    .map(Number).filter(value=>Number.isInteger(value)&&value>0);
+function parseChromeProcessState(outputText) {
+  try {
+    const state=JSON.parse(outputText);
+    if(Array.isArray(state.remainingPids)&&typeof state.rootExited==="boolean"
+        &&state.remainingPids.every(pid=>Number.isInteger(pid)&&pid>0))return state;
+  } catch {}
+  return null;
 }
 
-async function sweepWindowsChromeProfile(profileDirectory) {
+async function sweepWindowsChromeProfile(profileDirectory, rootPid=null) {
   if(process.platform!=="win32")return {attempted:false,remainingPids:[],error:null};
   const source=[
     "$ErrorActionPreference='Stop'",
     "$needle=$env:GAIUS_CHROME_PROFILE_CLEANUP.Replace('\\','/').ToLowerInvariant()",
-    "function MatchesProfile($process){$process.Name -eq 'chrome.exe' -and $process.CommandLine -and $process.CommandLine.Replace('\\','/').ToLowerInvariant().Contains($needle)}",
+    "function MatchesProfile($process){if($process.Name -ne 'chrome.exe' -or !$process.CommandLine -or !$process.CommandLine.Replace('\\','/').ToLowerInvariant().Contains($needle)){return $false};$live=Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue;return $live -and !$live.HasExited}",
     "$matches=@(Get-CimInstance Win32_Process | Where-Object { MatchesProfile $_ })",
     "foreach($process in $matches){Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue}",
     "Start-Sleep -Milliseconds 150",
     "$remaining=@(Get-CimInstance Win32_Process | Where-Object { MatchesProfile $_ } | Select-Object -ExpandProperty ProcessId)",
-    "[Console]::Out.Write(($remaining -join ','))",
+    "$root=Get-Process -Id ([int]$env:GAIUS_CHROME_ROOT_PID) -ErrorAction SilentlyContinue",
+    "[Console]::Out.Write((@{remainingPids=@($remaining);rootExited=(!$root -or $root.HasExited)} | ConvertTo-Json -Compress))",
   ].join(";");
   const result=await runCleanupCommand("powershell.exe",[
     "-NoLogo","-NoProfile","-NonInteractive","-Command",source,
-  ],{env:{...process.env,GAIUS_CHROME_PROFILE_CLEANUP:profileDirectory}});
-  const remainingPids=parsePidList(result.stdout);
-  return {attempted:true,remainingPids,error:result.ok?null:(result.error||result.stderr||`exit ${result.code}`)};
+  ],{env:{...process.env,GAIUS_CHROME_PROFILE_CLEANUP:profileDirectory,GAIUS_CHROME_ROOT_PID:String(rootPid||0)}});
+  const state=parseChromeProcessState(result.stdout);
+  return {attempted:true,...(state||{remainingPids:[],rootExited:false}),
+    error:result.ok ? state ? null : "invalid Chrome process state" : (result.error||result.stderr||`exit ${result.code}`)};
 }
 
 async function terminateChromeTree(chromeProcess, profileDirectory) {
@@ -839,17 +877,33 @@ async function terminateChromeTree(chromeProcess, profileDirectory) {
       }
     }
   }
-  const firstSweep=await sweepWindowsChromeProfile(profileDirectory);
+  const firstSweep=await sweepWindowsChromeProfile(profileDirectory,rootPid);
   if(firstSweep.error)errors.push(firstSweep.error);
   if(firstSweep.remainingPids.length) {
     await sleep(250);
-    const secondSweep=await sweepWindowsChromeProfile(profileDirectory);
+    const secondSweep=await sweepWindowsChromeProfile(profileDirectory,rootPid);
     if(secondSweep.error)errors.push(secondSweep.error);
     firstSweep.remainingPids=secondSweep.remainingPids;
+    firstSweep.rootExited=secondSweep.rootExited;
   }
-  const rootExited=!chromeProcess||await waitForExit(chromeProcess,5000);
+  // Windows retains terminated process objects while handles remain open. CIM
+  // presence and delayed Node exit events are not evidence of a running process.
+  const rootExited=process.platform==="win32" ? !firstSweep.error&&firstSweep.rootExited : !chromeProcess||await waitForExit(chromeProcess,5000);
   return {rootPid,rootExited,processTreeExited:rootExited&&firstSweep.remainingPids.length===0,
     remainingPids:firstSweep.remainingPids,error:errors.length?errors.join("\n"):null};
+}
+
+// A request to a non-loopback host that Chrome's isolation proxy refused (chromeIsolationArgs):
+// the harness blocked it on purpose, so it is reported (blockedExternalRequests) but does not fail
+// the run; the product's own failures to load are still critical.
+function isBlockedExternalRequest(entry) {
+  if (!networkIsolated) return false;
+  let url;
+  try { url=new URL(String(entry?.url||"")); } catch { return false; }
+  if (!/^https?:$|^wss?:$/.test(url.protocol)) return false;
+  const host=url.hostname.replace(/^\[|\]$/g,"").toLowerCase();
+  if (host==="localhost"||host==="::1"||/^127\./.test(host)) return false;
+  return /ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED/.test(String(entry?.errorText||""));
 }
 
 function singleRuntimeGate(runMode,singleRuntime) {
@@ -882,9 +936,16 @@ if(process.argv.includes("--static-self-test")){
   }
   assert.equal(failureEvents([{event:'singleplayer:worker',detail:{
     type:'network-pump-busy'}}]).length,0);
-  assert.deepEqual(parsePidList(""),[],"empty process output must not become PID 0");
-  assert.deepEqual(parsePidList(" 12, ,0,-1,not-a-pid,34 "),[12,34],
-    "process output must contain only positive integer PIDs");
+  assert.equal(parseChromeProcessState(""),null,"missing process output must fail closed");
+  assert.equal(isBlockedExternalRequest({url:"https://relay.example/proxy/auth?x",errorText:"net::ERR_PROXY_CONNECTION_FAILED"}),networkIsolated);
+  assert.equal(isBlockedExternalRequest({url:"http://127.0.0.1:8080/proxy/auth?x",errorText:"net::ERR_PROXY_CONNECTION_FAILED"}),false);
+  assert.equal(isBlockedExternalRequest({url:"https://relay.example/x",errorText:"net::ERR_FAILED"}),false);
+  assert.deepEqual(parseChromeProcessState('{"rootExited":true,"remainingPids":[]}'),
+    {rootExited:true,remainingPids:[]});
+  assert.deepEqual(parseChromeProcessState('{"rootExited":false,"remainingPids":[12,34]}'),
+    {rootExited:false,remainingPids:[12,34]});
+  assert.equal(parseChromeProcessState('{"rootExited":true,"remainingPids":[0]}'),null);
+  assert.equal(parseChromeProcessState('{"rootExited":"true","remainingPids":[]}'),null);
   class FakeWebSocket {
     constructor(readyState=1){this.readyState=readyState;this.listeners=new Map();this.sent=[];}
     addEventListener(type,listener,options={}){this.listeners.set(type,[...(this.listeners.get(type)||[]),{listener,once:options?.once===true}]);}
@@ -962,8 +1023,13 @@ if(process.argv.includes("--static-self-test")){
 }
 
 const profileDir = await mkdtemp(`${tmpdir()}/gaius-file-entry-`); const port = await freePort();
-const chrome = spawn(chromeBinary,["--headless=new",`--remote-debugging-port=${port}`,"--remote-allow-origins=*",`--user-data-dir=${profileDir}`,"--no-first-run","--no-default-browser-check","--disable-background-networking","--disable-component-update","--disable-domain-reliability","--disable-features=Translate,MediaRouter","about:blank"],{stdio:["ignore","pipe","pipe"]});
+// chromeIsolationArgs: no background traffic, and non-loopback requests go to a closed local proxy
+// (GAIUS_HARNESS_NETWORK=allow lifts the proxy). The local bridge on 127.0.0.1 is not proxied.
+const chrome = spawn(chromeBinary,["--headless=new",`--remote-debugging-port=${port}`,"--remote-allow-origins=*",`--user-data-dir=${profileDir}`,...chromeIsolationArgs(),"about:blank"],{stdio:["ignore","pipe","pipe"]});
 const chromeOutput=[];chrome.stdout.on("data",d=>chromeOutput.push(String(d)));chrome.stderr.on("data",d=>chromeOutput.push(String(d)));
+// Synchronous GL calls per presented frame and unique presented frames (tools/gl-frame-guard.mjs),
+// measured on the title screen and in the settled singleplayer world.
+const glFrames={title:null,world:null}; let glSyncFailures=[]; let glSyncReady=true;
 let cdp; let workerProfiler=null; let report=null; let artifactIdentity=null; let artifactDiagnostic=null; let runtime=null; let singleRuntime=null; let customSkin=null; const consoleMessages=[]; const exceptions=[]; const failedResources=[];
 try {
   artifactIdentity=await fileIdentity(artifact);
@@ -1033,8 +1099,10 @@ try {
   // seed it (and the optional custom skin) before the first document runs.
   // Later reloads keep whatever the in-game profile flow stored.
   await cdp.send("Page.addScriptToEvaluateOnNewDocument",{source:`(()=>{try{if(sessionStorage.getItem('gaius.acceptance.identity'))return;sessionStorage.setItem('gaius.acceptance.identity','1');localStorage.setItem('gaius.playerName',${JSON.stringify(playerName)});${customSkinDataUrl ? `localStorage.setItem('gaius.customSkin',${JSON.stringify(customSkinDataUrl)});` : ""}}catch(_){}})();`});
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument",{source:GL_FRAME_GUARD_SOURCE});
   await cdp.send("Page.navigate",{url:targetUrl});
-  await waitFor(cdp,"String(window.__gaiusMinecraftState?.screen||'').endsWith('TitleScreen')",timeoutMs,"Minecraft title screen");
+  await waitForTitle(cdp,timeoutMs);
+  glFrames.title=await evaluate(cdp,GL_FRAME_GUARD_WINDOW_EXPRESSION(3000)).catch(e=>({installed:false,error:String(e)}));
   const title = await evaluate(cdp,"window.__gaiusMinecraftState?.screen||null");
   customSkin = await evaluate(cdp,`(()=>{const d=window.__gaiusSkinDescriptor;return {requested:${JSON.stringify(!!customSkinDataUrl)},present:!!d,custom:!!d?.custom,username:String(d?.username||''),uuid:String(d?.uuid||''),signature:String(d?.signature||''),valueLength:Number(String(d?.value||'').length)};})()`);
   artifactDiagnostic=await evaluate(cdp,`(()=>{const m=window.__gaiusPortableManifest;return m?.diagnosticOnly===true?{diagnosticOnly:true,latencyAcceptanceEligible:false,candidate:m.candidate||null}:null;})()`);
@@ -1045,8 +1113,8 @@ try {
     if(screen.includes("SelectWorldScreen")) { const create=await findWidget(cdp,"Create New World",5000); if(create) { await clickAt(cdp,create.x,create.y); await waitFor(cdp,"String(window.__gaiusMinecraftState?.screen||'').includes('CreateWorldScreen')",60000,"create-world screen"); } else throw new Error("existing worlds were listed but Create New World was not visible"); }
     await preferCreativeWorld(cdp);
     let worldSeedInput=null;
-    if(process.env.GAIUS_FILE_WORLD_SEED) {
-      const seed=process.env.GAIUS_FILE_WORLD_SEED;
+    if(worldSeed.value!=null) {
+      const seed=worldSeed.value;
       if(seed.length>32||/[\r\n]/.test(seed))throw new Error('Invalid diagnostic world seed');
       worldSeedInput=await configureWorldSeed(cdp,seed,{
         findButton:findWidget,click:clickAt,evaluate,waitFor,sleep,outputPath:output,
@@ -1067,6 +1135,7 @@ try {
     const terrain=await captureSingleplayerTerrain(cdp,worldRequestedAtMillis);
     terrain.cameraInput=cameraInput;
     terrain.worldSeedInput=worldSeedInput;
+    glFrames.world=await evaluate(cdp,GL_FRAME_GUARD_WINDOW_EXPRESSION(4000)).catch(e=>({installed:false,error:String(e)}));
     singleRuntime = await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}let workerTelemetry=null;try{workerTelemetry=JSON.parse(JSON.stringify(window.__gaiusWorkerMessageTelemetry||null));}catch(e){workerTelemetry={captureError:String(e)}}return {capturedAt:new Date().toISOString(),stage:'singleplayer-world',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,workerTelemetry,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
     singleRuntime.terrain=terrain;
     singleRuntime.workerTelemetry=terrain.workerTelemetry||singleRuntime.workerTelemetry;
@@ -1076,13 +1145,26 @@ try {
     await clickWidget(cdp,"Multiplayer"); await waitFor(cdp,"/MultiplayerScreen|ServerListScreen|Online/.test(String(window.__gaiusMinecraftState?.screen||''))",60000,"multiplayer screen");
   }
   runtime = mode==="single" ? singleRuntime : await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}return {capturedAt:new Date().toISOString(),stage:'final',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
-  const siblingFileRequests=runtime.resources.filter(x=>x.name.startsWith("file:")&&!x.name.toLowerCase().endsWith(basename(artifact).toLowerCase())).map(x=>x.name); const criticalFailedResources=failedResources.filter(x=>!String(x.url||"").startsWith("http://127.0.0.1:8080/proxy/auth?")); const blobUrls=[runtime.classesUrl,runtime.workerUrl,runtime.wasmUrl].filter(x=>x.startsWith("blob:"));
+  const siblingFileRequests=runtime.resources.filter(x=>x.name.startsWith("file:")&&!x.name.toLowerCase().endsWith(basename(artifact).toLowerCase())).map(x=>x.name); const blockedExternalRequests=failedResources.filter(isBlockedExternalRequest); const criticalFailedResources=failedResources.filter(x=>!String(x.url||"").startsWith("http://127.0.0.1:8080/proxy/auth?")&&!isBlockedExternalRequest(x)); const blobUrls=[runtime.classesUrl,runtime.workerUrl,runtime.wasmUrl].filter(x=>x.startsWith("blob:"));
+  // Runtime-neutral telemetry (bench/harness-common.mjs): the JS build's suspension guards and the
+  // WebAssembly GC build's failed-thread and boot errors, read the same way on both runtimes.
+  const runtimeTelemetry=await evaluate(cdp,RUNTIME_TELEMETRY_EXPRESSION); const runtimeMatches=requestedRuntime==null||runtimeTelemetry?.runtime===requestedRuntime;
+  const glTrace=await evaluate(cdp,`(()=>{const s=window.__gaiusGLStats||{};return {stacks:window.__gaiusGlFrameGuard?.stacks||[],bufferReadbacks:s.bufferReadbacks||null,baseVertex:Object.fromEntries(Object.entries(s).filter(([key])=>key.startsWith('baseVertex')))};})()`);
+  // The WebAssembly GC page decodes its module from an inline payload, so only the Worker and the
+  // hot-path module are blob URLs there.
+  const requiredBlobUrls=runtimeTelemetry?.runtime==="wasm"?2:3;
   // TeaVM suspension guard errors can be swallowed by Java catch blocks, so the
   // counters and console text are checked besides uncaught exceptions.
-  const runtimeGuards=await evaluate(cdp,RUNTIME_GUARD_EXPRESSION); const guardFailures=runtimeGuardFailures({snapshots:[runtimeGuards],entries:[...consoleMessages,...exceptions],label:"page"});
-  const baseReady=guardFailures.length===0&&exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=3;
-  report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:true,success:false,titleScreen:title,customSkin,singleRuntime,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,runtimeGuards,runtimeGuardFailures:guardFailures,clinitSuspensions:clinitSuspensionCount([runtimeGuards]),gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
-  } catch(error) { if(!artifactIdentity){try{artifactIdentity=await fileIdentity(artifact);}catch(_){}} let diagnostic=null; try { diagnostic=await evaluate(cdp,`(()=>{const b=window.__gaiusNettyBridge;return {href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,body:(document.body?.innerText||'').slice(0,4000),state:window.__gaiusMinecraftState||null,workers:window.__gaiusSingleplayerWorkers?Array.from(window.__gaiusSingleplayerWorkers.entries()).map(([k,v])=>({key:k,state:v?.state||null,worldgen:v?.worldgen||null,ready:v?.ready||null})):null,events:(window.__gaiusMinecraftEvents||[]).slice(-80),bridgeType:typeof b,bridgeKeys:b?Object.keys(b):null,networkStats:window.__gaiusNetworkStats||null,bridgeStats:b?.stats||null,bridgeInitTrace:window.__gaiusNettyBridgeInitTrace||[],bridgeInitError:window.__gaiusNettyBridgeInitError||null,portableBridgeTrace:window.__gaiusPortableBridgeTrace||[],bridgeTrace:window.__gaiusBridgeTrace||[],bridgeOwn:globalThis===window?Object.getOwnPropertyNames(window).filter(k=>k.toLowerCase().includes('bridge')||k.toLowerCase().includes('network')):[],resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize}))};})()`); } catch(_) {} report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:false,success:false,error:String(error.stack||error),customSkin,singleRuntime,runtime,diagnostic,consoleMessages,exceptions,failedResources,gates:{baseReady:false,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-20000),capturedAt:new Date().toISOString()};
+  const runtimeGuards=await evaluate(cdp,RUNTIME_GUARD_EXPRESSION); const guardFailures=[...runtimeGuardFailures({snapshots:[runtimeGuards],entries:[...consoleMessages,...exceptions],label:"page"}),...runtimeTelemetryFailures(runtimeTelemetry,"page")];
+  const baseReady=guardFailures.length===0&&exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=requiredBlobUrls&&runtimeMatches;
+  // Synchronous GL calls per presented frame = 0: a gate on the WebAssembly GC runtime; the frozen
+  // JavaScript fallback (which predates the GL emulation fixes) is reported only.
+  glSyncFailures=[...(glFrames.title?glFrameGuardFailures(glFrames.title,"title"):[]),...(glFrames.world?glFrameGuardFailures(glFrames.world,"world"):[])];
+  glSyncReady=runtimeTelemetry?.runtime!=="wasm"||glSyncFailures.length===0;
+  report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,requestedRuntime,runtimeTelemetry,
+    runtimeSelection:await evaluate(cdp,"window.__gaiusRuntimeSelection||null"),
+    bootTimings:await evaluate(cdp,"window.__gaiusBootTimings||null"),runtimeMatches,worldSeed,completed:true,success:false,titleScreen:title,customSkin,singleRuntime,runtime,consoleMessages,exceptions,failedResources,blockedExternalRequests,siblingFileRequests,blobUrls,runtimeGuards,runtimeGuardFailures:guardFailures,clinitSuspensions:clinitSuspensionCount([runtimeGuards]),glTrace,gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
+  } catch(error) { if(!artifactIdentity){try{artifactIdentity=await fileIdentity(artifact);}catch(_){}} let diagnostic=null; try { diagnostic=await evaluate(cdp,`(()=>{const b=window.__gaiusNettyBridge;return {href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,body:(document.body?.innerText||'').slice(0,4000),state:window.__gaiusMinecraftState||null,workers:window.__gaiusSingleplayerWorkers?Array.from(window.__gaiusSingleplayerWorkers.entries()).map(([k,v])=>({key:k,state:v?.state||null,worldgen:v?.worldgen||null,ready:v?.ready||null})):null,events:(window.__gaiusMinecraftEvents||[]).slice(-80),bridgeType:typeof b,bridgeKeys:b?Object.keys(b):null,networkStats:window.__gaiusNetworkStats||null,bridgeStats:b?.stats||null,bridgeInitTrace:window.__gaiusNettyBridgeInitTrace||[],bridgeInitError:window.__gaiusNettyBridgeInitError||null,portableBridgeTrace:window.__gaiusPortableBridgeTrace||[],bridgeTrace:window.__gaiusBridgeTrace||[],bridgeOwn:globalThis===window?Object.getOwnPropertyNames(window).filter(k=>k.toLowerCase().includes('bridge')||k.toLowerCase().includes('network')):[],resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize}))};})()`); } catch(_) {} let runtimeTelemetry=null; try { runtimeTelemetry=await evaluate(cdp,RUNTIME_TELEMETRY_EXPRESSION); } catch(_) {} report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,requestedRuntime,runtimeTelemetry,worldSeed,completed:false,success:false,error:String(error.stack||error),customSkin,singleRuntime,runtime,diagnostic,consoleMessages,exceptions,failedResources,gates:{baseReady:false,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-20000),capturedAt:new Date().toISOString()};
 } finally {
   if (workerProfiler && report) {
     report.workerDiagnostic = await workerProfiler.stop();
@@ -1100,20 +1182,36 @@ try {
       report.gates={...(report.gates||{}),baseReady:false};
     }
   }
+  // Let Chrome release storage handles before the forced Windows cleanup fallback.
+  if(cdp&&!cdp.closed) {
+    try { await cdp.send("Browser.close",{},2000); } catch {}
+    if(chrome)await waitForExit(chrome,5000);
+  }
   const cdpClosed=await closeCdp(cdp);
-  const treeCleanup=await terminateChromeTree(chrome,profileDir);
-  const chromeExited=treeCleanup.rootExited;
+  let treeCleanup=await terminateChromeTree(chrome,profileDir);
   const profileCleanup=await removeChromeProfile(profileDir);
+  // Profile removal can wait for delayed Windows process teardown. The final gate
+  // must observe the final process state rather than reuse the pre-removal snapshot.
+  const initialTreeCleanup=treeCleanup;
+  if(!treeCleanup.processTreeExited)treeCleanup=await terminateChromeTree(chrome,profileDir);
+  const chromeExited=treeCleanup.rootExited;
   const cleanup={cdpClosed,chromeExited,processTreeExited:treeCleanup.processTreeExited,
     remainingPids:treeCleanup.remainingPids,processTreeError:treeCleanup.error,
-    profileRemoved:profileCleanup.removed,profileError:profileCleanup.error};
+    profileRemoved:profileCleanup.removed,profileError:profileCleanup.error,
+    initialTreeCleanup};
   try {
     const finalIdentity=await fileIdentity(artifact);
     artifactIdentity={...artifactIdentity,finalBytes:finalIdentity.bytes,finalSha256:finalIdentity.sha256,unchanged:artifactIdentity?.bytes===finalIdentity.bytes&&artifactIdentity?.sha256===finalIdentity.sha256};
   } catch(error) {
     artifactIdentity={...artifactIdentity,unchanged:false,finalIdentityError:String(error?.stack||error)};
   }
-  report=report||{schemaVersion:2,profile:profileId,artifact,targetUrl,mode,completed:false,success:false,error:"acceptance did not produce a report",gates:{baseReady:false,singleRuntimeReady:false},capturedAt:new Date().toISOString()};
+  report=report||{schemaVersion:2,profile:profileId,artifact,targetUrl,mode,requestedRuntime,worldSeed,completed:false,success:false,error:"acceptance did not produce a report",gates:{baseReady:false,singleRuntimeReady:false},capturedAt:new Date().toISOString()};
+  report.glFrames=glFrames;
+  if(report.completed){
+    report.glSyncFailures=glSyncFailures;
+    report.gates={...(report.gates||{}),glSyncReady};
+    if(!glSyncReady)report.gates.baseReady=false;
+  }
   report.artifactIdentity=artifactIdentity;
   report.artifactDiagnostic=artifactDiagnostic;
   report.cleanup=cleanup;
@@ -1122,6 +1220,6 @@ try {
   report.finishedAt=new Date().toISOString();
   await mkdir(dirname(output),{recursive:true});
   await writeFile(output,JSON.stringify(report,null,2)+"\n");
-  console.log(JSON.stringify({output,profile:profileId,mode,success:report.success,screen:report.runtime?.screen||null,level:report.singleRuntime?.level||false,storage:report.singleRuntime?.storage||null,idb:report.singleRuntime?.idb||null,wasm:report.singleRuntime?.wasm||null,terrain:report.singleRuntime?.terrain?{ready:report.singleRuntime.terrain.ready,loadedChunkCount:report.singleRuntime.terrain.loadedChunkCount,chunkEventCount:report.singleRuntime.terrain.chunkEventCount,screenshotPath:report.singleRuntime.terrain.screenshotPath}:null,cleanup,artifactUnchanged:artifactIdentity?.unchanged===true,exceptions:exceptions.length,failedResources:failedResources.length},null,2));
+  console.log(JSON.stringify({output,profile:profileId,mode,runtime:report.runtimeTelemetry?.runtime||null,requestedRuntime,worldSeed,success:report.success,screen:report.runtime?.screen||null,level:report.singleRuntime?.level||false,storage:report.singleRuntime?.storage||null,idb:report.singleRuntime?.idb||null,wasm:report.singleRuntime?.wasm||null,terrain:report.singleRuntime?.terrain?{ready:report.singleRuntime.terrain.ready,loadedChunkCount:report.singleRuntime.terrain.loadedChunkCount,chunkEventCount:report.singleRuntime.terrain.chunkEventCount,screenshotPath:report.singleRuntime.terrain.screenshotPath}:null,cleanup,artifactUnchanged:artifactIdentity?.unchanged===true,exceptions:exceptions.length,failedResources:failedResources.length},null,2));
   if(!report.success)process.exitCode=1;
 }

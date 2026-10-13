@@ -26,6 +26,12 @@ public final class AbstractSpliteratorBrowserPatcher {
     public static void main(String[] args) throws IOException {
         Path jarPath = Path.of(args[0]);
         Path outputRoot = Path.of(args[1]);
+        PatchRegistry.configureOutput(outputRoot);
+        PatchRegistry.runPart("AbstractSpliteratorBrowserPatcher.classOverrides", "REQUIRED OVERRIDE js wasmgc",
+                () -> patchJar(jarPath, outputRoot));
+    }
+
+    private static void patchJar(Path jarPath, Path outputRoot) throws IOException {
         try (ZipFile jar = new ZipFile(jarPath.toFile())) {
             var entries = jar.entries();
             while (entries.hasMoreElements()) {

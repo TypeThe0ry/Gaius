@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {patcherSource} from "./patcher-sources.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const networkPath = path.join(
@@ -17,20 +18,9 @@ const networkPath = path.join(
   "browser",
   "BrowserClientNetwork.java",
 );
-const patcherPath = path.join(
-  repository,
-  "port",
-  "tools",
-  "src",
-  "main",
-  "java",
-  "dev",
-  "gaius",
-  "tools",
-  "MinecraftClientPatcher.java",
-);
 const network = fs.readFileSync(networkPath, "utf8");
-const patcher = fs.readFileSync(patcherPath, "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = patcherSource("MinecraftClientPatcher");
 
 const installMethodStart = network.indexOf("public static void install() {");
 const installMethodEnd = network.indexOf("    /**", installMethodStart + 1);

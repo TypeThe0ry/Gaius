@@ -3,7 +3,7 @@
 use gaius_kernel_abi::{
     release_descriptor, run_kernel, JobHeader, ResultHeader, RunDescriptor, Status, RESULT_HEADER_LEN,
 };
-use gaius_noise::Profile;
+use gaius_noise::Semantics;
 use gaius_worldgen::beard::Beard;
 use gaius_worldgen::ir::example::overworld;
 use gaius_worldgen::Generator;
@@ -39,10 +39,83 @@ fn i32_at(b: &[u8], at: usize) -> i32 {
 }
 
 #[test]
-fn jobs_round_trip_through_the_framing() {
-    for (key, profile) in [(1u32, Profile::V26_2), (2, Profile::V26_3)] {
+fn history_independent_biome_sources_remain_available() {
+    for &semantics in Semantics::all() {
+        for source in [
+            gaius_worldgen::ir::BiomeSource::Fixed(0),
+            gaius_worldgen::ir::BiomeSource::TheEnd {
+                end: 0,
+                highlands: 0,
+                midlands: 0,
+                islands: 0,
+                barrens: 0,
+            },
+        ] {
+            job::clear_cache();
+            let mut ir = overworld(semantics, 555);
+            ir.biomes.source = source;
+            let bytes = ir.encode();
+            let mut generator = Generator::load(&bytes).unwrap();
+            assert!(!generator.biome_context_requires_vanilla());
+            let expected = generator.run_biomes(3, -10);
+            let mut payload = Vec::new();
+            write_ref(&mut payload, 71, &bytes, true);
+            payload.extend_from_slice(&3i32.to_le_bytes());
+            payload.extend_from_slice(&(-10i32).to_le_bytes());
+            let (status, data) = run(job::KIND_BIOMES, &payload, job::biomes);
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+            let result = payload_of(&data);
+            assert_eq!(result.len(), 8 + expected.len() * 4);
+            for (index, biome) in expected.iter().enumerate() {
+                assert_eq!(i32_at(result, 8 + index * 4) as u32, *biome);
+            }
+        }
+    }
+}
+
+#[test]
+fn climate_tie_declines_only_the_job_without_stored_biomes() {
+    for (key, &semantics) in (101u32..).zip(Semantics::all()) {
         job::clear_cache();
-        let ir = overworld(profile, 555).encode();
+        let mut ir = overworld(semantics, 12345);
+        let gaius_worldgen::ir::BiomeSource::MultiNoise { entries, .. } = &mut ir.biomes.source else {
+            panic!("multi-noise fixture");
+        };
+        entries.truncate(2);
+        for entry in entries {
+            entry.params = [[-1_000_000, 1_000_000]; 7];
+        }
+        let bytes = ir.encode();
+        let generator = Generator::load(&bytes).unwrap();
+        let mut payload = Vec::new();
+        write_ref(&mut payload, key, &bytes, true);
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let (status, data) = run(job::KIND_BIOMES, &payload, job::biomes);
+        assert_eq!(status, Status::BadPayload as u32);
+        assert!(String::from_utf8_lossy(&data).starts_with(job::FALLBACK_PREFIX));
+        let stored = vec![ir.biomes.biomes[0].global_id; generator.stored_biomes_len()];
+        let mut terrain = encode_terrain(
+            key,
+            &bytes,
+            false,
+            0,
+            0,
+            job::FLAG_SURFACE | job::FLAG_RING_BIOMES,
+            &Beard::default(),
+        );
+        write_ring(&mut terrain, &stored);
+        let (status, data) = run(job::KIND_TERRAIN, &terrain, job::terrain);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        assert!(ResultHeader::parse(&data).is_some());
+    }
+}
+
+#[test]
+fn jobs_round_trip_through_the_framing() {
+    for (key, &semantics) in (1u32..).zip(Semantics::all()) {
+        job::clear_cache();
+        let ir = overworld(semantics, 555).encode();
 
         // A job without the IR fails until the generator is loaded.
         let lazy = encode_terrain(key, &ir, false, 0, 0, job::FLAG_SURFACE, &Beard::default());
@@ -76,7 +149,7 @@ fn jobs_round_trip_through_the_framing() {
         assert_eq!(
             &surfaced[24..],
             &chunk[24..],
-            "{profile:?}: surface job matches the inline surface"
+            "{semantics:?}: surface job matches the inline surface"
         );
 
         let mut biomes = Vec::new();
@@ -84,9 +157,8 @@ fn jobs_round_trip_through_the_framing() {
         biomes.extend_from_slice(&0i32.to_le_bytes());
         biomes.extend_from_slice(&0i32.to_le_bytes());
         let (status, data) = run(job::KIND_BIOMES, &biomes, job::biomes);
-        assert_eq!(status, 0);
-        let b = payload_of(&data);
-        assert_eq!(b.len(), 8 + 24 * 64 * 4);
+        assert_eq!(status, Status::BadPayload as u32);
+        assert!(String::from_utf8_lossy(&data).starts_with(job::FALLBACK_PREFIX));
     }
 }
 
@@ -116,9 +188,9 @@ fn computed_ring(generator: &mut Generator, cx: i32, cz: i32) -> Vec<u32> {
 
 #[test]
 fn ring_biomes_reach_terrain_and_surface_jobs() {
-    for (key, profile) in [(11u32, Profile::V26_2), (12, Profile::V26_3)] {
+    for (key, &semantics) in (11u32..).zip(Semantics::all()) {
         job::clear_cache();
-        let ir = overworld(profile, 777).encode();
+        let ir = overworld(semantics, 777).encode();
         let mut generator = Generator::load(&ir).expect("loads");
         let (cx, cz) = (-2, 3);
         let ring = computed_ring(&mut generator, cx, cz);
@@ -142,7 +214,11 @@ fn ring_biomes_reach_terrain_and_surface_jobs() {
         write_ring(&mut seeded, &ring);
         let (status, data) = run(job::KIND_TERRAIN, &seeded, job::terrain);
         assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
-        assert_eq!(payload_of(&data), &expected[..], "{profile:?}: ring of computed biomes");
+        assert_eq!(
+            payload_of(&data),
+            &expected[..],
+            "{semantics:?}: ring of computed biomes"
+        );
 
         let fill = encode_terrain(key, &ir, false, cx, cz, 0, &Beard::default());
         let (status, data) = run(job::KIND_TERRAIN, &fill, job::terrain);
@@ -154,14 +230,14 @@ fn ring_biomes_reach_terrain_and_surface_jobs() {
         assert_eq!(
             &payload_of(&data)[24..],
             &expected[24..],
-            "{profile:?}: surface job with a ring"
+            "{semantics:?}: surface job with a ring"
         );
 
         // The surface rules read the ring: neighbours that all store the example's badlands
         // (global id 42, clay bands) change the border columns.
         assert!(
             ring.iter().any(|&id| id != 42),
-            "{profile:?}: pick a chunk outside the badlands"
+            "{semantics:?}: pick a chunk outside the badlands"
         );
         let badlands = vec![42u32; ring.len()];
         let surface = encode_surface_with(key, &ir, false, (cx, cz), &Beard::default(), Some(&badlands), &filled);
@@ -169,8 +245,33 @@ fn ring_biomes_reach_terrain_and_surface_jobs() {
         assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
         assert!(
             payload_of(&data)[24..] != expected[24..],
-            "{profile:?}: the surface rules ignored the ring"
+            "{semantics:?}: the surface rules ignored the ring"
         );
+
+        let stored = vec![42u32; generator.stored_biomes_len()];
+        let mut combined = encode_terrain(
+            key,
+            &ir,
+            false,
+            cx,
+            cz,
+            job::FLAG_SURFACE | job::FLAG_BIOMES | job::FLAG_RING_BIOMES,
+            &Beard::default(),
+        );
+        write_ring(&mut combined, &stored);
+        let (status, data) = run(job::KIND_TERRAIN, &combined, job::terrain);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        let returned = payload_of(&data);
+        let biome_start = returned.len() - generator.section_count() * 64 * 4;
+        assert!(returned[biome_start..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|bytes| i32_at(bytes, 0) == 42));
+        let surface = encode_surface_with(key, &ir, false, (cx, cz), &Beard::default(), Some(&stored), &filled);
+        let (status, data) = run(job::KIND_SURFACE, &surface, job::surface);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&data));
+        assert_eq!(&payload_of(&data)[24..], &returned[24..biome_start]);
 
         // A neighbour biome outside the generator's table only refuses this chunk.
         let mut foreign = ring.clone();

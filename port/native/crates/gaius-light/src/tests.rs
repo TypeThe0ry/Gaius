@@ -44,6 +44,7 @@ fn table() -> LightTable {
 struct Scene {
     sections: usize,
     neighbours: u8,
+    emit_outgoing: bool,
     /// Slot-major flat ids, (y << 8 | z << 4 | x) per section.
     states: Vec<Vec<Vec<u16>>>,
     flags: Vec<Vec<u8>>,
@@ -56,6 +57,7 @@ impl Scene {
         Scene {
             sections,
             neighbours,
+            emit_outgoing: true,
             states: vec![vec![vec![AIR; 4096]; sections]; 5],
             flags: vec![vec![flags::SKY_STORING | flags::BLOCK_STORING; light]; 5],
             ring_layers: vec![vec![(vec![0; 2048], vec![0; 2048]); light]; 5],
@@ -73,7 +75,7 @@ impl Scene {
             sky_bottom_section: -1,
             sky_light_on: true,
             block_light_on: true,
-            emit_outgoing: true,
+            emit_outgoing: self.emit_outgoing,
             neighbours: self.neighbours,
         }
     }
@@ -470,6 +472,170 @@ fn ring_slices_light_like_full_neighbour_sections() {
         assert!(
             snapshot(&full, scene.sections) == snapshot(&ring, scene.sections),
             "seed {seed}: ring slices light differently from full neighbour sections"
+        );
+    }
+}
+
+impl Scene {
+    /// A `light_column` job with PULL_RING: INITIAL lights the column from
+    /// nothing, CHECKS starts from `previous` (the column's stored layers) and
+    /// runs `checkNode` at `checks`.
+    fn light_settled(
+        &self,
+        column: &mut LightColumn,
+        table: &LightTable,
+        previous: Option<&Layers>,
+        checks: &[(i32, i32, i32)],
+    ) {
+        self.load(column, table);
+        if let Some(previous) = previous {
+            for light_section in 0..self.sections + 2 {
+                column
+                    .load_layer(0, light_section, Layer::Sky, &previous.0[light_section])
+                    .unwrap();
+                column
+                    .load_layer(0, light_section, Layer::Block, &previous.1[light_section])
+                    .unwrap();
+            }
+        } else {
+            column.enqueue_block_sources();
+        }
+        for &(x, y, z) in checks {
+            column.check_block(x, y, z);
+        }
+        column.enqueue_ring_light(Layer::Block);
+        column.propagate(Layer::Block, table);
+        if previous.is_none() {
+            column.enqueue_sky_sources();
+        }
+        for &(x, y, z) in checks {
+            column.check_sky(x, y, z);
+        }
+        column.enqueue_ring_light(Layer::Sky);
+        column.propagate(Layer::Sky, table);
+    }
+}
+
+/// The column's stored layers per light section, sky then block.
+type Layers = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+fn layers(column: &LightColumn, sections: usize) -> Layers {
+    let mut out: Layers = (Vec::new(), Vec::new());
+    for light_section in 0..sections + 2 {
+        for (layer, list) in [(Layer::Sky, &mut out.0), (Layer::Block, &mut out.1)] {
+            let mut nibbles = vec![0u8; 2048];
+            column.write_layer(light_section, layer, &mut nibbles);
+            list.push(nibbles);
+        }
+    }
+    out
+}
+
+fn set_nibble(data: &mut [u8], index: usize, level: u8) {
+    let shift = (index & 1) << 2;
+    data[index >> 1] = (data[index >> 1] & !(15 << shift)) | (level << shift);
+}
+
+/// Regression for the 1.21.11 emitter-remove goldens: a neighbour emitter that
+/// touched the column is gone and the settled neighbour relit that ring cell
+/// to a lower level. A settled ring is a boundary condition: checking the
+/// changed border cell without EMIT_OUTGOING ends exactly where a fresh light
+/// with the same ring does. With EMIT_OUTGOING the ring is live storage: the
+/// decrease zeroes the kernel's copy of the ring cell and reports it, and the
+/// column only gets the light back when the Java side replays that record.
+#[test]
+fn settled_ring_checks_end_where_a_fresh_light_does() {
+    let table = table();
+    let face = facing_index(SIDE_WEST, 8, 8);
+    let mut before = Scene::new(1, 1 << SIDE_WEST);
+    before.states[1 + SIDE_WEST][0][face] = GLOWSTONE;
+    set_nibble(&mut before.ring_layers[1 + SIDE_WEST][1].1, face, 15);
+    let mut column = LightColumn::new();
+    before.light_settled(&mut column, &table, None, &[]);
+    assert_eq!(column.level(Layer::Block, 0, 8, 8), 14);
+    let previous = layers(&column, 1);
+
+    for emit_outgoing in [false, true] {
+        let mut after = Scene::new(1, 1 << SIDE_WEST);
+        after.emit_outgoing = emit_outgoing;
+        set_nibble(&mut after.ring_layers[1 + SIDE_WEST][1].1, face, 10);
+        let mut fresh = LightColumn::new();
+        after.light_settled(&mut fresh, &table, None, &[]);
+        assert_eq!(fresh.level(Layer::Block, 0, 8, 8), 9);
+        let mut checked = LightColumn::new();
+        after.light_settled(&mut checked, &table, Some(&previous), &[(0, 8, 8)]);
+        if !emit_outgoing {
+            assert!(
+                layers(&checked, 1) == layers(&fresh, 1),
+                "settled checks differ from a fresh light"
+            );
+            continue;
+        }
+        assert_eq!(checked.level(Layer::Block, 0, 8, 8), 0);
+        assert!(checked
+            .outgoing()
+            .iter()
+            .any(|r| r.kind == crate::outgoing::BLOCK_DECREASE
+                && r.side == SIDE_WEST as u8
+                && r.along == 8
+                && r.y == 8
+                && r.level == 14));
+    }
+}
+
+/// Incremental jobs against a settled ring (block changes in the column and in
+/// the ring, changed ring levels, checks at the changed cells and at the border
+/// cells facing changed ring cells) end exactly where a fresh light ends.
+#[test]
+fn settled_ring_checks_match_a_fresh_light_on_random_columns() {
+    let table = table();
+    let ids = [AIR, STONE, TORCH, GLOWSTONE, BOTTOM_SLAB, TOP_SLAB, GLASS, LEAVES];
+    for seed in 1..41u64 {
+        let mut scene = random_scene(seed.wrapping_mul(0x6c8e_9cf5_7093_2bd5));
+        scene.emit_outgoing = false;
+        let mut column = LightColumn::new();
+        scene.light_settled(&mut column, &table, None, &[]);
+        let previous = layers(&column, scene.sections);
+
+        let mut rng = Rng(seed ^ 0x5851_f42d_4c95_7f2d);
+        let mut checks = Vec::new();
+        for _ in 0..16 {
+            let (x, y, z) = (rng.below(16) as usize, rng.below(48) as usize, rng.below(16) as usize);
+            scene.set(x, y, z, ids[rng.below(ids.len() as u64) as usize]);
+            checks.push((x as i32, y as i32, z as i32));
+        }
+        for _ in 0..24 {
+            let side = rng.below(4) as usize;
+            let (y, along) = (rng.below(48) as usize, rng.below(16) as usize);
+            let index = facing_index(side, y & 15, along);
+            if rng.below(2) == 0 {
+                scene.states[1 + side][y >> 4][index] = ids[rng.below(ids.len() as u64) as usize];
+            }
+            let (sky, block) = &mut scene.ring_layers[1 + side][(y >> 4) + 1];
+            for data in [sky, block] {
+                if rng.below(2) == 0 {
+                    set_nibble(data, index, rng.below(16) as u8);
+                }
+            }
+            let (x, z) = match side {
+                SIDE_NORTH => (along as i32, 0),
+                SIDE_SOUTH => (along as i32, 15),
+                SIDE_WEST => (0, along as i32),
+                _ => (15, along as i32),
+            };
+            checks.push((x, y as i32, z));
+        }
+
+        let mut fresh = LightColumn::new();
+        scene.light_settled(&mut fresh, &table, None, &[]);
+        let mut checked = LightColumn::new();
+        scene.light_settled(&mut checked, &table, Some(&previous), &checks);
+        let (a, b) = (layers(&checked, scene.sections), layers(&fresh, scene.sections));
+        let sky = a.0.iter().zip(&b.0).filter(|(x, y)| x != y).count();
+        let block = a.1.iter().zip(&b.1).filter(|(x, y)| x != y).count();
+        assert!(
+            a == b,
+            "seed {seed}: settled checks differ from a fresh light (sky sections {sky}, block sections {block})"
         );
     }
 }

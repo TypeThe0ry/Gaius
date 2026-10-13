@@ -16,6 +16,7 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
+import {patcherSource as stepSource} from "../../port/scripts/patcher-sources.mjs";
 
 const repository = fileURLToPath(new URL("../..", import.meta.url));
 const read = (relative) => readFile(`${repository}/${relative}`, "utf8");
@@ -27,7 +28,8 @@ const [schedulerSource, clientNetworkSource, channelSource, patcherSource,
         read("port/src/main/java/dev/gaius/browser/BrowserClientNetwork.java"),
         read("port/overrides/libraries/netty-transport/src/main/java/" +
             "io/netty/channel/browser/BrowserWebSocketChannel.java"),
-        read("port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
+        // MinecraftClientPatcher with its domain classes (port/tools/patchkit/README.md, "Domains").
+        stepSource("MinecraftClientPatcher"),
         read("apps/bridge/dist/main.js"),
         read("apps/bridge/browser-full-path-smoke.mjs"),
         read("port/scripts/packet-processor-accounting-smoke.mjs"),

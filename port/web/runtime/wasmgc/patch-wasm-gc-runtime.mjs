@@ -17,6 +17,14 @@
 // 3. Bytes-capable loading.  options.emscriptenModules entries may be
 //    {wasmModule | wasmBytes, jsLoader} instead of {pathToJs, pathToWasm}, for file:// pages
 //    that carry the module bytes inline.
+// 4. Streamed sources.  load(src) also accepts a Response, compiled with compileStreaming as it
+//    arrives: the dist opened from disk pipes its gzip+base64 payload through
+//    DecompressionStream and a site page starts the module download before the loader script
+//    runs.  No fetch is involved in the first (design D13); the portable page passes the
+//    inflated bytes (load(bytes)).
+// 5. Precompiled modules.  load(src) also accepts a WebAssembly.Module (compiled with the same
+//    js-string builtins option): the singleplayer Worker compiles singleplayer-server.wasm
+//    while its storage opens and instantiates it afterwards (gaius-wasm-worker.js).
 //
 // Every patch locates its anchor exactly and fails when the TeaVM text differs.
 //
@@ -161,6 +169,22 @@ replaceOnce(`    return Promise.all(keysValues.map(async ([key, { pathToJs, path
       }
       const { pathToJs, pathToWasm } = spec;
       const [response, close] = await openPath(pathToWasm, isNodeJs);`, "loadEmscriptenModules");
+
+replaceOnce(`  async function compileModule(src, isNodeJs) {
+    if (typeof src !== "string") {
+      return await WebAssembly.compile(src, { builtins: ["js-string"] });
+    }`, `  async function compileModule(src, isNodeJs) {
+    if (src instanceof WebAssembly.Module) {
+      // Gaius: a precompiled module (see the patch header).
+      return src;
+    }
+    if (typeof Response !== "undefined" && src instanceof Response) {
+      // Gaius: a streamed source (see the patch header).
+      return await WebAssembly.compileStreaming(src, { builtins: ["js-string"] });
+    }
+    if (typeof src !== "string") {
+      return await WebAssembly.compile(src, { builtins: ["js-string"] });
+    }`, "compileModule");
 
 replaceOnce(`      createWeakRef(value, ref, queue) {
         if (queue !== null) {

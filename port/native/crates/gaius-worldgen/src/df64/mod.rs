@@ -66,6 +66,10 @@ pub enum D {
     ShiftA(u32),
     ShiftB(u32),
     Shift(u32),
+    ScaledNoise {
+        noise: u32,
+        scale: Did,
+    },
     Blended(u32),
     EndIslands,
     YClamped {
@@ -450,6 +454,10 @@ impl Program64 {
             Op::BlendAlpha => D::Const(1.0),
             Op::BlendOffset => D::Const(0.0),
             Op::Beardifier => D::Beardifier,
+            Op::ScaledNoise { noise, scale } => D::ScaledNoise {
+                noise: *noise,
+                scale: self.compile(c, *scale)?,
+            },
             Op::BlendDensity(input) => return self.compile(c, *input),
             Op::Unary(t, input) => {
                 let i = self.compile(c, *input)?;
@@ -584,6 +592,13 @@ impl Program64 {
             D::ShiftA(n) => self.noises[*n as usize].get64(x as f64 * 0.25, 0.0, z as f64 * 0.25) * 4.0,
             D::ShiftB(n) => self.noises[*n as usize].get64(z as f64 * 0.25, x as f64 * 0.25, 0.0) * 4.0,
             D::Shift(n) => self.noises[*n as usize].get64(x as f64 * 0.25, y as f64 * 0.25, z as f64 * 0.25) * 4.0,
+            D::ScaledNoise { noise, scale } => {
+                let scale = self.compute(ctx, *scale, x, y, z, kind);
+                scale
+                    * self.noises[*noise as usize]
+                        .get64(x as f64 / scale, y as f64 / scale, z as f64 / scale)
+                        .abs()
+            }
             D::Blended(b) => self.blended[*b as usize].compute(x, y, z),
             D::EndIslands => {
                 let n = self.end_islands.as_ref().expect("end islands noise");

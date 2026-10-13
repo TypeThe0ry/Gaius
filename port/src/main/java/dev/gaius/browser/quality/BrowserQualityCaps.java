@@ -6,7 +6,7 @@ import org.teavm.jso.JSBody;
  * Capability gates of the graphics quality tiers, answered by the page's quality runtime
  * ({@code port/web/runtime/quality}).
  *
- * <p>{@code QualityPatches263.patchImprovedTransparencyByTier} wraps 26.3's
+ * <p>{@code QualityTierPatches.patchImprovedTransparencyByTier} wraps 26.3's
  * {@code GameRenderer.useImprovedTransparency()} in {@link #filterImprovedTransparency}: the
  * player's option still decides, but order-independent transparency only runs when the context
  * renders and blends float colour targets ({@code EXT_color_buffer_float},
@@ -41,11 +41,21 @@ public final class BrowserQualityCaps {
         return improvedTransparency > 0;
     }
 
+    /**
+     * -1 while there is no context to ask about yet. Gate by backend (PLAN-DELTA 3.10): under
+     * WebGPU ({@code GaiusWebGpu.active}) the core's {@code contextAvailable()} replaces the WebGL
+     * 2 check and the runtime answers from the WebGPU device's caps.
+     */
     @JSBody(script = """
             try {
               var quality = globalThis.GaiusQuality;
               if (!quality || !quality.runtime || !quality.profile) return -1;
-              if (!globalThis.__gaiusWebGL) return -1;
+              var gpu = globalThis.GaiusWebGpu;
+              if (gpu && gpu.active === true && typeof gpu.contextAvailable === 'function') {
+                if (gpu.contextAvailable() !== true) return -1;
+              } else if (!globalThis.__gaiusWebGL) {
+                return -1;
+              }
               return quality.runtime.oitAllowed() ? 1 : 0;
             } catch (e) {
               return 0;

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE, profileIdPattern} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 import {execFileSync} from "node:child_process";
 import {access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile} from "node:fs/promises";
 import {existsSync} from "node:fs";
@@ -19,17 +21,17 @@ const profileIdFromPath = (value) => basename(nativePath(value).replaceAll("\\",
   .replace(/\.json$/, "");
 const requestedProfile = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
-    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH) : "26.2");
-if (requestedProfile !== "26.2") {
-  throw new Error(`Minecraft 26.2 P1 patcher smoke is 26.2-only; got ${requestedProfile}`);
+    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH) : CANONICAL_PROFILE.id);
+if (requestedProfile !== CANONICAL_PROFILE.id) {
+  throw new Error(`Minecraft ${CANONICAL_PROFILE.id} P1 patcher smoke is ${CANONICAL_PROFILE.id}-only; got ${requestedProfile}`);
 }
 execFileSync(process.execPath, [join(repositoryRoot,
   "port/scripts/teavm-platform-start-thread-smoke.mjs")], {
   encoding: "utf8",
   stdio: "inherit",
 });
-const rawClientJar = join(repositoryRoot, "port/work/26.2/client-named.jar");
-const raw121ClientJar = join(repositoryRoot, "port/work/1.21.11/client-named.jar");
+const rawClientJar = join(repositoryRoot, "port/work/" + CANONICAL_PROFILE.id + "/client-named.jar");
+const raw121ClientJar = join(repositoryRoot, "port/work/" + LEGACY_PROFILE.id + "/client-named.jar");
 const toolsSource = join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools");
 const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
 const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
@@ -418,6 +420,86 @@ function assertPacketProcessorLifecycleContract(packetProcessorBytecode, profile
 // ServerboundFinishConfiguration handler.  On the browser Worker server,
 // Preparing must stay in place until the spawn chunk's entities are loaded so
 // that wait never enters managedBlock.  Any other server keeps that wait.
+// ServerChunkCache.getChunk called off the server thread hands the lookup to the server thread
+// and joins it (CompletableFuture.supplyAsync(..., mainThreadProcessor).join()); the browser
+// CompletableFuture cannot block, so the join is BrowserFuturePump.joinFromWorker, which yields
+// the calling generation thread until the server thread has run the lookup
+// (server-offthread-wait-teavm-smoke.mjs runs it). The server thread's own join stays.
+function assertOffThreadGetChunkWaitContract(bytecode, profileId) {
+  const getChunkClass = method(bytecode,
+    "public net.minecraft.world.level.chunk.ChunkAccess getChunk(int, int, "
+      + "net.minecraft.world.level.chunk.status.ChunkStatus, boolean);");
+  // javap separates methods with a blank line.
+  const getChunkEnd = getChunkClass.search(/\r?\n\r?\n/);
+  const getChunk = getChunkEnd < 0 ? getChunkClass : getChunkClass.slice(0, getChunkEnd);
+  const instructions = bytecodeInstructions(getChunk);
+  const supply = instructions.findIndex(({instruction}) =>
+    instruction.includes("Method java/util/concurrent/CompletableFuture.supplyAsync:"
+      + "(Ljava/util/function/Supplier;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;"));
+  assert.ok(supply > 0
+      && instructions[supply - 1].instruction.includes("Field mainThreadProcessor:")
+      && instructions[supply + 1]?.instruction.includes(
+        "Method dev/gaius/browser/BrowserFuturePump.joinFromWorker:"
+          + "(Ljava/util/concurrent/CompletableFuture;)Ljava/lang/Object;"),
+  `${profileId} ServerChunkCache.getChunk off the server thread must wait through BrowserFuturePump.joinFromWorker`);
+  assert.equal(occurrences(getChunk, "BrowserFuturePump.joinFromWorker"), 1,
+    `${profileId} ServerChunkCache.getChunk must wait cooperatively exactly once`);
+  assert.equal(occurrences(getChunk, "CompletableFuture.join:()Ljava/lang/Object;"), 1,
+    `${profileId} ServerChunkCache.getChunk must keep the server thread's own join`);
+}
+
+// PlayerSpawnFinder.gaius$fixupLoadedSpawn stands in for the spawn search taken out of
+// PlayerSpawnFinder.findSpawn, so only a player without a saved position goes through it:
+// PrepareSpawnTask.start sets Preparing.gaius$spawnSearched from SavedPosition.position() right
+// after it enters Preparing, and Preparing.tick skips the fixup when it is false, so a returning
+// player spawns at the stored position as in vanilla.
+function assertSavedSpawnPositionContract(taskBytecode, preparingBytecode, profileId) {
+  const start = method(taskBytecode,
+    "public void start(java.util.function.Consumer<net.minecraft.network.protocol.Packet<?>>);",
+    "public boolean tick();");
+  const startInstructions = bytecodeInstructions(start);
+  const enter = startInstructions.findIndex(({instruction}) =>
+    /^putfield\s.*Field state:Lnet\/minecraft\/server\/network\/config\/PrepareSpawnTask\$State;$/.test(instruction));
+  const mark = startInstructions.slice(enter + 1, enter + 10).map(({instruction}) => instruction);
+  assert.ok(enter > 0
+      && startInstructions[enter - 1].instruction.includes("PrepareSpawnTask$Preparing.\"<init>\"")
+      && mark[0] === "aload_0"
+      && mark[1]?.includes("Field state:")
+      && mark[2]?.includes("class net/minecraft/server/network/config/PrepareSpawnTask$Preparing")
+      && /^aload(_\d|\s+\d+)$/.test(mark[3] ?? "")
+      && mark[4]?.includes("Method net/minecraft/server/level/ServerPlayer$SavedPosition.position:()Ljava/util/Optional;")
+      && mark[5]?.includes("Method java/util/Optional.isPresent:()Z")
+      && mark[6] === "iconst_1"
+      && mark[7] === "ixor"
+      && mark[8]?.includes("PrepareSpawnTask$Preparing.gaius$spawnSearched:Z"),
+  `${profileId} PrepareSpawnTask.start must mark a spawn without a saved position as searched`);
+  assert.equal(occurrences(start, "gaius$spawnSearched"), 1,
+    `${profileId} PrepareSpawnTask.start must mark the spawn exactly once`);
+
+  const tick = method(preparingBytecode,
+    "public net.minecraft.server.network.config.PrepareSpawnTask$Ready tick();",
+    "private void lambda$tick$0(");
+  const tickInstructions = bytecodeInstructions(tick);
+  const fixup = tickInstructions.findIndex(({instruction}) =>
+    instruction.includes("Method net/minecraft/server/level/PlayerSpawnFinder.gaius$fixupLoadedSpawn:"));
+  const ready = tickInstructions.findIndex(({instruction}) =>
+    instruction.includes("class net/minecraft/server/network/config/PrepareSpawnTask$Ready"));
+  const guard = tickInstructions.slice(fixup - 6, fixup + 2).map(({instruction}) => instruction);
+  assert.ok(fixup > 5
+      && guard[0] === "aload_0"
+      && guard[1]?.includes("Field gaius$spawnSearched:Z")
+      && /^ifeq\s+\d+$/.test(guard[2] ?? "")
+      && Number(guard[2].match(/\d+$/)[0]) === tickInstructions[ready]?.offset
+      && guard[3] === "aload_0"
+      && guard[4]?.includes("Field spawnLevel:")
+      && guard[5] === "aload_1"
+      && guard[7] === "astore_1"
+      && fixup + 2 === ready,
+  `${profileId} Preparing.tick must skip the spawn fixup for a saved position`);
+  assert.equal(occurrences(tick, "gaius$fixupLoadedSpawn"), 1,
+    `${profileId} Preparing.tick must call the spawn fixup exactly once`);
+}
+
 function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode,
   serverLevelBytecode, profileId, chunkKeyCall) {
   const tick = method(preparingBytecode,
@@ -902,10 +984,8 @@ for (const clientJar of [rawClientJar, raw121ClientJar]) {
     "--raw-jar", clientJar,
   ], {encoding: "utf8", stdio: "inherit", timeout: 300_000});
 }
-const browserPatcherSource = await readFile(
-  join(toolsSource, "Minecraft262BrowserPatcher.java"),
-  "utf8",
-);
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const browserPatcherSource = stepSource("Minecraft262BrowserPatcher");
 assert.match(browserPatcherSource, /BROWSER_HOLDERS_PER_TURN = 16/,
   "26.2 holder batching must retain the reviewed 16-holder upper bound");
 assert.match(browserPatcherSource,
@@ -927,12 +1007,9 @@ for (const required of [
   "writeChunkGenerationYieldHelper",
 ]) {
   assert.equal(browserPatcherSource.includes(required), true,
-    `26.2 patcher must return a pending batch continuation: ${required}`);
+    `${CANONICAL_PROFILE.id} patcher must return a pending batch continuation: ${required}`);
 }
-const clientPatcherSource = await readFile(
-  join(toolsSource, "MinecraftClientPatcher.java"),
-  "utf8",
-);
+const clientPatcherSource = stepSource("MinecraftClientPatcher");
 const schedulerSource = await readFile(
   join(repositoryRoot, "port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java"),
   "utf8",
@@ -982,7 +1059,7 @@ for (const contract of [
   '"endTaskWork",\n                "(I)V"',
 ]) {
   assert.ok(browserPatcherSource.includes(contract),
-    `missing 26.2 task-scope token contract: ${contract}`);
+    `missing ${CANONICAL_PROFILE.id} task-scope token contract: ${contract}`);
 }
 assert.ok(browserPatcherSource.includes(
   'writeComputeFrames(node, root.resolve(owner + ".class"))',
@@ -1020,7 +1097,7 @@ try {
     join(toolsSource, "Minecraft262BrowserPatcher.java"),
   ], {encoding: "utf8", timeout: 30_000});
   execFileSync(java, ["-classpath", [classes, classpath].join(delimiter),
-    "dev.gaius.tools.MinecraftClientPatcher", clientJar, clientPatches, "26.2"], {
+    "dev.gaius.tools.MinecraftClientPatcher", clientJar, clientPatches, CANONICAL_PROFILE.id], {
     encoding: "utf8", timeout: 30_000,
   });
   execFileSync(jar, ["--update", "--file", clientJar, "-C", clientPatches, "."], {
@@ -1101,7 +1178,7 @@ try {
     ["aconst_null", "areturn"],
     "26.2 F3 client-chunk lookup must remain available to vanilla debug entries");
 
-  // The 26.2 deep-worldgen path uses the adapter only at the synchronous
+  // The canonical deep-worldgen path uses the adapter only at the synchronous
   // loops that can outrun holder-boundary pulses.  Assert the actual patched
   // bytecode so a source-only marker cannot mask a missing runtime callsite.
   const patchedChunkGenerator = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
@@ -1168,10 +1245,10 @@ try {
     "public net.minecraft.world.level.GameType gameMode();");
   assert.equal(occurrences(rawInit, "WorldData.setGameType"), 1,
     "26.2 raw initServer game type override shape changed");
-  assertDedicatedServerGameTypeContract(patchedDedicatedServer, "26.2",
+  assertDedicatedServerGameTypeContract(patchedDedicatedServer, CANONICAL_PROFILE.id,
     "protected boolean initServer() throws java.io.IOException;");
   execFileSync(java, ["-classpath", [classes, classpath].join(delimiter),
-    "dev.gaius.tools.Minecraft262BrowserPatcher", clientJar, browserPatches], {
+    "dev.gaius.tools.Minecraft262BrowserPatcher", clientJar, browserPatches, requestedProfile], {
     encoding: "utf8", timeout: 30_000,
   });
   execFileSync(jar, ["--update", "--file", clientJar, "-C", browserPatches, "."], {
@@ -1399,25 +1476,25 @@ try {
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [
     "--release", "21", "-proc:none", "-classpath", verifierClasspath,
-    "-d", classes, verifierSource,
+    "-sourcepath", join(repositoryRoot, "port/tools/src/main/java"), "-d", classes, verifierSource,
   ], {encoding: "utf8", timeout: 30_000});
   const verifierOutput = execFileSync(java, [
     "-classpath", [classes, verifierClasspath].join(delimiter),
-    "GaiusChunkLayerBytecodeVerifier", clientJar, "26.2",
+    "GaiusChunkLayerBytecodeVerifier", clientJar, CANONICAL_PROFILE.id,
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/,
     "ASM BasicVerifier did not validate ChunkGenerationTask");
   assert.match(verifierOutput, /PENDING_LAYER_YIELD_OK .*ChunkGenerationTask/,
     "ASM CFG verifier did not validate the pending batch continuation");
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/,
-    "26.2 continuation helper was not verified");
+    `${CANONICAL_PROFILE.id} continuation helper was not verified`);
   assert.match(verifierOutput, /PENDING_HELPER_JVM_OK normalCompletion=1 duplicateContinuation=0/,
-    "26.2 emitted continuation helper was not executed on the JVM");
+    `${CANONICAL_PROFILE.id} emitted continuation helper was not executed on the JVM`);
   assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
     "ASM CFG verifier did not validate the chunk layer barrier");
   assert.match(verifierOutput,
-    /PROFILE_CFG_OK 26\.2 net\/minecraft\/server\/level\/ChunkGenerationTask/,
-    "ASM profile verifier did not validate 26.2 holder pulse paths");
+    new RegExp(String.raw`PROFILE_CFG_OK ${profileIdPattern(CANONICAL_PROFILE)} net\/minecraft\/server\/level\/ChunkGenerationTask`),
+    `ASM profile verifier did not validate ${CANONICAL_PROFILE.id} holder pulse paths`);
   process.stdout.write(verifierOutput);
 
   const rawGraphics = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
@@ -1434,46 +1511,46 @@ try {
   // distances over the player's options, so FANCY and FABULOUS carry the 8/6 contract too.
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 8", "bipush 8"],
-    "26.2 FAST/FANCY/FABULOUS render distance is not the browser 8 contract");
+    "" + CANONICAL_PROFILE.id + " FAST/FANCY/FABULOUS render distance is not the browser 8 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
     ["bipush 6", "bipush 6", "bipush 6"],
-    "26.2 FAST/FANCY/FABULOUS simulation distance is not the browser 6 contract");
+    "" + CANONICAL_PROFILE.id + " FAST/FANCY/FABULOUS simulation distance is not the browser 6 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
-    "26.2 raw FAST/FANCY render distance shape changed");
+    "" + CANONICAL_PROFILE.id + " raw FAST/FANCY render distance shape changed");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
-    "26.2 raw FAST/FANCY simulation distance shape changed");
+    "" + CANONICAL_PROFILE.id + " raw FAST/FANCY simulation distance shape changed");
   const presetDistances = (applyBytecode, arm) => ["renderDistance", "simulationDistance"]
     .map(getter => graphicsPresetArmValue(applyBytecode, arm, getter).replace(/^bipush /, ""))
     .join("/");
   assert.equal(presetDistances(patchedGraphicsApply, "FAST"), "8/6",
-    "26.2 FAST graphics preset distances changed from vanilla 8/6");
+    "" + CANONICAL_PROFILE.id + " FAST graphics preset distances changed from vanilla 8/6");
   assert.equal(presetDistances(patchedGraphicsApply, "FANCY"), "8/6",
-    "26.2 FANCY graphics preset still overwrites the browser 8/6 distances");
+    "" + CANONICAL_PROFILE.id + " FANCY graphics preset still overwrites the browser 8/6 distances");
   assert.equal(presetDistances(rawGraphicsApply, "FANCY"), "16/12",
-    "26.2 raw FANCY graphics preset distance shape changed");
+    "" + CANONICAL_PROFILE.id + " raw FANCY graphics preset distance shape changed");
   assert.equal(presetDistances(patchedGraphicsApply, "FABULOUS"), "8/6",
-    "26.2 FABULOUS graphics preset still overwrites the browser 8/6 distances");
+    "" + CANONICAL_PROFILE.id + " FABULOUS graphics preset still overwrites the browser 8/6 distances");
   assert.equal(presetDistances(rawGraphicsApply, "FABULOUS"), "32/12",
-    "26.2 raw FABULOUS graphics preset distance shape changed");
+    "" + CANONICAL_PROFILE.id + " raw FABULOUS graphics preset distance shape changed");
   assert.equal(graphicsPresetArmValue(patchedGraphicsApply, "FANCY", "mipmapLevels"), "iconst_4",
-    "26.2 FANCY graphics preset lost vanilla mipmapLevels 4");
+    "" + CANONICAL_PROFILE.id + " FANCY graphics preset lost vanilla mipmapLevels 4");
   assert.deepEqual(graphicsPresetPatchedValues(rawGraphicsApply, patchedGraphicsApply), [
     "FANCY renderDistance bipush 16 -> bipush 8",
     "FANCY simulationDistance bipush 12 -> bipush 6",
     "FABULOUS renderDistance bipush 32 -> bipush 8",
     "FABULOUS simulationDistance bipush 12 -> bipush 6",
-  ], "26.2 graphics preset patch must change only the FANCY/FABULOUS render/simulation distances");
+  ], "" + CANONICAL_PROFILE.id + " graphics preset patch must change only the FANCY/FABULOUS render/simulation distances");
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
-    "26.2 CUSTOM graphics preset arm changed");
+    "" + CANONICAL_PROFILE.id + " CUSTOM graphics preset arm changed");
 
   // The generic 1.21.11 path never invokes Minecraft262BrowserPatcher.  Run it on
   // a disposable 1.21 jar and verify its FAST values remain vanilla 8/6.
   execFileSync(java, ["-classpath", [classes, classpath].join(delimiter),
     "dev.gaius.tools.MinecraftClientPatcher", generic121Jar, generic121Patches,
-    "1.21.11"], {encoding: "utf8", timeout: 60_000});
+    LEGACY_PROFILE.id], {encoding: "utf8", timeout: 60_000});
   execFileSync(jar, ["--update", "--file", generic121Jar, "-C", generic121Patches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
@@ -1485,8 +1562,8 @@ try {
     "net.minecraft.client.Options"], {
       encoding: "utf8", maxBuffer: 24 * 1024 * 1024, timeout: 30_000,
     });
-  assertDefaultSprintKeyMapping(rawOptions121, "1.21.11 raw", 341);
-  assertDefaultSprintKeyMapping(patchedOptions121, "1.21.11 patched", 82);
+  assertDefaultSprintKeyMapping(rawOptions121, "" + LEGACY_PROFILE.id + " raw", 341);
+  assertDefaultSprintKeyMapping(patchedOptions121, "" + LEGACY_PROFILE.id + " patched", 82);
   const patched121Screen = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.client.gui.screens.Screen"], {
       encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
@@ -1495,14 +1572,14 @@ try {
     "protected void renderPanorama(net.minecraft.client.gui.GuiGraphics, float);",
     "protected void renderMenuBackground(net.minecraft.client.gui.GuiGraphics);");
   assert.match(panorama121, /GameRenderer\.getPanorama/,
-    "1.21.11 menu panorama must keep the vanilla animated renderer");
+    "" + LEGACY_PROFILE.id + " menu panorama must keep the vanilla animated renderer");
   assert.match(panorama121, /PanoramaRenderer\.render/,
-    "1.21.11 menu panorama render call was removed");
+    "" + LEGACY_PROFILE.id + " menu panorama render call was removed");
   const menuBackground121 = method(patched121Screen,
     "protected void renderMenuBackground(net.minecraft.client.gui.GuiGraphics, int, int, int, int);",
     "public static void renderMenuBackgroundTexture");
   assert.match(menuBackground121, /renderMenuBackgroundTexture/,
-    "1.21.11 menu background must keep its texture draw path");
+    "" + LEGACY_PROFILE.id + " menu background must keep its texture draw path");
   const patched121NaturalSpawner = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.world.level.NaturalSpawner"], {
       encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
@@ -1511,17 +1588,17 @@ try {
     "public static void spawnMobsForChunkGeneration(net.minecraft.world.level.ServerLevelAccessor, net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>, net.minecraft.world.level.ChunkPos, net.minecraft.util.RandomSource);",
     "private static net.minecraft.core.BlockPos getTopNonCollidingPos");
   assert.ok(bytecodeInstructions(spawnGeneration121).length > 1,
-    "1.21.11 generation-time spawning must retain the vanilla implementation");
+    "" + LEGACY_PROFILE.id + " generation-time spawning must retain the vanilla implementation");
   for (const operation of ["getCreatureProbability", "finalizeSpawn", "addFreshEntityWithPassengers"]) {
     assert.ok(spawnGeneration121.includes(operation),
-      "1.21.11 generation-time spawning lost " + operation);
+      "" + LEGACY_PROFILE.id + " generation-time spawning lost " + operation);
   }
   for (const operation of ["BrowserGenerationSpawnTelemetry.begin",
     "BrowserGenerationSpawnTelemetry.entityAdded",
     "BrowserGenerationSpawnTelemetry.complete",
     "BrowserGenerationSpawnTelemetry.failed"]) {
     assert.ok(spawnGeneration121.includes(operation),
-      "1.21.11 generation-spawn telemetry lost " + operation);
+      "" + LEGACY_PROFILE.id + " generation-spawn telemetry lost " + operation);
   }
   const patched121ServerLevel = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.server.level.ServerLevel"], {
@@ -1530,9 +1607,9 @@ try {
   const spawningMonsters121 = method(patched121ServerLevel,
     "public boolean isSpawningMonsters();", "public void close() throws java.io.IOException;");
   assert.match(spawningMonsters121, /SPAWN_MONSTERS/,
-    "1.21.11 hostile-mob gamerule filtering was removed");
+    "" + LEGACY_PROFILE.id + " hostile-mob gamerule filtering was removed");
   assert.doesNotMatch(spawningMonsters121, /Code:\s*0:\s*iconst_0\s+1:\s*ireturn/,
-    "1.21.11 ServerLevel.isSpawningMonsters must not be hard-disabled");
+    "" + LEGACY_PROFILE.id + " ServerLevel.isSpawningMonsters must not be hard-disabled");
   const patched121ChunkGenerator = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.world.level.chunk.ChunkGenerator"], {
     encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
@@ -1542,9 +1619,9 @@ try {
     encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
   });
   assert.doesNotMatch(patched121ChunkGenerator, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
-    "1.21.11 ChunkGenerator must keep the 26.2 deep checkpoint path isolated");
+    "" + LEGACY_PROFILE.id + " ChunkGenerator must keep the " + CANONICAL_PROFILE.id + " deep checkpoint path isolated");
   assert.doesNotMatch(patched121ClimateTree, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
-    "1.21.11 Climate.RTree.SubTree must keep the 26.2 deep checkpoint path isolated");
+    "" + LEGACY_PROFILE.id + " Climate.RTree.SubTree must keep the " + CANONICAL_PROFILE.id + " deep checkpoint path isolated");
   const raw121DedicatedServer = execFileSync(javap, ["-classpath", raw121ClientJar, "-p", "-c",
     "net.minecraft.server.dedicated.DedicatedServer"], {
       encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
@@ -1557,8 +1634,8 @@ try {
     "public boolean initServer() throws java.io.IOException;",
     "public net.minecraft.world.level.GameType gameMode();");
   assert.equal(occurrences(raw121Init, "WorldData.setGameType"), 1,
-    "1.21.11 raw initServer game type override shape changed");
-  assertDedicatedServerGameTypeContract(patched121DedicatedServer, "1.21.11",
+    "" + LEGACY_PROFILE.id + " raw initServer game type override shape changed");
+  assertDedicatedServerGameTypeContract(patched121DedicatedServer, LEGACY_PROFILE.id,
     "public boolean initServer() throws java.io.IOException;");
   const generic121Graphics = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.client.GraphicsPreset"], {
@@ -1570,14 +1647,14 @@ try {
   const generic121RunServer = method(
     generic121MinecraftServer, "protected void runServer();",
   );
-  assertRunServerWaitTelemetryOrder(generic121RunServer, "1.21.11");
+  assertRunServerWaitTelemetryOrder(generic121RunServer, LEGACY_PROFILE.id);
   const generic121Apply = graphicsPresetApply(generic121Graphics);
   assert.deepEqual(graphicsPresetDistanceConstants(generic121Apply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
-    "1.21.11 FAST render distance was changed by the 26.2 overlay path");
+    "" + LEGACY_PROFILE.id + " FAST render distance was changed by the " + CANONICAL_PROFILE.id + " overlay path");
   assert.deepEqual(graphicsPresetDistanceConstants(generic121Apply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
-    "1.21.11 FAST simulation distance was changed by the 26.2 overlay path");
+    "" + LEGACY_PROFILE.id + " FAST simulation distance was changed by the " + CANONICAL_PROFILE.id + " overlay path");
 
   // The spawn entity gate adds a branch to Preparing.tick, so its rebuilt
   // stack map frames must also pass the JVM verifier on both profiles.
@@ -1625,8 +1702,8 @@ try {
     encoding: "utf8", timeout: 30_000,
   });
   for (const [profileId, patchedJar, rawJar, chunkKeyCall] of [
-    ["26.2", clientJar, rawClientJar, "ChunkPos.pack:()J"],
-    ["1.21.11", generic121Jar, raw121ClientJar, "ChunkPos.toLong:()J"],
+    [CANONICAL_PROFILE.id, clientJar, rawClientJar, "ChunkPos.pack:()J"],
+    [LEGACY_PROFILE.id, generic121Jar, raw121ClientJar, "ChunkPos.toLong:()J"],
   ]) {
     const preparing = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
       "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
@@ -1641,6 +1718,16 @@ try {
       encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
     });
     assertPrepareSpawnEntityGateContract(preparing, ready, serverLevel, profileId, chunkKeyCall);
+    const prepareSpawnTask = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.network.config.PrepareSpawnTask"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
+    assertSavedSpawnPositionContract(prepareSpawnTask, preparing, profileId);
+    const serverChunkCache = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.level.ServerChunkCache"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+    assertOffThreadGetChunkWaitContract(serverChunkCache, profileId);
     const verified = execFileSync(java, ["-Xverify:all", "-classpath",
       [classes, patchedJar].join(delimiter), "GaiusClassInitVerifier",
       "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
@@ -1650,12 +1737,13 @@ try {
       /CLASS_INIT_VERIFIED net\.minecraft\.server\.network\.config\.PrepareSpawnTask\$Preparing/,
       `${profileId} patched PrepareSpawnTask$Preparing failed JVM verification`);
 
-    // Only the two patched classes go in front of the vanilla jar: the rest of
+    // Only these patched classes go in front of the vanilla jar: the rest of
     // the overlay calls Gaius browser classes that are absent on the JVM.
     const gateOverlay = join(root, `spawn-gate-overlay-${profileId}`);
     await mkdir(gateOverlay, {recursive: true});
     execFileSync(jar, ["--extract", "--file", patchedJar,
       "net/minecraft/server/network/config/PrepareSpawnTask$Preparing.class",
+      "net/minecraft/server/level/PlayerSpawnFinder.class",
       "net/minecraft/server/level/ServerLevel.class"], {
       cwd: gateOverlay, encoding: "utf8", timeout: 30_000,
     });
@@ -1689,6 +1777,7 @@ try {
       "SPAWN_ENTITY_GATE_NON_WORKER_PASSES",
       "SPAWN_ENTITY_GATE_WAITS_WITH_TICKET",
       "SPAWN_ENTITY_GATE_DRAINS_PENDING_LOADS",
+      "SPAWN_FIXUP_ONLY_FOR_SEARCHED_SPAWN",
     ]) {
       assert.ok(gate.includes(marker), `${profileId} spawn entity gate fixture missed ${marker}`);
     }
@@ -1703,8 +1792,8 @@ try {
   ], {
     encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
   });
-  assertClientPlayPacketQueueContract(patchedPacketUtils, "26.2");
-  assertClientPlayPacketQueueContract(patched121PacketUtils, "1.21.11");
+  assertClientPlayPacketQueueContract(patchedPacketUtils, CANONICAL_PROFILE.id);
+  assertClientPlayPacketQueueContract(patched121PacketUtils, LEGACY_PROFILE.id);
   const patchedCommonListener = execFileSync(javap, [
     "-classpath", clientJar, "-p", "-c",
     "net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl",
@@ -1713,8 +1802,8 @@ try {
     "-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl",
   ], {encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000});
-  assertKeepAliveImmediateSendContract(patchedCommonListener, "26.2");
-  assertKeepAliveImmediateSendContract(patched121CommonListener, "1.21.11");
+  assertKeepAliveImmediateSendContract(patchedCommonListener, CANONICAL_PROFILE.id);
+  assertKeepAliveImmediateSendContract(patched121CommonListener, LEGACY_PROFILE.id);
   const patchedPacketProcessor = execFileSync(javap, [
     "-classpath", clientJar, "-p", "-c", "net.minecraft.network.PacketProcessor",
   ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
@@ -1728,8 +1817,8 @@ try {
     "-classpath", generic121Jar, "-p", "-c", "net.minecraft.util.thread.BlockableEventLoop",
   ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
   for (const [profileId, blockableEventLoop] of [
-    ["26.2", patchedBlockableEventLoop],
-    ["1.21.11", patched121BlockableEventLoop],
+    [CANONICAL_PROFILE.id, patchedBlockableEventLoop],
+    [LEGACY_PROFILE.id, patched121BlockableEventLoop],
   ]) {
     const doRunTask = method(blockableEventLoop,
       "protected void doRunTask(R);",
@@ -1743,10 +1832,10 @@ try {
       /BrowserIntegratedServerMain\.endScheduledNetworkInputTask/,
       `${profileId} doRunTask must close scheduled network input`);
   }
-  assertPacketProcessorQueueContract(patchedPacketProcessor, "26.2");
-  assertPacketProcessorQueueContract(patched121PacketProcessor, "1.21.11");
-  assertPacketProcessorLifecycleContract(patchedPacketProcessor, "26.2");
-  assertPacketProcessorLifecycleContract(patched121PacketProcessor, "1.21.11");
+  assertPacketProcessorQueueContract(patchedPacketProcessor, CANONICAL_PROFILE.id);
+  assertPacketProcessorQueueContract(patched121PacketProcessor, LEGACY_PROFILE.id);
+  assertPacketProcessorLifecycleContract(patchedPacketProcessor, CANONICAL_PROFILE.id);
+  assertPacketProcessorLifecycleContract(patched121PacketProcessor, LEGACY_PROFILE.id);
 
   const rawMob = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
     "net.minecraft.world.entity.Mob"], {
@@ -1805,21 +1894,21 @@ try {
   assert.doesNotMatch(rawLivingTick, /BrowserWorldgenScheduler\.mobEntityPulse/,
     "raw LivingEntity.tick unexpectedly contains browser scheduler hooks");
   assert.equal(occurrences(patchedMobAi, "BrowserWorldgenScheduler.mobAiPulse"), 7,
-    "26.2 Mob.serverAiStep must checkpoint all seven vanilla AI stage boundaries");
+    "" + CANONICAL_PROFILE.id + " Mob.serverAiStep must checkpoint all seven vanilla AI stage boundaries");
   assert.equal(occurrences(patched121MobAi, "BrowserWorldgenScheduler.mobAiPulse"), 7,
-    "1.21.11 Mob.serverAiStep must checkpoint all seven vanilla AI stage boundaries");
+    "" + LEGACY_PROFILE.id + " Mob.serverAiStep must checkpoint all seven vanilla AI stage boundaries");
   assert.equal(occurrences(patchedMobAiStep, "BrowserWorldgenScheduler.mobAiPulse"), 2,
-    "26.2 Mob.aiStep must retain a cooperative boundary around the vanilla super call");
+    "" + CANONICAL_PROFILE.id + " Mob.aiStep must retain a cooperative boundary around the vanilla super call");
   assert.equal(occurrences(patched121MobAiStep, "BrowserWorldgenScheduler.mobAiPulse"), 2,
-    "1.21.11 Mob.aiStep must retain a cooperative boundary around the vanilla super call");
+    "" + LEGACY_PROFILE.id + " Mob.aiStep must retain a cooperative boundary around the vanilla super call");
   assert.equal(occurrences(patchedMobTick, "BrowserWorldgenScheduler.mobAiPulse"), 0,
-    "26.2 Mob.tick must remain unmodified after moving the fallback to LivingEntity");
+    "" + CANONICAL_PROFILE.id + " Mob.tick must remain unmodified after moving the fallback to LivingEntity");
   assert.equal(occurrences(patched121MobTick, "BrowserWorldgenScheduler.mobAiPulse"), 0,
-    "1.21.11 Mob.tick must remain unmodified after moving the fallback to LivingEntity");
+    "" + LEGACY_PROFILE.id + " Mob.tick must remain unmodified after moving the fallback to LivingEntity");
   assert.equal(occurrences(patchedLivingTick, "BrowserWorldgenScheduler.mobEntityPulse"), 1,
-    "26.2 LivingEntity.tick must retain the profile-generic Mob fallback boundary");
+    "" + CANONICAL_PROFILE.id + " LivingEntity.tick must retain the profile-generic Mob fallback boundary");
   assert.equal(occurrences(patched121LivingTick, "BrowserWorldgenScheduler.mobEntityPulse"), 1,
-    "1.21.11 LivingEntity.tick must retain the profile-generic Mob fallback boundary");
+    "" + LEGACY_PROFILE.id + " LivingEntity.tick must retain the profile-generic Mob fallback boundary");
   assert.equal(occurrences(patchedMobAi, "BrowserWorldgenScheduler.mobAiPulse"),
     occurrences(patched121MobAi, "BrowserWorldgenScheduler.mobAiPulse"),
     "Mob AI cooperation must remain profile-generic");
@@ -1984,7 +2073,7 @@ try {
     "wait telemetry must bracket the actual waitUntilNextTick call");
   assert.ok(tickCheckpoint < tickTelemetryEnd && tickTelemetryEnd < waitTelemetryStart,
     "wait telemetry must start after the tick checkpoint/telemetry end boundary");
-  assertRunServerWaitTelemetryOrder(runServer, "26.2");
+  assertRunServerWaitTelemetryOrder(runServer, CANONICAL_PROFILE.id);
   const pollTask = method(bytecode, "protected boolean pollTask();", "private boolean pollTaskInternal");
   assert.equal(occurrences(pollTask, "BrowserWorldgenScheduler.beginTaskWork"), 1,
     "MinecraftServer.pollTask must enter one active-work task scope");
@@ -2102,7 +2191,7 @@ try {
     /^fload\s+5$/,
     "frame targeting still uses the world partial tick and can drift");
 
-  console.log("Minecraft 26.2 P1 patcher smoke passed", JSON.stringify({
+  console.log("Minecraft " + CANONICAL_PROFILE.id + " P1 patcher smoke passed", JSON.stringify({
     scheduledLayerPulses: occurrences(generationWait, "BrowserWorldgenScheduler.pulse"),
     distancePulses: occurrences(distance, "pulseDistanceManager"),
     graphicsPresetDistances: {

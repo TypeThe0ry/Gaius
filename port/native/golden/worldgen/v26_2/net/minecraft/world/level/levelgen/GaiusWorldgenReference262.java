@@ -92,7 +92,8 @@ public final class GaiusWorldgenReference262 {
         });
         GaiusWorldgenReference262 reference = new GaiusWorldgenReference262(lookup, seed, biomeMap);
         byte[] ir = GaiusWorldgenExport262.export(reference.generator, reference.randomState, lookup,
-                b -> biomeIds.getOrDefault(b, -1), reference.height, seed, 1);
+                b -> biomeIds.getOrDefault(b, -1), reference.height, seed,
+                Integer.getInteger("gaius.worldgen.semantics", 1));
         Files.write(out.resolve("overworld.gwir"), ir);
         System.out.println("overworld.gwir: " + ir.length + " bytes");
 
@@ -109,6 +110,8 @@ public final class GaiusWorldgenReference262 {
             }
             System.out.println(file.getFileName());
         }
+        dev.gaius.golden.worldgen.StageTiming.run(chunks, (chunkX, chunkZ) -> reference.write(
+                new DataOutputStream(java.io.OutputStream.nullOutputStream()), chunkX, chunkZ, biomeIds, seed));
     }
 
     private ProtoChunk newChunk(int cx, int cz) {
@@ -135,7 +138,9 @@ public final class GaiusWorldgenReference262 {
             data.writeInt(0);
         }
         ProtoChunk chunk = newChunk(cx, cz);
+        long biomeStart = dev.gaius.golden.worldgen.StageTiming.start();
         generator.createBiomes(randomState, Blender.empty(), null, chunk).join();
+        dev.gaius.golden.worldgen.StageTiming.finish("biomes", cx, cz, biomeStart);
         chunk.setPersistedStatus(ChunkStatus.BIOMES);
         biomeChunks.put(ChunkPos.pack(cx, cz), chunk);
         int minQuartY = QuartPos.fromBlock(MIN_Y);
@@ -151,7 +156,9 @@ public final class GaiusWorldgenReference262 {
             }
         }
 
+        long terrainStart = dev.gaius.golden.worldgen.StageTiming.start();
         generator.fillFromNoise(Blender.empty(), randomState, null, chunk).join();
+        dev.gaius.golden.worldgen.StageTiming.finish("terrain", cx, cz, terrainStart);
         writeStates(data, chunk, cx, cz);
 
         // The surface step reads biomes through the region: neighbours' noise biomes, with the
@@ -160,14 +167,27 @@ public final class GaiusWorldgenReference262 {
                 .getNoiseBiome(qx, qy, qz);
         BiomeManager biomeManager = new BiomeManager(regionBiomes, BiomeManager.obfuscateSeed(seed));
         Set<Holder<Biome>> possible = source.possibleBiomes();
+        long surfaceStart = dev.gaius.golden.worldgen.StageTiming.start();
         generator.buildSurface(chunk, new WorldGenerationContext(generator, height), randomState, null,
                 biomeManager, Blender.empty(), possible);
+        dev.gaius.golden.worldgen.StageTiming.finish("surface", cx, cz, surfaceStart);
         writeStates(data, chunk, cx, cz);
         for (Heightmap.Types type : new Heightmap.Types[] {
                 Heightmap.Types.WORLD_SURFACE_WG, Heightmap.Types.OCEAN_FLOOR_WG}) {
             for (int z = 0; z < 16; z++) {
                 for (int x = 0; x < 16; x++) {
                     data.writeInt(Integer.reverseBytes(chunk.getHeight(type, x, z) + 1));
+                }
+            }
+        }
+        for (int x = -1; x <= 4; x++) {
+            for (int z = -1; z <= 4; z++) {
+                int qx = (cx << 2) + x;
+                int qz = (cz << 2) + z;
+                ProtoChunk stored = biomeChunk(qx >> 2, qz >> 2);
+                for (int y = 0; y < QuartPos.fromBlock(HEIGHT); y++) {
+                    data.writeInt(Integer.reverseBytes(biomeIds.get(
+                            stored.getNoiseBiome(qx, minQuartY + y, qz).value())));
                 }
             }
         }

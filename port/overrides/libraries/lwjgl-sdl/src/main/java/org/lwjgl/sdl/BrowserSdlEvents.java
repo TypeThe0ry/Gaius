@@ -64,6 +64,13 @@ final class BrowserSdlEvents {
 
         /** Dequeue-time keyboard state of a scancode (0 or 1). */
         int keyState(int scancode);
+
+        /**
+         * Called before the first poll of each drain cycle (SDLEventHandler.pollEvents polls until
+         * the queue is empty once per Minecraft.run iteration): the game-loop boundary.
+         */
+        default void loopBoundary() {
+        }
     }
 
     private static final class DomSource implements Source {
@@ -106,11 +113,18 @@ final class BrowserSdlEvents {
         public int keyState(int scancode) {
             return BrowserSdlDom.keyState(scancode);
         }
+
+        @Override
+        public void loopBoundary() {
+            BrowserSdlDom.loopBoundary();
+        }
     }
 
     private static Source source = new DomSource();
     private static ByteBuffer text;
     private static long polledEvents;
+    /** True when the next poll starts a drain cycle (the previous one answered "empty"). */
+    private static boolean drainCycleStart = true;
 
     private BrowserSdlEvents() {
     }
@@ -119,6 +133,7 @@ final class BrowserSdlEvents {
     static void useSource(Source replacement) {
         source = replacement == null ? new DomSource() : replacement;
         releaseText();
+        drainCycleStart = true;
     }
 
     static long polledEvents() {
@@ -129,9 +144,14 @@ final class BrowserSdlEvents {
         if (event == null) {
             return source.peek();
         }
+        if (drainCycleStart) {
+            drainCycleStart = false;
+            source.loopBoundary();
+        }
         releaseText();
         int type = source.poll();
         if (type == 0) {
+            drainCycleStart = true;
             return false;
         }
         write(event.address(), type, source, BrowserSdlVideo.eventWindowId());

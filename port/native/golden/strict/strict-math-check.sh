@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Proves the StrictMath263 worldgen rewrite keeps vanilla semantics: rewrites the 26.3 client
+# Proves the worldgen float rewrite (WorldgenStrictMath, the patch
+# StrictMath263.roundWorldgenArithmetic) keeps vanilla semantics: rewrites the 26.3 client
 # jar's worldgen scope, checks the bytecode (BasicVerifier, every float rounded, no raw cast
 # left), checks the BrowserStrictMath helpers against the JVM's own casts and DoubleStream.sum,
 # then dumps the 26.3 golden fixtures from the rewritten classes on the JVM and requires them to
@@ -14,7 +15,7 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GOLDEN="$(cd -- "$HERE/.." && pwd)"
 ROOT="$(cd -- "$GOLDEN/../../.." && pwd)"
-JDK="${GOLDEN_JAVA_HOME:-/c/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot}"
+JDK="${GOLDEN_JAVA_HOME:-${GAIUS_JAVA_HOME:-${JAVA_HOME:-$(dirname -- "$(dirname -- "$(command -v javac)")")}}}"
 M2="${MAVEN_REPOSITORY:-$HOME/.m2/repository}"
 ASM="$M2/org/ow2/asm"
 
@@ -37,13 +38,13 @@ analysis="$(native "$ASM/asm-analysis/9.8/asm-analysis-9.8.jar")"
 tools_src="$ROOT/port/tools/src/main/java"
 
 "$JDK/bin/javac" --release 21 -proc:none -classpath "$asm_path" -sourcepath "$(native "$tools_src")" \
-    -d "$(native "$BUILD/tools")" "$(native "$tools_src/dev/gaius/tools/m263/StrictMath263.java")"
+    -d "$(native "$BUILD/tools")" "$(native "$tools_src/dev/gaius/tools/patches/worldgen/WorldgenStrictMath.java")"
 "$JDK/bin/javac" --release 21 -proc:none -classpath "$(native "$M2/org/teavm/teavm-jso/0.15.0/teavm-jso-0.15.0.jar")" \
     -d "$(native "$BUILD/helper")" "$(native "$ROOT/port/src/main/java/dev/gaius/browser/BrowserStrictMath.java")"
 "$JDK/bin/javac" --release 21 -proc:none -classpath "$asm_path$SEP$analysis$SEP$(native "$BUILD/tools")" \
     -d "$(native "$BUILD/check")" "$(native "$HERE/StrictMathCheck.java")"
 
-"$JDK/bin/java" -cp "$(native "$BUILD/tools")$SEP$asm_path" dev.gaius.tools.m263.StrictMath263 \
+"$JDK/bin/java" -cp "$(native "$BUILD/tools")$SEP$asm_path" dev.gaius.tools.patches.worldgen.WorldgenStrictMath \
     "$(native "$JAR")" "$(native "$BUILD/rewritten")"
 "$JDK/bin/java" -cp "$(native "$BUILD/check")$SEP$(native "$BUILD/tools")$SEP$asm_path$SEP$analysis" StrictMathCheck \
     "$(native "$JAR")" "$(native "$BUILD/rewritten")" \

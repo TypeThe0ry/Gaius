@@ -7,7 +7,7 @@ import net.minecraft.server.players.PlayerList;
  *
  * <p>Minecraft 26.2 keeps the vanilla "allow commands for all players" setter.
  * Profiles whose PlayerList differs provide a replacement with the same
- * relative path under port/src/versions/&lt;profile&gt;/java.
+ * relative path in a source set of port/mc/shared (selected by the profile).
  */
 public final class BrowserPlayerListCompat {
     private BrowserPlayerListCompat() {}

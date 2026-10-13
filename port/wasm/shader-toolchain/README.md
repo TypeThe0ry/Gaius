@@ -58,13 +58,42 @@ Artifacts (all next to `index.html`):
 | `gaius-shaderc.wasm` + `.js` | 3,405,778 + 17,222 B | 1,067,026 + 5,606 B |
 | `gaius-spvc.wasm` + `.js` | 643,044 + 13,844 B | 210,797 + 4,377 B |
 | `gaius-shader-toolchain.js` (loader) | ~40 KB | ~10 KB |
-| `gaius-shader-toolchain.json` | pins, emscripten version, sizes, sha256 | |
+| `gaius-shader-toolchain.json` | pins, emscripten version, exports, sizes, sha256 | |
 
 **Repository policy.**  The modules are build outputs and are not committed:
 the repository keeps large binaries only under `port/web/dist` (Git LFS, one
 coherent release).  A release build of a profile that needs the toolchain runs
 the script with `--dist <profile dist>`; the files then travel with that
 release like `gaius-hotpath.wasm`.
+
+## The blaze3d front-end (26.2, 1.21.11)
+
+The WebGPU backends of 26.2 and 1.21.11 receive GLSL and compile it the way the
+vanilla 26.2 `GlslCompiler` does, which also sets
+`shaderc_compile_options_set_auto_map_locations` (renderpearl does not): their
+shaders declare no `layout(location)`, and without the option shaderc refuses
+every stage ("SPIR-V requires location for user input/output"). The export list
+therefore carries that setter and the loader maps job option 6 to it
+(`OPTION_AUTO_MAP_LOCATIONS`; the Java side's `BrowserShadercJob` code must
+match). The reflection and rebind that follow shaderc are Rust
+(`gaius-shaderxlat` `frontend::link`), not spvc.
+
+Modules built before the export was added (every `--prebuilt` set made before
+it, whose manifest has no `exports` record) still serve 26.3: the build prints a
+warning, `api.shadercSupportsOption(6)` is false, and a job that asks for the
+option fails with a message naming the export while the instance stays in
+service. Rebuild them with emsdk (the stamp covers the export list, so the next
+build recompiles):
+
+```sh
+GAIUS_EMSDK=/path/to/emsdk port/scripts/build-wasm-shader-toolchain.sh --force
+node port/wasm/shader-toolchain/check-loader-exports.mjs --toolchain port/target/shader-toolchain/out
+```
+
+`check-loader-exports.mjs` checks that every function the loader calls is
+exported and every option setter has an option code (without `--toolchain`
+it only reads the two files), and with `--toolchain` compiles an unlocated
+stage on the modules with and without the option.
 
 ## Page contract (C7)
 

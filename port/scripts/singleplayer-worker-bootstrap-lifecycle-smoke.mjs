@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {MessageChannel, Worker} from "node:worker_threads";
@@ -25,13 +26,14 @@ assert.ok(bootstrap.includes("globalPump: snapshotGlobalPumpTelemetry"),
 assert.ok(bootstrap.includes('message.type === "diagnostic-snapshot"'),
   "Worker bootstrap lost the diagnostic snapshot message");
 const sessionId = "5123456789abcdef0123456789abcdef";
+const initialGameRulesText = '{"minecraft:random_tick_speed":7,"minecraft:advance_time":false}';
 const storageConfig = Object.freeze({
-  profileId: "26.2",
+  profileId: CANONICAL_PROFILE.id,
   worldVersion: 4903,
   storageSchema: 2,
-  storageDatabaseName: "gaius-fs-v2-26.2",
-  storagePrefix: "gaius.fs.v2:26.2:",
-  storageOpfsDirectory: "regions-v2-26.2",
+  storageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+  storagePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+  storageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
 });
 
 const harness = `
@@ -63,6 +65,9 @@ globalThis.main = () => parentPort.postMessage({
   serverTickTelemetryEnabled: globalThis.__gaiusServerTickTelemetryEnabled === true,
   structurePreloadIds: globalThis.__gaiusStructurePreloadIds || [],
   structurePreloadBudgetMillis: globalThis.__gaiusStructurePreloadBudgetMillis,
+  // The game rules Java reads when it builds the DedicatedServer (BrowserIntegratedServerMain
+  // .initialGameRules): they must be in place by the time main() runs.
+  initialGameRules: globalThis.__gaiusServerInitialGameRules,
 });
 globalThis.__gaiusStartIntegratedServerPump = () => {};
 globalThis.setIntegratedServerDistances = (viewDistance, simulationDistance) => {
@@ -412,6 +417,7 @@ worker.postMessage({
   launchGeneration: "1",
   worldId: "portable-lifecycle-world",
   newWorld: true,
+  initialGameRules: initialGameRulesText,
   profileId: storageConfig.profileId,
   worldVersion: storageConfig.worldVersion,
   storageSchema: storageConfig.storageSchema,
@@ -432,6 +438,8 @@ worker.postMessage({type: "attach-port", sessionId, port: activeChannel.port1},
   [activeChannel.port1]);
 await waitFor("port-attached");
 const mainStartObserved = await waitFor("main-start-observed");
+assert.equal(mainStartObserved.initialGameRules, initialGameRulesText,
+  "bootstrap main() did not observe the game rules the page sent in the start message");
 assert.equal(mainStartObserved.serverTickTelemetryEnabled, true,
   "bootstrap main() did not observe server tick telemetry enabled by pre-start diagnostic-config");
 assert.equal(mainStartObserved.structurePreloadIds.length, 64,

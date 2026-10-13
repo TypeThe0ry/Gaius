@@ -10,6 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.zip.ZipFile;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
@@ -20,28 +21,36 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /**
- * Redirects the LWJGL 3.4.3 SDL3 bindings that Minecraft 26.3 uses to the browser shim
+ * Redirects the LWJGL SDL3 bindings that the vanilla client uses to the browser shim
  * {@code org.lwjgl.sdl.BrowserSdl} (work package P2, decision D3).
  *
  * <ul>
  *   <li>{@code SDL.<clinit>} becomes {@code SDL = null}: no native library is loaded.</li>
- *   <li>The <em>body</em> of each of the {@value #ENTRY_COUNT} public static {@code SDL_*}
- *       entry points in {@link #ENTRIES} becomes an {@code invokestatic} of the
- *       {@code BrowserSdl} method with the same name and descriptor. Bodies rather than
- *       call sites, because {@code SDLTimer.SDL_GetTicksNS} is also reached through the
+ *   <li>The entry table is generated from the profile's usage lock
+ *       ({@code port/mc/profiles/<profile>/usage.lock}, {@link UsageLock}; maint/D14 P15 and M1
+ *       item 6): every public static {@code SDL_*} method of {@code org/lwjgl/sdl} that vanilla
+ *       references. The <em>body</em> of each entry becomes an {@code invokestatic} of the
+ *       {@code BrowserSdl} method with the same name and descriptor. Bodies rather than call
+ *       sites, because {@code SDLTimer.SDL_GetTicksNS} is also reached through the
  *       {@code REF_invokeStatic} method handle of {@code RenderSystem.initBackendSystem}.</li>
+ *   <li>An entry that {@code BrowserSdl} does not implement gets a FEATURE stub: its body throws
+ *       the {@code UnsupportedOperationException} of {@code BrowserSdlUnsupported.entry}, which
+ *       reports the entry once. Only the entries a seam of the profile requires
+ *       ({@code requiredEntries} of port/mc/seams/<generation>/seam.json) are REQUIRED: the build
+ *       fails when vanilla does not use one or {@code BrowserSdl} does not implement it.</li>
  * </ul>
  *
- * <p>Fail-closed: every entry must exist in the jar as a public static method, the
- * {@code BrowserSdl} overlay (compiled into the jar by build-overlays.sh before this step)
- * must declare a public static target with the identical descriptor, and exactly
- * {@value #ENTRY_COUNT} bodies must be replaced. {@code InputPatches263} checks that the
- * client references no SDL entry point outside {@link #ENTRIES}.
+ * <p>No count is hard-coded: a new vanilla version that uses more SDL entry points gets stubs for
+ * the new ones (and a stale lock fails {@code InputPatches263}'s coverage check, which compares the
+ * client's references with {@link #entryKeys()}). Fail-closed otherwise: every entry must exist in
+ * the jar as a public static method, and the {@code BrowserSdl} overlay (compiled into the jar by
+ * build-overlays.sh before this step) must be present.
  *
  * <p>The module has no native methods and no {@code sun.misc.Unsafe} use; its callback
  * interfaces ({@code SDL_LogOutputFunctionI} and others) still need the {@code callbacks}
@@ -51,137 +60,124 @@ public final class LwjglSdlBrowserPatcher {
     public static final String PACKAGE = "org/lwjgl/sdl/";
     public static final String SDL = PACKAGE + "SDL";
     public static final String BROWSER = PACKAGE + "BrowserSdl";
-    public static final int ENTRY_COUNT = 84;
-
-    /**
-     * Owner (simple name in {@code org/lwjgl/sdl}), name and descriptor of every SDL entry
-     * point that the Minecraft 26.3 client reaches: 84 {@code SDL_*} methods (migration
-     * notes input-window V.2-1). {@code SDL.getLibrary()} is only reached from the no-op'ed
-     * NativeLibrariesBootstrap and keeps returning the (now null) library.
-     */
-    static final String[][] ENTRIES = {
-            {"SDLClipboard", "SDL_GetClipboardText", "()Ljava/lang/String;"},
-            {"SDLClipboard", "SDL_SetClipboardText", "(Ljava/lang/CharSequence;)Z"},
-            {"SDLError", "SDL_GetError", "()Ljava/lang/String;"},
-            {"SDLEvents", "SDL_FlushEvents", "(II)V"},
-            {"SDLEvents", "SDL_GetWindowFromEvent", "(Lorg/lwjgl/sdl/SDL_Event;)J"},
-            {"SDLEvents", "SDL_PollEvent", "(Lorg/lwjgl/sdl/SDL_Event;)Z"},
-            {"SDLEvents", "SDL_PumpEvents", "()V"},
-            {"SDLHints", "SDL_SetHint", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Z"},
-            {"SDLInit", "SDL_Init", "(I)Z"},
-            {"SDLInit", "SDL_Quit", "()V"},
-            {"SDLInit", "SDL_SetAppMetadataProperty", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Z"},
-            {"SDLKeyboard", "SDL_ClearComposition", "(J)Z"},
-            {"SDLKeyboard", "SDL_GetKeyFromScancode", "(ISZ)I"},
-            {"SDLKeyboard", "SDL_GetKeyName", "(I)Ljava/lang/String;"},
-            {"SDLKeyboard", "SDL_GetKeyboardState", "()Ljava/nio/ByteBuffer;"},
-            {"SDLKeyboard", "SDL_GetModState", "()S"},
-            {"SDLKeyboard", "SDL_SetTextInputArea", "(JLorg/lwjgl/sdl/SDL_Rect$Buffer;I)Z"},
-            {"SDLKeyboard", "SDL_StartTextInput", "(J)Z"},
-            {"SDLKeyboard", "SDL_StopTextInput", "(J)Z"},
-            {"SDLLog", "SDL_SetLogOutputFunction", "(Lorg/lwjgl/sdl/SDL_LogOutputFunctionI;J)V"},
-            {"SDLLog", "SDL_SetLogPriorities", "(I)V"},
-            {"SDLMessageBox", "SDL_ShowMessageBox", "(Lorg/lwjgl/sdl/SDL_MessageBoxData;Ljava/nio/IntBuffer;)Z"},
-            {"SDLMessageBox", "SDL_ShowSimpleMessageBox", "(ILjava/lang/CharSequence;Ljava/lang/CharSequence;J)Z"},
-            {"SDLMisc", "SDL_OpenURL", "(Ljava/lang/CharSequence;)Z"},
-            {"SDLMouse", "SDL_CreateSystemCursor", "(I)J"},
-            {"SDLMouse", "SDL_GetDefaultCursor", "()J"},
-            {"SDLMouse", "SDL_GetGlobalMouseState", "(Ljava/nio/FloatBuffer;Ljava/nio/FloatBuffer;)I"},
-            {"SDLMouse", "SDL_GetMouseState", "(Ljava/nio/FloatBuffer;Ljava/nio/FloatBuffer;)I"},
-            {"SDLMouse", "SDL_SetCursor", "(J)Z"},
-            {"SDLMouse", "SDL_SetWindowRelativeMouseMode", "(JZ)Z"},
-            {"SDLMouse", "SDL_WarpMouseInWindow", "(JFF)V"},
-            {"SDLPixels", "SDL_GetPixelFormatDetails", "(I)Lorg/lwjgl/sdl/SDL_PixelFormatDetails;"},
-            {"SDLPlatform", "SDL_GetPlatform", "()Ljava/lang/String;"},
-            {"SDLStdinc", "SDL_free", "(Ljava/nio/IntBuffer;)V"},
-            {"SDLStdinc", "SDL_free", "(Lorg/lwjgl/PointerBuffer;)V"},
-            {"SDLSurface", "SDL_AddSurfaceAlternateImage", "(Lorg/lwjgl/sdl/SDL_Surface;Lorg/lwjgl/sdl/SDL_Surface;)Z"},
-            {"SDLSurface", "SDL_CreateSurfaceFrom", "(IIILjava/nio/ByteBuffer;I)Lorg/lwjgl/sdl/SDL_Surface;"},
-            {"SDLSurface", "SDL_DestroySurface", "(Lorg/lwjgl/sdl/SDL_Surface;)V"},
-            {"SDLTimer", "SDL_GetTicksNS", "()J"},
-            {"SDLVideo", "SDL_CreateWindow", "(Ljava/lang/CharSequence;IIJ)J"},
-            {"SDLVideo", "SDL_DestroyWindow", "(J)V"},
-            {"SDLVideo", "SDL_GL_CreateContext", "(J)J"},
-            {"SDLVideo", "SDL_GL_DestroyContext", "(J)Z"},
-            {"SDLVideo", "SDL_GL_GetAttribute", "(ILjava/nio/IntBuffer;)Z"},
-            {"SDLVideo", "SDL_GL_GetProcAddress", "(Ljava/lang/CharSequence;)J"},
-            {"SDLVideo", "SDL_GL_LoadLibrary", "(Ljava/lang/CharSequence;)Z"},
-            {"SDLVideo", "SDL_GL_MakeCurrent", "(JJ)Z"},
-            {"SDLVideo", "SDL_GL_SetAttribute", "(II)Z"},
-            {"SDLVideo", "SDL_GL_SetSwapInterval", "(I)Z"},
-            {"SDLVideo", "SDL_GL_SwapWindow", "(J)Z"},
-            {"SDLVideo", "SDL_GL_UnloadLibrary", "()V"},
-            {"SDLVideo", "SDL_GetClosestFullscreenDisplayMode", "(IIIFZLorg/lwjgl/sdl/SDL_DisplayMode;)Z"},
-            {"SDLVideo", "SDL_GetCurrentDisplayMode", "(I)Lorg/lwjgl/sdl/SDL_DisplayMode;"},
-            {"SDLVideo", "SDL_GetCurrentVideoDriver", "()Ljava/lang/String;"},
-            {"SDLVideo", "SDL_GetDesktopDisplayMode", "(I)Lorg/lwjgl/sdl/SDL_DisplayMode;"},
-            {"SDLVideo", "SDL_GetDisplayBounds", "(ILorg/lwjgl/sdl/SDL_Rect;)Z"},
-            {"SDLVideo", "SDL_GetDisplayForWindow", "(J)I"},
-            {"SDLVideo", "SDL_GetDisplayName", "(I)Ljava/lang/String;"},
-            {"SDLVideo", "SDL_GetDisplays", "()Ljava/nio/IntBuffer;"},
-            {"SDLVideo", "SDL_GetFullscreenDisplayModes", "(I)Lorg/lwjgl/PointerBuffer;"},
-            {"SDLVideo", "SDL_GetPrimaryDisplay", "()I"},
-            {"SDLVideo", "SDL_GetWindowFlags", "(J)J"},
-            {"SDLVideo", "SDL_GetWindowFullscreenMode", "(J)Lorg/lwjgl/sdl/SDL_DisplayMode;"},
-            {"SDLVideo", "SDL_GetWindowPixelDensity", "(J)F"},
-            {"SDLVideo", "SDL_GetWindowPosition", "(JLjava/nio/IntBuffer;Ljava/nio/IntBuffer;)Z"},
-            {"SDLVideo", "SDL_GetWindowSizeInPixels", "(JLjava/nio/IntBuffer;Ljava/nio/IntBuffer;)Z"},
-            {"SDLVideo", "SDL_RestoreWindow", "(J)Z"},
-            {"SDLVideo", "SDL_SetWindowBordered", "(JZ)Z"},
-            {"SDLVideo", "SDL_SetWindowFullscreen", "(JZ)Z"},
-            {"SDLVideo", "SDL_SetWindowFullscreenMode", "(JLorg/lwjgl/sdl/SDL_DisplayMode;)Z"},
-            {"SDLVideo", "SDL_SetWindowIcon", "(JLorg/lwjgl/sdl/SDL_Surface;)Z"},
-            {"SDLVideo", "SDL_SetWindowMaximumSize", "(JII)Z"},
-            {"SDLVideo", "SDL_SetWindowMinimumSize", "(JII)Z"},
-            {"SDLVideo", "SDL_SetWindowMouseGrab", "(JZ)Z"},
-            {"SDLVideo", "SDL_SetWindowPosition", "(JII)Z"},
-            {"SDLVideo", "SDL_SetWindowSize", "(JII)Z"},
-            {"SDLVideo", "SDL_SetWindowTitle", "(JLjava/lang/CharSequence;)Z"},
-            {"SDLVideo", "SDL_SyncWindow", "(J)Z"},
-            {"SDLVulkan", "SDL_Vulkan_CreateSurface",
-                    "(JLorg/lwjgl/vulkan/VkInstance;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)Z"},
-            {"SDLVulkan", "SDL_Vulkan_GetInstanceExtensions", "()Lorg/lwjgl/PointerBuffer;"},
-            {"SDLVulkan", "SDL_Vulkan_GetPresentationSupport",
-                    "(Lorg/lwjgl/vulkan/VkInstance;Lorg/lwjgl/vulkan/VkPhysicalDevice;I)Z"},
-            {"SDLVulkan", "SDL_Vulkan_GetVkGetInstanceProcAddr", "()J"},
-            {"SDLVulkan", "SDL_Vulkan_LoadLibrary", "(Ljava/lang/CharSequence;)Z"},
-            {"SDLVulkan", "SDL_Vulkan_UnloadLibrary", "()V"},
-    };
+    public static final String UNSUPPORTED = PACKAGE + "BrowserSdlUnsupported";
+    /** The usage lock section of the SDL bindings. */
+    public static final String ARTIFACT = "org.lwjgl:lwjgl-sdl";
 
     private LwjglSdlBrowserPatcher() {
     }
 
-    /** {@code org/lwjgl/sdl/<Owner>.<name><descriptor>} of every redirected entry point. */
-    public static Set<String> entryKeys() {
+    /** An SDL entry point: owner simple name in {@code org/lwjgl/sdl}, name and descriptor. */
+    record Entry(String owner, String name, String desc) {
+        String key() {
+            return PACKAGE + owner + "." + name + desc;
+        }
+
+        /** {@code SDLVideo.SDL_CreateWindow}: the form of seam.json's requiredEntries. */
+        String ownerAndName() {
+            return PACKAGE + owner + "." + name;
+        }
+    }
+
+    /**
+     * The SDL entry points of a usage lock: the {@code M org/lwjgl/sdl/<Owner>.SDL_*(...)} lines
+     * of its lwjgl-sdl section, sorted.
+     */
+    static List<Entry> entries(UsageLock lock) {
+        List<Entry> entries = new ArrayList<>();
+        for (String line : lock.library(ARTIFACT)) {
+            if (!line.startsWith("M " + PACKAGE)) {
+                continue;
+            }
+            String body = line.substring(2);
+            int paren = body.indexOf('(');
+            String qualified = body.substring(0, paren);
+            int dot = qualified.lastIndexOf('.');
+            String owner = qualified.substring(PACKAGE.length(), dot);
+            String name = qualified.substring(dot + 1);
+            if (name.startsWith("SDL_") && owner.indexOf('/') < 0) {
+                entries.add(new Entry(owner, name, body.substring(paren)));
+            }
+        }
+        return entries;
+    }
+
+    /**
+     * {@code org/lwjgl/sdl/<Owner>.<name><descriptor>} of every entry point of the active
+     * profile's usage lock (redirected or stubbed: none keeps its native body).
+     */
+    public static Set<String> entryKeys() throws IOException {
         Set<String> keys = new LinkedHashSet<>();
-        for (String[] entry : ENTRIES) {
-            keys.add(PACKAGE + entry[0] + "." + entry[1] + entry[2]);
+        for (Entry entry : entries(UsageLock.active())) {
+            keys.add(entry.key());
         }
         return Collections.unmodifiableSet(keys);
     }
 
     public static void main(String[] args) throws IOException {
-        if (args.length != 2) {
-            throw new IllegalArgumentException("usage: LwjglSdlBrowserPatcher INPUT_JAR OUTPUT_ROOT");
-        }
-        if (ENTRIES.length != ENTRY_COUNT || entryKeys().size() != ENTRY_COUNT) {
-            throw new IllegalStateException("SDL entry table has " + ENTRIES.length + " rows and "
-                    + entryKeys().size() + " distinct keys, expected " + ENTRY_COUNT);
+        if (args.length < 2 || args.length > 3) {
+            throw new IllegalArgumentException(
+                    "usage: LwjglSdlBrowserPatcher INPUT_JAR OUTPUT_ROOT [USAGE_LOCK]");
         }
         String jar = args[0];
         Path root = Path.of(args[1]);
-        requireBrowserTargets(jar);
-        patchLibraryInitializer(jar, root.resolve(SDL + ".class"));
-        int replaced = redirectEntries(jar, root);
-        if (replaced != ENTRY_COUNT) {
-            throw new IllegalStateException("Redirected " + replaced + " SDL entry points, expected "
-                    + ENTRY_COUNT);
+        UsageLock lock = args.length == 3 ? UsageLock.read(Path.of(args[2])) : UsageLock.active();
+        List<Entry> entries = entries(lock);
+        if (entries.isEmpty()) {
+            throw new IllegalStateException(lock.file() + " lists no SDL entry point of " + ARTIFACT
+                    + "; regenerate it (bash port/tools/extrefs/extrefs.sh usage " + lock.profile() + " --write)");
         }
-        System.out.println("LwjglSdlBrowserPatcher: redirected " + replaced
-                + " SDL entry points to " + BROWSER + "; SDL.<clinit> loads no native library");
+        Set<String> targets = browserTargets(jar);
+        List<Entry> redirected = new ArrayList<>();
+        List<Entry> stubbed = new ArrayList<>();
+        for (Entry entry : entries) {
+            (targets.contains(entry.name() + entry.desc()) ? redirected : stubbed).add(entry);
+        }
+        Set<String> required = new LinkedHashSet<>();
+        for (String requirement : lock.seamRequiredEntries()) {
+            if (requirement.startsWith(PACKAGE)) {
+                required.add(requirement);
+            }
+        }
+        List<String> unmet = new ArrayList<>();
+        for (String requirement : required) {
+            boolean used = false;
+            boolean implemented = false;
+            for (Entry entry : entries) {
+                if (entry.ownerAndName().equals(requirement)) {
+                    used = true;
+                    implemented |= redirected.contains(entry);
+                }
+            }
+            if (!used) {
+                unmet.add(requirement + " (vanilla does not use it)");
+            } else if (!implemented) {
+                unmet.add(requirement + " (" + BROWSER + " does not implement it)");
+            }
+        }
+        if (!unmet.isEmpty()) {
+            throw new IllegalStateException("REQUIRED SDL entry points of the " + lock.profile()
+                    + " seams are not redirected: " + String.join(", ", unmet));
+        }
+        if (!stubbed.isEmpty()) {
+            read(jar, UNSUPPORTED + ".class");
+        }
+        patchLibraryInitializer(jar, root.resolve(SDL + ".class"));
+        int replaced = rewriteEntries(jar, root, redirected, stubbed);
+        if (replaced != entries.size()) {
+            throw new IllegalStateException("Rewrote " + replaced + " SDL entry points, the usage lock lists "
+                    + entries.size());
+        }
+        for (Entry entry : stubbed) {
+            System.out.println("SDL_FEATURE_STUB " + entry.owner() + "." + entry.name() + entry.desc());
+        }
+        System.out.println("LwjglSdlBrowserPatcher: redirected " + redirected.size() + " SDL entry points to "
+                + BROWSER + " and stubbed " + stubbed.size() + " (FEATURE) of the " + entries.size()
+                + " in " + lock.file().getFileName() + " of " + lock.profile() + " (" + required.size()
+                + " REQUIRED by seams); SDL.<clinit> loads no native library");
     }
 
-    private static void requireBrowserTargets(String jar) throws IOException {
+    private static Set<String> browserTargets(String jar) throws IOException {
         ClassNode browser = read(jar, BROWSER + ".class");
         Set<String> targets = new LinkedHashSet<>();
         for (MethodNode method : browser.methods) {
@@ -190,16 +186,7 @@ public final class LwjglSdlBrowserPatcher {
                 targets.add(method.name + method.desc);
             }
         }
-        List<String> missing = new ArrayList<>();
-        for (String[] entry : ENTRIES) {
-            if (!targets.contains(entry[1] + entry[2])) {
-                missing.add(entry[0] + "." + entry[1] + entry[2]);
-            }
-        }
-        if (!missing.isEmpty()) {
-            throw new IllegalStateException(BROWSER + " is missing public static targets: "
-                    + String.join(", ", missing));
-        }
+        return targets;
     }
 
     private static void patchLibraryInitializer(String jar, Path output) throws IOException {
@@ -243,24 +230,29 @@ public final class LwjglSdlBrowserPatcher {
         write(node, output);
     }
 
-    private static int redirectEntries(String jar, Path root) throws IOException {
-        Map<String, Map<String, Boolean>> byOwner = new LinkedHashMap<>();
-        for (String[] entry : ENTRIES) {
-            byOwner.computeIfAbsent(entry[0], owner -> new LinkedHashMap<>())
-                    .put(entry[1] + entry[2], Boolean.FALSE);
+    private static int rewriteEntries(String jar, Path root, List<Entry> redirected, List<Entry> stubbed)
+            throws IOException {
+        // Owner -> (name + descriptor -> redirect?), owners in name order for a stable log.
+        Map<String, Map<String, Boolean>> byOwner = new TreeMap<>();
+        for (Entry entry : redirected) {
+            byOwner.computeIfAbsent(entry.owner(), owner -> new LinkedHashMap<>()).put(entry.name() + entry.desc(), true);
+        }
+        for (Entry entry : stubbed) {
+            byOwner.computeIfAbsent(entry.owner(), owner -> new LinkedHashMap<>()).put(entry.name() + entry.desc(), false);
         }
         int replaced = 0;
         for (Map.Entry<String, Map<String, Boolean>> owner : byOwner.entrySet()) {
             String className = PACKAGE + owner.getKey();
             ClassNode node = read(jar, className + ".class");
             Map<String, Boolean> wanted = owner.getValue();
+            Set<String> done = new LinkedHashSet<>();
             for (MethodNode method : node.methods) {
                 String key = method.name + method.desc;
-                Boolean seen = wanted.get(key);
-                if (seen == null) {
+                Boolean redirect = wanted.get(key);
+                if (redirect == null) {
                     continue;
                 }
-                if (seen) {
+                if (!done.add(key)) {
                     throw new IllegalStateException("Duplicate method " + className + "." + key);
                 }
                 if ((method.access & (Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC))
@@ -268,16 +260,19 @@ public final class LwjglSdlBrowserPatcher {
                         || (method.access & (Opcodes.ACC_NATIVE | Opcodes.ACC_ABSTRACT)) != 0) {
                     throw new IllegalStateException(className + "." + key + " is not a public static method");
                 }
-                delegate(method);
-                wanted.put(key, Boolean.TRUE);
+                if (redirect) {
+                    delegate(method);
+                } else {
+                    stub(method, owner.getKey() + "." + key);
+                }
                 replaced++;
             }
             List<String> missing = new ArrayList<>();
-            wanted.forEach((key, done) -> {
-                if (!done) {
+            for (String key : wanted.keySet()) {
+                if (!done.contains(key)) {
                     missing.add(className + "." + key);
                 }
-            });
+            }
             if (!missing.isEmpty()) {
                 throw new IllegalStateException("SDL entry points not found: " + String.join(", ", missing));
             }
@@ -296,6 +291,16 @@ public final class LwjglSdlBrowserPatcher {
         code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, BROWSER, method.name, method.desc, false));
         code.add(new InsnNode(Type.getReturnType(method.desc).getOpcode(Opcodes.IRETURN)));
         replace(method, code, Math.max(2, local));
+    }
+
+    /** {@code throw BrowserSdlUnsupported.entry("<Owner>.<name><descriptor>");} */
+    private static void stub(MethodNode method, String entry) {
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(entry));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, UNSUPPORTED, "entry",
+                "(Ljava/lang/String;)Ljava/lang/UnsupportedOperationException;", false));
+        code.add(new InsnNode(Opcodes.ATHROW));
+        replace(method, code, 1);
     }
 
     private static ClassNode read(String jarPath, String entryName) throws IOException {

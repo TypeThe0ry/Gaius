@@ -13,8 +13,11 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from verification_profiles import CANONICAL_ID, LEGACY_ID, RENDERPEARL_ID
+UNKNOWN_PROFILE_ID = f"{max(int(profile.split('.')[0]) for profile in (CANONICAL_ID, LEGACY_ID, RENDERPEARL_ID)) + 1}.1"
 
-SCRIPT = Path(__file__).resolve().with_name("quick-check.py")
+
+SCRIPT = Path(__file__).resolve().parent / "legacy" / "quick-check.py"
 SPEC = importlib.util.spec_from_file_location("gaius_quick_check", SCRIPT)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"cannot import {SCRIPT}")
@@ -154,20 +157,20 @@ def check_profile_scoped_defaults() -> None:
             os.environ.pop(key, None)
         base = QUICK_CHECK.PORT / "target"
         require(
-            QUICK_CHECK._profile_scoped_default(base, "1.21.11") == base,
+            QUICK_CHECK._profile_scoped_default(base, LEGACY_ID) == base,
             "legacy quick-check target default unexpectedly became profile-scoped",
         )
 
-        os.environ["GAIUS_VERSION_PROFILE_PATH"] = "versions/1.21.11.json"
+        os.environ["GAIUS_VERSION_PROFILE_PATH"] = ("versions/" + LEGACY_ID + ".json")
         require(
-            QUICK_CHECK._profile_scoped_default(base, "1.21.11") == base / "1.21.11",
+            QUICK_CHECK._profile_scoped_default(base, LEGACY_ID) == base / LEGACY_ID,
             "GAIUS_VERSION_PROFILE_PATH did not select a profile-scoped target",
         )
 
         os.environ.pop("GAIUS_VERSION_PROFILE_PATH")
-        os.environ["GAIUS_BUILD_ROOT"] = "port/target/1.21.11"
+        os.environ["GAIUS_BUILD_ROOT"] = ("port/target/" + LEGACY_ID + "")
         require(
-            QUICK_CHECK._profile_scoped_default(base, "1.21.11") == base / "1.21.11",
+            QUICK_CHECK._profile_scoped_default(base, LEGACY_ID) == base / LEGACY_ID,
             "GAIUS_BUILD_ROOT did not select a profile-scoped target",
         )
 
@@ -203,15 +206,15 @@ def check_release_pom_contract() -> None:
 def check_manifest_top_level_identity() -> None:
     storage = {
         "schema": 2,
-        "databaseName": "gaius-fs-v2-26.2",
-        "prefix": "gaius.fs.v2:26.2:",
-        "opfsDirectory": "regions-v2-26.2",
+        "databaseName": ("gaius-fs-v2-" + CANONICAL_ID + ""),
+        "prefix": ("gaius.fs.v2:" + CANONICAL_ID + ":"),
+        "opfsDirectory": ("regions-v2-" + CANONICAL_ID + ""),
     }
     expected = {
         "schemaVersion": 2,
         "profile": {
-            "id": "26.2",
-            "path": "versions/26.2.json",
+            "id": CANONICAL_ID,
+            "path": ("versions/" + CANONICAL_ID + ".json"),
             "sha256": "a" * 64,
             "clientDistribution": "named",
             "protocolVersion": 776,
@@ -228,8 +231,8 @@ def check_manifest_top_level_identity() -> None:
         "compatibilitySha256": "e" * 64,
     }
     manifest = {
-        "profile": "26.2",
-        "profilePath": "versions/26.2.json",
+        "profile": CANONICAL_ID,
+        "profilePath": ("versions/" + CANONICAL_ID + ".json"),
         "worldVersion": 4903,
         "worldgenTelemetryMode": "task-pulsed",
         "storage": storage,
@@ -296,31 +299,31 @@ def overlay_bytecode_check_names() -> set[str]:
 
 def check_profile_rules() -> None:
     rules = QUICK_CHECK.PROFILE_RULES
-    require(set(rules) >= {"1.21.11", "26.2", "26.3"}, "a supported profile has no quick-check rules")
-    require(QUICK_CHECK.is_named_family("26.2"), "26.2 is not in the named family")
-    require(QUICK_CHECK.is_named_family("26.3"), "26.3 is not in the named family")
-    require(not QUICK_CHECK.is_named_family("1.21.11"), "1.21.11 was judged by the named rules")
-    require(not QUICK_CHECK.is_named_family("27.1"), "an unknown profile was judged by the named rules")
-    require(QUICK_CHECK.profile_rules("27.1") is None, "an unknown profile has rules")
+    require(set(rules) >= {LEGACY_ID, CANONICAL_ID, RENDERPEARL_ID}, "a supported profile has no quick-check rules")
+    require(QUICK_CHECK.is_named_family(CANONICAL_ID), ("" + CANONICAL_ID + " is not in the named family"))
+    require(QUICK_CHECK.is_named_family(RENDERPEARL_ID), ("" + RENDERPEARL_ID + " is not in the named family"))
+    require(not QUICK_CHECK.is_named_family(LEGACY_ID), ("" + LEGACY_ID + " was judged by the named rules"))
+    require(not QUICK_CHECK.is_named_family(UNKNOWN_PROFILE_ID), "an unknown profile was judged by the named rules")
+    require(QUICK_CHECK.profile_rules(UNKNOWN_PROFILE_ID) is None, "an unknown profile has rules")
     require(
-        rules["26.3"].window_library == ("lwjgl_sdl", "org.lwjgl:lwjgl-sdl")
-        and rules["26.2"].window_library == ("lwjgl_glfw", "org.lwjgl:lwjgl-glfw"),
+        rules[RENDERPEARL_ID].window_library == ("lwjgl_sdl", "org.lwjgl:lwjgl-sdl")
+        and rules[CANONICAL_ID].window_library == ("lwjgl_glfw", "org.lwjgl:lwjgl-glfw"),
         "window library per profile changed",
     )
     require(
-        rules["26.3"].render_api == "renderpearl" and rules["26.2"].render_api == "blaze3d",
+        rules[RENDERPEARL_ID].render_api == "renderpearl" and rules[CANONICAL_ID].render_api == "blaze3d",
         "render API per profile changed",
     )
     require(
-        rules["26.3"].authlib_session[0].startswith("com.mojang.authlib.services.")
-        and rules["26.2"].authlib_session[0].startswith("com.mojang.authlib.yggdrasil."),
+        rules[RENDERPEARL_ID].authlib_session[0].startswith("com.mojang.authlib.services.")
+        and rules[CANONICAL_ID].authlib_session[0].startswith("com.mojang.authlib.yggdrasil."),
         "authlib session service per profile changed",
     )
-    require(not rules["26.2"].not_applicable, "26.2 must be judged by every named-family rule")
-    require(not rules["26.2"].domain_modules, "26.2 unexpectedly dispatches domain modules")
+    require(not rules[CANONICAL_ID].not_applicable, ("" + CANONICAL_ID + " must be judged by every named-family rule"))
+    require(not rules[CANONICAL_ID].domain_modules, ("" + CANONICAL_ID + " unexpectedly dispatches domain modules"))
     require(
-        rules["26.3"].domain_modules == ("render", "input", "terrain", "worldgen", "server", "ui"),
-        "26.3 does not dispatch the six wave-1 domain modules",
+        rules[RENDERPEARL_ID].domain_modules == ("render", "input", "terrain", "worldgen", "server", "ui"),
+        ("" + RENDERPEARL_ID + " does not dispatch the six wave-1 domain modules"),
     )
     names = overlay_bytecode_check_names()
     for profile_id, profile in rules.items():
@@ -352,27 +355,27 @@ def check_not_applicable_reporting() -> None:
         QUICK_CHECK.FAILURES.clear()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            QUICK_CHECK.report_profile_checks("26.3", checks)
+            QUICK_CHECK.report_profile_checks(RENDERPEARL_ID, checks)
         require(
             QUICK_CHECK.FAILURES == [shared],
             f"26.3 not-applicable reporting failed the wrong checks: {QUICK_CHECK.FAILURES}",
         )
         require(
             all(f"N/A {name} [26.3: " in output.getvalue() for name in names),
-            "a not-applicable 26.3 check was not reported with its reason",
+            ("a not-applicable " + RENDERPEARL_ID + " check was not reported with its reason"),
         )
 
         QUICK_CHECK.FAILURES.clear()
         with contextlib.redirect_stdout(io.StringIO()):
-            QUICK_CHECK.report_profile_checks("26.2", checks)
+            QUICK_CHECK.report_profile_checks(CANONICAL_ID, checks)
         require(
             QUICK_CHECK.FAILURES == [name for name, ok in checks if not ok],
-            "26.2 skipped a named-family rule that is only not applicable to 26.3",
+            ("" + CANONICAL_ID + " skipped a named-family rule that is only not applicable to " + RENDERPEARL_ID + ""),
         )
 
         QUICK_CHECK.FAILURES.clear()
         with contextlib.redirect_stdout(io.StringIO()):
-            QUICK_CHECK.report_profile_checks("26.3", checks[1:])
+            QUICK_CHECK.report_profile_checks(RENDERPEARL_ID, checks[1:])
         require(
             QUICK_CHECK.FAILURES
             == [shared, f"26.3 not-applicable entry names an existing check: {names[0]}"],
@@ -383,15 +386,15 @@ def check_not_applicable_reporting() -> None:
 
 
 def check_unknown_profile_fails_closed(root: Path) -> None:
-    write_profile(root, "27.1", "named")
-    write_version(root, "27.1", "named", {
+    write_profile(root, UNKNOWN_PROFILE_ID, "named")
+    write_version(root, UNKNOWN_PROFILE_ID, "named", {
         "lwjgl": "3.4.9",
         "netty": "4.2.20.Final",
         "authlib": "11.0.1",
         "joml": "1.10.9",
         "patchy": "2.2.10",
     }, window_module="lwjgl-sdl", lwjgl_classifier=None)
-    set_active_profile(root, "27.1")
+    set_active_profile(root, UNKNOWN_PROFILE_ID)
     try:
         QUICK_CHECK.resolve_overlay_paths(root)
     except QUICK_CHECK.OverlayResolutionError as exc:
@@ -408,39 +411,39 @@ def check_263_resolution(root: Path) -> None:
         "joml": "1.10.9",
         "patchy": "2.2.10",
     }
-    write_profile(root, "26.3", "named")
+    write_profile(root, RENDERPEARL_ID, "named")
     # 26.3 ships the plain lwjgl core jar and lwjgl-sdl; it has no lwjgl-glfw.
-    write_version(root, "26.3", "named", versions_263, window_module="lwjgl-sdl", lwjgl_classifier=None)
-    set_active_profile(root, "26.3")
+    write_version(root, RENDERPEARL_ID, "named", versions_263, window_module="lwjgl-sdl", lwjgl_classifier=None)
+    set_active_profile(root, RENDERPEARL_ID)
     resolved = QUICK_CHECK.resolve_overlay_paths(root)
     libraries = resolved["libraries"]
-    require(resolved["version"] == "26.3", "active 26.3 profile was not selected")
-    require("lwjgl_glfw" not in libraries, "26.3 resolution still requires lwjgl-glfw")
+    require(resolved["version"] == RENDERPEARL_ID, ("active " + RENDERPEARL_ID + " profile was not selected"))
+    require("lwjgl_glfw" not in libraries, ("" + RENDERPEARL_ID + " resolution still requires lwjgl-glfw"))
     require(
         libraries["lwjgl_sdl"]
         == root / "work" / "overlays" / "libraries" / "org/lwjgl/lwjgl-sdl/3.4.3/lwjgl-sdl-3.4.3.jar",
-        "26.3 lwjgl-sdl overlay path is not profile-derived",
+        ("" + RENDERPEARL_ID + " lwjgl-sdl overlay path is not profile-derived"),
     )
     require(
         libraries["lwjgl"].name == "lwjgl-3.4.3.jar"
         and "10.0.77" in str(libraries["authlib"]),
-        "26.3 library overlay versions were not resolved",
+        ("" + RENDERPEARL_ID + " library overlay versions were not resolved"),
     )
     require(
         list(resolved["expected_paths"])[:3] == ["client", "lwjgl", "lwjgl_sdl"],
-        "26.3 expected overlay order changed",
+        ("" + RENDERPEARL_ID + " expected overlay order changed"),
     )
-    require(not QUICK_CHECK.missing_overlay_paths(resolved), "complete 26.3 fixture is missing artifacts")
+    require(not QUICK_CHECK.missing_overlay_paths(resolved), ("complete " + RENDERPEARL_ID + " fixture is missing artifacts"))
 
     # A 26.3 metadata file that still lists lwjgl-glfw (a 26.2 copy) must not
     # satisfy the SDL window module.
-    write_version(root, "26.3", "named", versions_263, window_module="lwjgl-glfw", lwjgl_classifier=None)
+    write_version(root, RENDERPEARL_ID, "named", versions_263, window_module="lwjgl-glfw", lwjgl_classifier=None)
     try:
         QUICK_CHECK.resolve_overlay_paths(root)
     except QUICK_CHECK.OverlayResolutionError as exc:
         require("org.lwjgl:lwjgl-sdl" in str(exc), f"unexpected resolver error: {exc}")
     else:
-        raise AssertionError("26.3 resolved without an lwjgl-sdl library")
+        raise AssertionError(("" + RENDERPEARL_ID + " resolved without an lwjgl-sdl library"))
 
 
 @hermetic_gaius_environment()
@@ -467,47 +470,47 @@ def main() -> None:
 
     with TemporaryDirectory(prefix="gaius-quick-check-") as temporary:
         root = Path(temporary)
-        write_profile(root, "26.2", "named")
-        write_profile(root, "1.21.11", "obfuscated-with-mappings")
-        write_version(root, "26.2", "named", current_versions)
-        write_version(root, "1.21.11", "obfuscated-with-mappings", legacy_versions)
+        write_profile(root, CANONICAL_ID, "named")
+        write_profile(root, LEGACY_ID, "obfuscated-with-mappings")
+        write_version(root, CANONICAL_ID, "named", current_versions)
+        write_version(root, LEGACY_ID, "obfuscated-with-mappings", legacy_versions)
 
-        set_active_profile(root, "26.2")
+        set_active_profile(root, CANONICAL_ID)
         resolved = QUICK_CHECK.resolve_overlay_paths(root)
-        require(resolved["version"] == "26.2", "active 26.2 profile was not selected")
-        require(resolved["client_distribution"] == "named", "26.2 distribution was not selected")
+        require(resolved["version"] == CANONICAL_ID, ("active " + CANONICAL_ID + " profile was not selected"))
+        require(resolved["client_distribution"] == "named", ("" + CANONICAL_ID + " distribution was not selected"))
         require(
             resolved["client"]
-            == root / "work" / "overlays" / "client-named-26.2-gaius.jar",
-            "26.2 client overlay path is not profile-derived",
+            == root / "work" / "overlays" / ("client-named-" + CANONICAL_ID + "-gaius.jar"),
+            ("" + CANONICAL_ID + " client overlay path is not profile-derived"),
         )
         require(
             "3.4.1" in str(resolved["libraries"]["lwjgl"])
             and "4.2.15.Final" in str(resolved["libraries"]["netty_transport"])
             and "9.0.75" in str(resolved["libraries"]["authlib"]),
-            "26.2 library overlay versions were not resolved",
+            ("" + CANONICAL_ID + " library overlay versions were not resolved"),
         )
-        require(not QUICK_CHECK.missing_overlay_paths(resolved), "complete 26.2 fixture is missing artifacts")
+        require(not QUICK_CHECK.missing_overlay_paths(resolved), ("complete " + CANONICAL_ID + " fixture is missing artifacts"))
 
-        set_active_profile(root, "1.21.11")
+        set_active_profile(root, LEGACY_ID)
         resolved = QUICK_CHECK.resolve_overlay_paths(root)
-        require(resolved["version"] == "1.21.11", "profile switch to 1.21.11 was not selected")
+        require(resolved["version"] == LEGACY_ID, ("profile switch to " + LEGACY_ID + " was not selected"))
         require(
             resolved["client"]
-            == root / "work" / "overlays" / "client-named-1.21.11-gaius.jar",
+            == root / "work" / "overlays" / ("client-named-" + LEGACY_ID + "-gaius.jar"),
             "legacy client overlay path is not profile-derived",
         )
         require(
             "3.3.3" in str(resolved["libraries"]["lwjgl"])
             and "4.2.7.Final" in str(resolved["libraries"]["netty_transport"])
             and "7.0.61" in str(resolved["libraries"]["authlib"]),
-            "1.21.11 library overlay versions were not resolved",
+            ("" + LEGACY_ID + " library overlay versions were not resolved"),
         )
 
-        set_active_profile(root, "26.2")
-        current_client = root / "work" / "overlays" / "client-named-26.2-gaius.jar"
+        set_active_profile(root, CANONICAL_ID)
+        current_client = root / "work" / "overlays" / ("client-named-" + CANONICAL_ID + "-gaius.jar")
         current_client.unlink()
-        (root / "work" / "overlays" / "client-named-1.21.11-gaius.jar").write_bytes(
+        (root / "work" / "overlays" / ("client-named-" + LEGACY_ID + "-gaius.jar")).write_bytes(
             b"old overlay must not satisfy current profile"
         )
         resolved = QUICK_CHECK.resolve_overlay_paths(root)
@@ -525,7 +528,7 @@ def main() -> None:
             "joml": "1.10.9",
             "patchy": "2.2.11",
         }
-        write_version(root, "26.2", "named", changed_versions)
+        write_version(root, CANONICAL_ID, "named", changed_versions)
         resolved = QUICK_CHECK.resolve_overlay_paths(root)
         require(
             all(

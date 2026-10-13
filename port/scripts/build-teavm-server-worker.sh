@@ -92,15 +92,18 @@ staged_dist="$staging_root/dist"
 mkdir -p "$staged_dist"
 
 # TeaVM keeps dependency JARs open throughout whole-program analysis. Prevent
-# another build from truncating and replacing an overlay while it is being read.
-overlay_lock="$root/port/work/.build-overlays.lock"
+# another build from truncating and replacing an overlay while it is being read
+# (the writer lock of the overlay directory, overlay-lock.sh).
+source "$root/port/scripts/overlay-lock.sh"
+overlay_lock=""
 release_overlay_lock() {
   if [[ -n "${overlay_lock_owner:-}" ]]; then
-    gaius_teavm_lock_release "$overlay_lock" "$overlay_lock_owner"
+    gaius_overlay_lock_release "$overlay_lock" "$overlay_lock_owner"
   fi
 }
-gaius_teavm_lock_acquire "$overlay_lock"
-overlay_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+gaius_overlay_lock_acquire "$root" "$overlay_directory"
+overlay_lock="$GAIUS_OVERLAY_LOCK_PATH"
+overlay_lock_owner="$GAIUS_OVERLAY_LOCK_OWNER_TOKEN"
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
@@ -122,6 +125,11 @@ awk 'index($0, "data/") == 1 \
 LC_ALL=C sort -u -o "$server_resource_list_tmp" "$server_resource_list_tmp"
 mv "$server_resource_list_tmp" "$server_resource_list"
 assert_java_sorted_resource_list "$server_resource_list"
+# MinecraftResourceSupplier prefers the embedded list when it exists.  That list is
+# generated for the client and intentionally excludes most data resources; leaving a
+# stale copy in the server resource directory makes the server silently lose tags and
+# other world data.  The server must use its complete filtered resource list above.
+rm -f "$server_resources/dev/gaius/browser/minecraft-embedded-resources.txt"
 export GAIUS_POM="$server_target/generated-pom.xml"
 # The Worker role's TeaVM compiler options come from the role table in
 # generate-pom.sh (POM <properties>); GAIUS_TEAVM_WORKER_<OPTION> overrides one

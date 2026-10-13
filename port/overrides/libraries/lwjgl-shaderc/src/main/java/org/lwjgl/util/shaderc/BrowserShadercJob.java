@@ -23,6 +23,12 @@ public final class BrowserShadercJob {
     public static final int OP_GENERATE_DEBUG_INFO = 4;
     /** shaderc_compile_options_set_optimization_level(options, a). */
     public static final int OP_OPTIMIZATION_LEVEL = 5;
+    /**
+     * shaderc_compile_options_set_auto_map_locations(options, a != 0). Only toolchain modules that
+     * export it accept this op ({@code __gaiusShaderToolchain.shadercSupportsOption(6)}); an older
+     * module fails the job with an error that names the missing export.
+     */
+    public static final int OP_AUTO_MAP_LOCATIONS = 6;
 
     /** shaderc_compilation_status_success. */
     public static final int STATUS_SUCCESS = 0;

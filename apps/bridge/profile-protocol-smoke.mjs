@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE, LEGACY_PROFILE, RENDERPEARL_PROFILE} from "../../port/scripts/verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {spawn} from "node:child_process";
@@ -10,9 +11,6 @@ import {fileURLToPath, pathToFileURL} from "node:url";
 import {WebSocket} from "./node_modules/ws/wrapper.mjs";
 import {
   decodeClientboundLoginDistances,
-  MINECRAFT_1_21_11 as RELAY_MINECRAFT_1_21_11,
-  MINECRAFT_26_2 as RELAY_MINECRAFT_26_2,
-  MINECRAFT_26_3 as RELAY_MINECRAFT_26_3,
   MINECRAFT_PROFILES as RELAY_MINECRAFT_PROFILES,
   resolveMinecraftProfile,
 } from "./dist/protocol.js";
@@ -32,6 +30,8 @@ const directory = fileURLToPath(new URL(".", import.meta.url));
 const origin = "http://127.0.0.1:8781";
 const token = "profile-smoke-token";
 const profiles = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3];
+const [RELAY_MINECRAFT_1_21_11, RELAY_MINECRAFT_26_2, RELAY_MINECRAFT_26_3] =
+  profiles.map(profile => resolveMinecraftProfile(profile.protocolVersion));
 const relayProfiles = [RELAY_MINECRAFT_1_21_11, RELAY_MINECRAFT_26_2, RELAY_MINECRAFT_26_3];
 
 const bridgeSource = await readFile(new URL("./dist/main.js", import.meta.url), "utf8");
@@ -147,7 +147,7 @@ const configurationIds774And776 = {
 };
 const expected = {
   774: {
-    name: "1.21.11",
+    name: LEGACY_PROFILE.id,
     worldVersion: 4671,
     resourcePackVersion: "75.0",
     dataPackVersion: "94.1",
@@ -176,7 +176,7 @@ const expected = {
     },
   },
   776: {
-    name: "26.2",
+    name: CANONICAL_PROFILE.id,
     worldVersion: 4903,
     resourcePackVersion: "88.0",
     dataPackVersion: "107.1",
@@ -205,7 +205,7 @@ const expected = {
     },
   },
   777: {
-    name: "26.3",
+    name: RENDERPEARL_PROFILE.id,
     worldVersion: 5023,
     resourcePackVersion: "97.1",
     dataPackVersion: "121.0",
@@ -301,17 +301,17 @@ assert.throws(() => resolveMinecraftProtocol(778), /Unsupported Minecraft protoc
 assert.equal(resolveMinecraftProfile(775), undefined);
 assert.equal(resolveMinecraftProfile(778), undefined);
 assert.throws(
-  () => resolveMinecraftProtocol({name: "26.2", protocolVersion: 774}),
+  () => resolveMinecraftProtocol({name: CANONICAL_PROFILE.id, protocolVersion: 774}),
   /name\/protocol mismatch/,
 );
 assert.throws(
-  () => resolveMinecraftProtocol({name: "26.3", protocolVersion: 776}),
+  () => resolveMinecraftProtocol({name: RENDERPEARL_PROFILE.id, protocolVersion: 776}),
   /name\/protocol mismatch/,
 );
 assert.notDeepEqual(
   {...RELAY_MINECRAFT_26_3.configuration},
   {...RELAY_MINECRAFT_26_2.configuration},
-  "26.3 must not reuse the 26.2 CONFIGURATION table",
+  "" + RENDERPEARL_PROFILE.id + " must not reuse the " + CANONICAL_PROFILE.id + " CONFIGURATION table",
 );
 
 const loginDistanceFixture = Buffer.concat([

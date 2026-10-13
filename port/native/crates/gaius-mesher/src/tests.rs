@@ -154,3 +154,28 @@ fn scenes_mesh_every_path_and_repeat_exactly() {
         assert_eq!(layer(&flat, 0).0, layer(&a, 0).0);
     }
 }
+
+#[test]
+fn incompatible_vertex_layouts_decline_before_emitting_geometry() {
+    let mut job = SectionJobData::empty(7);
+    job.set(1, 1, 1, STONE);
+    for semantics in crate::VERTEX_LAYOUTS
+        .iter()
+        .filter(|(_, stride)| *stride != 28)
+        .map(|(code, _)| *code)
+        .chain([u16::MAX])
+    {
+        let mut source = table();
+        source.semantics = semantics;
+        let mut kernel = Kernel::new();
+        kernel
+            .load_model_table(&TableWriter { table: source }.encode())
+            .unwrap();
+        let result = kernel.mesh_section(&job.encode()).unwrap();
+        assert_eq!(u32_at(&result, 0), STATUS_NEEDS_VANILLA);
+        assert_eq!(u32_at(&result, 52), STONE);
+        assert_eq!(result.len(), output::RESULT_HEADER_LEN);
+        let empty = kernel.mesh_section(&SectionJobData::empty(7).encode()).unwrap();
+        assert_eq!(u32_at(&empty, 0), STATUS_MESHED);
+    }
+}

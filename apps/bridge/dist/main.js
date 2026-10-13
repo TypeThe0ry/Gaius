@@ -11,6 +11,7 @@ import { WebSocket, WebSocketServer, } from "ws";
 import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost, parseConnectRequest, } from "./policy.js";
 import { MINECRAFT_PROFILES, resolveMinecraftProfile } from "./protocol.js";
+import {MAXIMUM_CONNECT_CONTROL_BYTES, sessionProtocolAcknowledgement} from "./session-protocol.js";
 import { MinecraftFrameAccumulator } from "./framed-stream.js";
 const config = loadConfig();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
@@ -88,6 +89,7 @@ const relayCapabilities = [
     "resource-pack-cache",
     "public-target-guard",
     "target-attestation",
+    "session-protocol-table-v1",
     "runtime-telemetry",
 ];
 // `ServerboundClientTickEndPacket` is emitted once per client tick. A resource
@@ -809,7 +811,7 @@ function createPayloadlessMinecraftFrame(packetId, compressed) {
     return Buffer.concat([encodeMinecraftVarInt(body.byteLength), body]);
 }
 
-function inspectMinecraftHandshake(frame) {
+function inspectMinecraftHandshake(frame, declaration) {
     const parsed = readMinecraftFrame(frame);
     if (parsed === undefined || parsed === null) {
         return {
@@ -848,7 +850,10 @@ function inspectMinecraftHandshake(frame) {
         state: "complete",
         handshake: {
             protocolVersion: protocolVersion.value,
-            profile: resolveMinecraftProfile(protocolVersion.value),
+            profile: declaration === undefined
+                ? resolveMinecraftProfile(protocolVersion.value)
+                : declaration.profile.protocolVersion === protocolVersion.value
+                    ? declaration.profile : undefined,
             remainder: parsed.remainder,
         },
     };
@@ -1142,6 +1147,7 @@ webSocketServer.on("connection", (webSocket) => {
     // the legacy table before that handshake: an unknown or malformed profile
     // must stay an opaque raw TCP tunnel rather than receive a guessed rewrite.
     let minecraftProfile;
+    let sessionProtocolDeclaration;
     let minecraftHandshakeSeen = false;
     let keepAliveProxyOpaque = false;
     let keepAliveProxyEncryptionOpaque = false;
@@ -2035,12 +2041,16 @@ webSocketServer.on("connection", (webSocket) => {
             return;
         }
         try {
+            if (toBuffer(rawData).byteLength > MAXIMUM_CONNECT_CONTROL_BYTES) {
+                throw new TypeError("Connect control message exceeds 64 KiB");
+            }
             const request = parseConnectRequest(rawData.toString());
             tunnelRequest = request;
             if (!tokenMatches(request.token, config.accessToken)) {
                 closeBoth(1008, "Invalid bridge token");
                 return;
             }
+            sessionProtocolDeclaration = request.protocolTable;
             const localTunnel = parseLocalTunnelHost(request.host);
             if (localTunnel !== undefined) {
                 localTunnel.skinDescriptor = request.skinDescriptor;
@@ -2073,6 +2083,9 @@ webSocketServer.on("connection", (webSocket) => {
                 const candidate = tcpSocket.gaiusTarget ?? request;
                 webSocket.send(JSON.stringify({
                     type: "connected",
+                    ...(sessionProtocolDeclaration === undefined ? {} : {
+                        protocolTable: sessionProtocolAcknowledgement(sessionProtocolDeclaration),
+                    }),
                     host: request.host,
                     port: request.port,
                     candidateHost: candidate.host,
@@ -2512,7 +2525,7 @@ webSocketServer.on("connection", (webSocket) => {
                             : Buffer.concat([minecraftHandshakeBuffer, clientData]);
                         handshakeResult = isDefinitelyNotMinecraftHandshake(minecraftHandshakeBuffer)
                             ? { state: "raw" }
-                            : inspectMinecraftHandshake(minecraftHandshakeBuffer);
+                            : inspectMinecraftHandshake(minecraftHandshakeBuffer, sessionProtocolDeclaration);
                     }
                     if (handshakeResult.state === "incomplete" || handshakeResult.state === "raw") {
                         // Keep forwarding the raw chunk below while retaining only

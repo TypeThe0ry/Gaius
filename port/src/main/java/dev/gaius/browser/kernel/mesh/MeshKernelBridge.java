@@ -95,7 +95,7 @@ public final class MeshKernelBridge {
 
     /** True when sections should go to the mesh kernel. */
     public static boolean ready() {
-        if (disabled) {
+        if (disabled || !dev.gaius.browser.kernel.KernelMirror.enabled("mesher")) {
             return false;
         }
         boolean ready;
@@ -222,6 +222,9 @@ public final class MeshKernelBridge {
 
     /** Hands a new model table to the facade (copied there); false when the facade is missing. */
     public static boolean setTable(byte[] bytes, int length, int epoch) {
+        if (disabled || !dev.gaius.browser.kernel.KernelMirror.enabled("mesher")) {
+            return false;
+        }
         try {
             return facadeSetTable(bytes, length, epoch);
         } catch (RuntimeException error) {
@@ -236,6 +239,9 @@ public final class MeshKernelBridge {
      */
     public static boolean submit(int[] header, short[] ids16, int[] ids32, byte[] light, byte[] quarts,
             int[] palette, byte[] swamp, float[] floats) {
+        if (!ready()) {
+            return false;
+        }
         boolean sent;
         if (header[H_WIDE] != 0) {
             sent = facadeSubmitWide(header, ids32, light, quarts, palette, swamp, floats);
@@ -300,6 +306,31 @@ public final class MeshKernelBridge {
         JsArrays.readBack(targetView, target);
         return result;
     }
+
+    /**
+     * WebAssembly GC: copies the vanilla BLOCK vertices of {@code layer} straight into linear
+     * memory at {@code address}, a direct buffer's address of at least {@code capacity} bytes
+     * (BrowserMemory); returns the bytes copied, or -1 when the record has no vertices for the
+     * layer or they do not fit. One copy, where {@link #copyVertices} needs a Java array (on
+     * WebAssembly GC: a typed-array copy in, one out and the copy into the buffer).
+     */
+    public static int copyVerticesToLinear(JSObject record, int layer, long address, int capacity) {
+        JsArrays.installLinearViews();
+        return copyVerticesLinearJs(record, layer, (int) address, capacity);
+    }
+
+    @JSBody(params = {"record", "layer", "address", "capacity"}, script = ""
+            + "var names = ['solid', 'cutout', 'translucent'];"
+            + "if (!record.result) return -1;"
+            + "var l = record.result.layers[names[layer]];"
+            + "if (!l || !l.vertices) return -1;"
+            + "var v = l.vertices;"
+            + "if (v.byteLength > capacity) return -1;"
+            + "var linear = globalThis.__gaiusLinear;"
+            + "if (!linear.u8.length) { linear.refresh(); }"
+            + "linear.u8.set(new Uint8Array(v.buffer, v.byteOffset, v.byteLength), address >>> 0);"
+            + "return v.byteLength;")
+    private static native int copyVerticesLinearJs(JSObject record, int layer, int address, int capacity);
 
     /** Bytes of vanilla BLOCK vertices the record holds for {@code layer}; -1 when absent. */
     @JSBody(params = {"record", "layer"}, script = ""

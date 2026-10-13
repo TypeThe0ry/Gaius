@@ -59,6 +59,41 @@ if (!pluginVersion) {
 }
 
 const readme = await readText("README.md");
+const releasing = await readText("docs/releasing.md");
+const pagesWorkflow = await readText(".github/workflows/pages.yml");
+let jsTriggers;
+try {
+    jsTriggers = JSON.parse(await readFile(resolve(root, "port/scripts/release-js-triggers.json"), "utf8"));
+} catch (error) {
+    fail(`port/scripts/release-js-triggers.json: ${error.message}`);
+}
+if (releasing) {
+    for (const phrase of [
+        "GAIUS_TEAVM_MAX_HEAP=8g",
+        "GAIUS_TEAVM_MAX_HEAP=14g",
+        "--skip-pass=memory-packing",
+        "WebAssembly.validate",
+        "wasm-data-check",
+        "900,000,000",
+        "Gaius-site-<profile>.tar.gz",
+        "SHA256SUMS",
+    ]) {
+        if (!releasing.includes(phrase)) fail(`docs/releasing.md: missing v0.4 release requirement ${phrase}`);
+    }
+}
+if (pagesWorkflow && !pagesWorkflow.includes("--check-total pages-publish")) {
+    fail(".github/workflows/pages.yml: missing the 900 MB --check-total gate");
+}
+const triggerNames = Object.keys(jsTriggers?.triggers ?? {}).sort();
+if (JSON.stringify(triggerNames) !== JSON.stringify(["relay", "save", "security", "storage", "worker"])) {
+    fail(`release-js-triggers.json: unexpected trigger names ${JSON.stringify(triggerNames)}`);
+}
+for (const name of ["storage", "save", "relay", "security", "worker"]) {
+    if (!jsTriggers?.triggers?.[name] || !Array.isArray(jsTriggers.triggers[name].paths)
+        || !Array.isArray(jsTriggers.triggers[name].profileFields)) {
+        fail(`release-js-triggers.json: ${name} must define paths and profileFields`);
+    }
+}
 const requiredScreenshots = [
     "docs/images/gaius-main-menu.png",
     "docs/images/gaius-singleplayer.png",

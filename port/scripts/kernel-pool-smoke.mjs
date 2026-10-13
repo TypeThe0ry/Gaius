@@ -209,6 +209,7 @@ function createEnv({hardwareConcurrency = 8, delay = 1, rejectModuleClone = fals
     },
   });
   vm.runInContext(poolSource, context, {filename: "kernel-pool.js"});
+  context.GaiusKernelMirror = {enabled: () => true, allowed: () => true};
   const api = context.GaiusKernelPool;
   const pools = [];
   const create = async (options = {}, desc = {}) => {

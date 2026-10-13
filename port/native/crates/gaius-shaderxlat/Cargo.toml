@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [features]
-# The native corpus runner (src/bin/shaderxlat-corpus.rs).
+# The native corpus tools (src/bin/shaderxlat-corpus.rs, src/bin/shaderxlat-link.rs).
 corpus = ["dep:serde_json"]
 
 [dependencies]
@@ -16,6 +16,10 @@ serde_json = { version = "1", optional = true }
 
 [[bin]]
 name = "shaderxlat-corpus"
+required-features = ["corpus"]
+
+[[bin]]
+name = "shaderxlat-link"
 required-features = ["corpus"]
 
 # The browser build uses the workspace profile release-size (opt-level "s"): naga dominates

@@ -73,6 +73,8 @@ function createEnv({rejectModuleClone = false} = {}) {
     },
   });
   vm.runInContext(poolSource, context, {filename: "kernel-pool.js"});
+  context.__gaiusKernelSemantics = {schemaVersion: 1, profile: "fixture", kernels: {noise: {enabled: true}}};
+  vm.runInContext(readFileSync(join(kernelsDir, "kernel-mirror.js"), "utf8"), context);
   const create = (options) => context.GaiusKernelPool.create({moduleBytes, workerSource, ...options});
   const shutdown = async (pool) => {
     pool.terminate();

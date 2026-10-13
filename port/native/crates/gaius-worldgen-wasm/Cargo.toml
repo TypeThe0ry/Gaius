@@ -9,6 +9,9 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+native-host = []
+
 [dependencies]
 gaius-kernel-abi.workspace = true
 gaius-worldgen = { path = "../gaius-worldgen" }

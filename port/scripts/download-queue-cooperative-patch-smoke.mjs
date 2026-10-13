@@ -3,13 +3,10 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import path from "node:path";
-import {fileURLToPath} from "node:url";
+import {patcherSource} from "./patcher-sources.mjs";
 
-const root = fileURLToPath(new URL("../..", import.meta.url));
-const patcher = await readFile(
-  path.join(root, "port/tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java"),
-  "utf8",
-);
+// The modern patch set step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = patcherSource("Minecraft262BrowserPatcher");
 assert.match(
   patcher,
   /patchDownloadQueueBrowserCooperativeExecutor\(jar, root\)/,

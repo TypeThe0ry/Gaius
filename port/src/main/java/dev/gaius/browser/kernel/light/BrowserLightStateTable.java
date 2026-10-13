@@ -76,7 +76,7 @@ public final class BrowserLightStateTable {
             if (state == null) {
                 continue;
             }
-            int dampening = state.getLightDampening() & 15;
+            int dampening = LightVersionOps.INSTANCE.lightDampening(state) & 15;
             int emission = state.getLightEmission() & 15;
             int shapeClass = 0;
             if (state.canOcclude() && state.useShapeForLightOcclusion()) {

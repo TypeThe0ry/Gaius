@@ -32,9 +32,11 @@ import org.teavm.jso.JSFunctor;
 import org.teavm.jso.JSObject;
 import org.teavm.jso.typedarrays.ArrayBuffer;
 import org.teavm.jso.typedarrays.Float32Array;
+import org.teavm.jso.typedarrays.Float64Array;
 import org.teavm.jso.typedarrays.Int8Array;
 import org.teavm.jso.typedarrays.Int32Array;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.system.BrowserMemory;
 
 /** WebGL2 implementation used by patched LWJGL OpenGL entry points. */
 public final class BrowserOpenGL {
@@ -58,6 +60,37 @@ public final class BrowserOpenGL {
     private static String inventoryWorldRenderScreen;
     private static int nextSyntheticQuery = 1;
     private static int terrainBatchMode = -1;
+    /** Number indices of the packed Minecraft state report (see reportMinecraftStateJs). */
+    private static final int S_PLAYER_X = 0;
+    private static final int S_PLAYER_Y = 1;
+    private static final int S_PLAYER_Z = 2;
+    private static final int S_PLAYER_YAW = 3;
+    private static final int S_PLAYER_PITCH = 4;
+    private static final int S_PLAYER_COLLISION_KNOWN = 5;
+    private static final int S_PLAYER_COLLISION_FREE = 6;
+    private static final int S_SELECTED_SLOT = 7;
+    private static final int S_SELECTED_COUNT = 8;
+    private static final int S_SCREEN_WIDTH = 9;
+    private static final int S_SCREEN_HEIGHT = 10;
+    private static final int S_LOADED_CHUNK_COUNT = 11;
+    private static final int S_RAW_RENDER_DISTANCE = 12;
+    private static final int S_EFFECTIVE_RENDER_DISTANCE = 13;
+    private static final int S_RAW_SIMULATION_DISTANCE = 14;
+    private static final int S_SERVER_SIMULATION_DISTANCE = 15;
+    private static final int S_NO_RENDER = 16;
+    private static final int S_RUNNING = 17;
+    private static final int S_PAUSE = 18;
+    private static final int S_COUNT = 19;
+    private static final double[] MINECRAFT_STATE_VALUES = new double[S_COUNT];
+    /**
+     * WebAssembly GC: the text of each state report string field as last sent to JS, and the
+     * arguments of the next report; allocated at the first report (no static initializer code,
+     * so the JavaScript build is unchanged).
+     */
+    private static String[] minecraftStateSent;
+    private static String[] minecraftStateArguments;
+    /** WebAssembly GC: the empty array of zero-length pointer uploads. */
+    private static Int8Array emptyBytes;
     /**
      * mapBufferRange staging is served from power-of-two size classes (4 KiB to 16 MiB)
      * kept across maps, capped at MAPPED_POOL_MAX_BYTES of idle storage; larger maps
@@ -67,7 +100,7 @@ public final class BrowserOpenGL {
     private static final int MAP_INVALIDATE_BUFFER_BIT = 0x0008;
     private static final int MAPPED_POOL_MIN_SHIFT = 12;
     private static final int MAPPED_POOL_MAX_SHIFT = 24;
-    private static final long MAPPED_POOL_MAX_BYTES = 32L * 1024L * 1024L;
+    private static final long MAPPED_POOL_MAX_BYTES = mappedPoolBudget();
     private static final long[][] MAPPED_POOL = new long[MAPPED_POOL_MAX_SHIFT + 1][];
     private static final int[] MAPPED_POOL_COUNTS = new int[MAPPED_POOL_MAX_SHIFT + 1];
     private static long mappedPoolBytes;
@@ -1847,6 +1880,16 @@ public final class BrowserOpenGL {
               window.__gaiusGL.prepareDrawAttribs=function(vao) {
                 const repaired=this.ensureProgramAttribTypes()|0;
                 const aligned=this.ensureAlignedAttribs()|0;
+                // Vertex-pulling pipelines (clouds are the current example) have no
+                // active vertex attributes.  A VAO reused from terrain can retain
+                // missingEnabledAttribs from an earlier draw; those entries do not
+                // apply to this program and must not keep the draw on the slow guard.
+                const active=this.programAttribs.get(this.currentProgram|0);
+                if (!active || !active.length) {
+                  if (vao.missingEnabledAttribs) vao.missingEnabledAttribs.clear();
+                  vao.drawReadyGeneration=this.drawProgramGeneration|0;
+                  return (repaired+aligned)|0;
+                }
                 const finalMissing=vao.missingEnabledAttribs ? (vao.missingEnabledAttribs.size|0) : 0;
                 if (finalMissing===0) {
                   vao.drawReadyGeneration=this.drawProgramGeneration|0;
@@ -2056,11 +2099,7 @@ public final class BrowserOpenGL {
                   stats.baseVertexIndexCacheMiss=(stats.baseVertexIndexCacheMiss||0)+1;
                   stats.baseVertexIndexCacheMisses=(stats.baseVertexIndexCacheMisses||0)+1;
                 }
-                let source=this.bufferBytes.get(elementBuffer);
-                if (!source) {
-                  source=this.ensureBufferShadow(elementBuffer,'base-vertex-index',false);
-                  if (source) this.markBufferShadowRequired(elementBuffer,'base-vertex-index');
-                }
+                const source=this.bufferBytes.get(elementBuffer);
                 if (!source) {
                   if (stats) {
                     stats.baseVertexIndexMissingUploadShadow=
@@ -2428,6 +2467,17 @@ public final class BrowserOpenGL {
             state.textureBufferDefaults=state.textureBufferDefaults || new Set();
             state.textureParameters=state.textureParameters || new Map();
             state.samplerBindings=state.samplerBindings || new Map();
+            state.effectiveSamplerBindings=new Map();
+            state.textureBufferUnits=new Set();
+            state.applySamplerBinding=function(unit) {
+              const effective=this.textureBufferUnits.has(unit|0)
+                ? 0 : (this.samplerBindings.get(unit|0)||0);
+              if (this.effectiveSamplerBindings.has(unit|0)
+                  && this.effectiveSamplerBindings.get(unit|0)===effective) return;
+              window.__gaiusWebGL.bindSampler(
+                unit,effective===0?null:this.samplers.get(effective));
+              this.effectiveSamplerBindings.set(unit|0,effective);
+            };
             state.indexedBufferBindings=state.indexedBufferBindings || new Map();
             state.uniformPrograms=state.uniformPrograms || new Map();
             state.programUniformLocations=state.programUniformLocations || new Map();
@@ -2571,16 +2621,20 @@ public final class BrowserOpenGL {
                 this.textureParameters.set(texture|0,parameters);
               } else if (parameters.has(parameter|0)
                   && (parameters.get(parameter|0)|0)===(value|0)) {
-                const skipStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
-                skipStats.texBufferTextureParameterSkips=
-                  (skipStats.texBufferTextureParameterSkips||0)+1;
+                if (this.hotPathTelemetryEnabled) {
+                  const skipStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                  skipStats.texBufferTextureParameterSkips=
+                    (skipStats.texBufferTextureParameterSkips||0)+1;
+                }
                 return false;
               }
               window.__gaiusWebGL.texParameteri(target,parameter,value);
               parameters.set(parameter|0,value|0);
-              const callStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
-              callStats.texBufferTextureParameterCalls=
-                (callStats.texBufferTextureParameterCalls||0)+1;
+              if (this.hotPathTelemetryEnabled) {
+                const callStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                callStats.texBufferTextureParameterCalls=
+                  (callStats.texBufferTextureParameterCalls||0)+1;
+              }
               return true;
             };
             """)
@@ -3458,7 +3512,17 @@ public final class BrowserOpenGL {
         initializeShadowDecisionCache();
         initializeMisalignedBufferRefs();
         initializeVaoBufferRefsJs();
-        initializeTerrainBatchJs();
+        initializeTerrainBatchJs(GaiusProfileCapabilities.PATCH_SET,
+                GaiusProfileCapabilities.TERRAIN_SECTION_UNIFORM_BLOCK);
+        if (JsArrays.LINEAR_MEMORY) {
+            JsArrays.installLinearViews();
+            initializeLinearUploadsJs();
+            initializeBufferLayerJs();
+            initializeTexelBufferCacheJs();
+            initializeShadowRetentionJs();
+            initializeDivisorCacheJs();
+            BrowserOpenGLPerf.initialize();
+        }
     }
 
     /** True when the live context exposes EXT_texture_filter_anisotropic (enabled at initialize). */
@@ -3507,6 +3571,10 @@ public final class BrowserOpenGL {
         if (drawCount <= 0 || data == null || data.length < drawCount * 8) {
             return 0;
         }
+        if (JsArrays.LINEAR_MEMORY) {
+            return terrainMultiDrawLinearJs(kind, JsArrays.stageInt32(data, 0, drawCount * 8),
+                    drawCount, leadSerial, leadIndexCount, leadBaseVertex);
+        }
         return terrainMultiDrawJs(kind, JsArrays.int32(data), drawCount, leadSerial,
                 leadIndexCount, leadBaseVertex);
     }
@@ -3519,6 +3587,29 @@ public final class BrowserOpenGL {
                   leadBaseVertex|0)|0) : 0;
             """)
     private static native int terrainMultiDrawJs(int kind, Int32Array data, int drawCount,
+            int leadSerial, int leadCount, int leadBaseVertex);
+
+    /**
+     * {@link #terrainMultiDrawJs} reading the records at a linear-memory address (WebAssembly
+     * GC): they are copied into one reused Int32Array, so the shared batch code is unchanged.
+     */
+    @JSBody(params = {"kind", "address", "drawCount", "leadSerial", "leadCount", "leadBaseVertex"},
+            script = """
+            const state=window.__gaiusGL;
+            if (!state || !state.terrainBatchDraw) return 0;
+            const n=drawCount|0,total=n*8,base=address>>>2;
+            const L=globalThis.__gaiusLinear;
+            const i32=L.i32.length ? L.i32 : L.refresh().i32;
+            let data=state.terrainLinearRecords;
+            if (!data || data.length<total) {
+              data=new Int32Array(Math.max(total,256,data ? data.length*2 : 0));
+              state.terrainLinearRecords=data;
+            }
+            for (let i=0;i<total;i++) data[i]=i32[base+i];
+            return state.terrainBatchDraw(kind|0,data,n,leadSerial|0,leadCount|0,
+              leadBaseVertex|0)|0;
+            """)
+    private static native int terrainMultiDrawLinearJs(int kind, int address, int drawCount,
             int leadSerial, int leadCount, int leadBaseVertex);
 
     /** Draws issued through executeDraw so far (wrapping); see {@link #terrainMultiDraw}. */
@@ -3576,7 +3667,7 @@ public final class BrowserOpenGL {
      * gaiusBakedIndex=0, gaiusMultiDraw=0 (uniform fallback), gaiusElementShadow=always
      * (shadow every element buffer as before), gaiusAnisotropy=0.</p>
      */
-    @JSBody(script = """
+    @JSBody(params = {"buildPatchSet", "buildTerrainSectionUniformBlock"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
             if (!gl || !state || state.__terrainBatchInit) return;
             state.__terrainBatchInit=true;
@@ -3594,9 +3685,17 @@ public final class BrowserOpenGL {
             const off=function(value) {
               return value==='0' || value==='false' || value==='off';
             };
-            const profile=String(globalThis.__gaiusProfileId || '').trim();
-            const modernProfile=profile!=='1.21.11';
-            state.terrainBatchEnabled=modernProfile && !off(flag('gaiusTerrainBatch'))
+            const patchSet=typeof globalThis.__gaiusPatchSet==='string'
+              ? globalThis.__gaiusPatchSet : buildPatchSet;
+            const terrainSectionUniformBlock=typeof globalThis.__gaiusTerrainSectionUniformBlock==='boolean'
+              ? globalThis.__gaiusTerrainSectionUniformBlock : buildTerrainSectionUniformBlock;
+            const modernProfile=String(patchSet || '').trim()!=='legacy-12111';
+            const runtimeSelection=globalThis.__gaiusRuntimeSelection;
+            const wasmNeedsVanillaTerrain=runtimeSelection
+              && runtimeSelection.selected==='wasm'
+              && terrainSectionUniformBlock===false;
+            state.terrainBatchEnabled=modernProfile && !wasmNeedsVanillaTerrain
+              && !off(flag('gaiusTerrainBatch'))
               && globalThis.__gaiusTerrainBatch!==false;
             state.quadFastPathEnabled=!off(flag('gaiusQuadIndex'));
             state.bakedIndexEnabled=!off(flag('gaiusBakedIndex'));
@@ -4243,7 +4342,8 @@ public final class BrowserOpenGL {
               return drawn;
             };
             """)
-    private static native void initializeTerrainBatchJs();
+    private static native void initializeTerrainBatchJs(String buildPatchSet,
+            boolean buildTerrainSectionUniformBlock);
 
 
     @JSBody(script = """
@@ -4496,14 +4596,35 @@ public final class BrowserOpenGL {
     public static native void clear(int mask);
 
     public static void clearBufferfv(int buffer, int drawBuffer, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            clearBufferfvLinearJs(buffer, drawBuffer, linearFloats(values));
+            return;
+        }
         clearBufferfvJs(buffer, drawBuffer, floats(values));
     }
 
     public static void clearBufferfv(int buffer, int drawBuffer, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                clearBufferfvJs(buffer, drawBuffer, null);
+                return;
+            }
+            clearBufferfvLinearJs(buffer, drawBuffer,
+                    JsArrays.stageFloat32(values, 0, values.length));
+            return;
+        }
         clearBufferfvJs(buffer, drawBuffer, JsArrays.float32(values));
     }
 
     public static void clearBufferfv(int buffer, int drawBuffer, long address) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (address == 0L) {
+                clearBufferfvJs(buffer, drawBuffer, null);
+                return;
+            }
+            clearBufferfvLinearJs(buffer, drawBuffer, (int) address);
+            return;
+        }
         int valueCount = buffer == 0x1800 ? 4 : 1;
         clearBufferfvJs(buffer, drawBuffer, pointerFloats(address, valueCount));
     }
@@ -4521,6 +4642,22 @@ public final class BrowserOpenGL {
             """)
     private static native void clearBufferfvJs(
             int buffer, int drawBuffer, Float32Array values);
+
+    /** {@link #clearBufferfvJs} reading the values at a linear-memory address (WebAssembly GC). */
+    @JSBody(params = {"buffer", "drawBuffer", "address"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if ((buffer|0)===(gl.COLOR|0) && state) {
+              const framebuffer=state.framebufferBindings.draw|0;
+              if (framebuffer) {
+                const texture=state.findFramebufferColorTextureId(framebuffer);
+                if (texture) state.invalidateGuiItemAtlasBlitCache(texture,'clearBufferfv');
+              }
+            }
+            const L=globalThis.__gaiusLinear;
+            const f32=L.f32.length ? L.f32 : L.refresh().f32;
+            gl.clearBufferfv(buffer,drawBuffer,f32,(address>>>2));
+            """)
+    private static native void clearBufferfvLinearJs(int buffer, int drawBuffer, int address);
 
     @JSBody(params = {"red", "green", "blue", "alpha"}, script = """
             const state=window.__gaiusGL;
@@ -4600,16 +4737,32 @@ public final class BrowserOpenGL {
     }
 
     public static void drawBuffers(IntBuffer buffers) {
+        if (JsArrays.LINEAR_MEMORY) {
+            drawBuffersLinearJs(linearInts(buffers), buffers.remaining());
+            return;
+        }
         drawBuffersJs(ints(buffers));
     }
 
     public static void drawBuffers(int[] buffers) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (buffers == null) {
+                drawBuffersJs(null);
+                return;
+            }
+            drawBuffersLinearJs(JsArrays.stageInt32(buffers, 0, buffers.length), buffers.length);
+            return;
+        }
         drawBuffersJs(JsArrays.int32(buffers));
     }
 
     public static void drawBuffers(int buffer) {
         int[] values = UNIFORM_SCRATCH.get().ints(1);
         values[0] = buffer;
+        if (JsArrays.LINEAR_MEMORY) {
+            drawBuffersLinearJs(JsArrays.stageInt32(values, 0, 1), 1);
+            return;
+        }
         drawBuffersJs(JsArrays.int32(values));
     }
 
@@ -4618,6 +4771,14 @@ public final class BrowserOpenGL {
     }
 
     public static void drawBuffers(int count, long address) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (address == 0L) {
+                drawBuffersJs(null);
+                return;
+            }
+            drawBuffersLinearJs((int) address, Math.max(0, count));
+            return;
+        }
         drawBuffersJs(pointerInts(address, count));
     }
 
@@ -4630,6 +4791,34 @@ public final class BrowserOpenGL {
             window.__gaiusWebGL.drawBuffers(buffers);
             """)
     private static native void drawBuffersJs(Int32Array buffers);
+
+    /**
+     * {@link #drawBuffersJs} reading {@code count} enums at a linear-memory address (WebAssembly
+     * GC). The enums go through one reused array per count; {@code lastDrawBuffers} is replaced
+     * only when the list changes.
+     */
+    @JSBody(params = {"address", "count"}, script = """
+            const state=window.__gaiusGL;
+            const L=globalThis.__gaiusLinear;
+            const i32=L.i32.length ? L.i32 : L.refresh().i32;
+            const n=count|0,base=address>>>2;
+            const lists=state ? (state.linearDrawBufferLists || (state.linearDrawBufferLists=[])) : [];
+            let list=lists[n];
+            if (!list) {
+              list=new Array(n);
+              lists[n]=list;
+            }
+            for (let i=0;i<n;i++) list[i]=i32[base+i];
+            if (state) {
+              const last=state.lastDrawBuffers;
+              let same=!!last && last.length===n;
+              for (let i=0;same && i<n;i++) same=last[i]===list[i];
+              if (!same) state.lastDrawBuffers=list.slice();
+              state.drawBuffersCalls=(state.drawBuffersCalls||0)+1;
+            }
+            window.__gaiusWebGL.drawBuffers(list);
+            """)
+    private static native void drawBuffersLinearJs(int address, int count);
 
     public static void readPixels(
             int x, int y, int width, int height, int format, int type, long pixels) {
@@ -4959,11 +5148,18 @@ public final class BrowserOpenGL {
     @JSBody(params = {"unit"}, script = """
             const state=window.__gaiusGL;
             const next=(unit-0x84C0)|0;
-            if (state && (state.activeTextureUnit|0)===next) return;
+            if (state && (state.activeTextureUnit|0)===next
+                && !(state.perfGl2 && state.perfGl2.unitDirty)) return;
             if (state) state.activeTextureUnit=next;
             window.__gaiusWebGL.activeTexture(unit);
             """)
-    public static native void activeTexture(int unit);
+    private static native void activeTextureJs(int unit);
+
+    public static void activeTexture(int unit) {
+        if (BrowserOpenGLPerf.skipTextureUnit(unit)) return;
+        activeTextureJs(unit);
+        BrowserOpenGLPerf.rememberTextureUnit(unit);
+    }
 
     @JSBody(script = """
             const state=window.__gaiusGL, id=state.next++;
@@ -5007,7 +5203,8 @@ public final class BrowserOpenGL {
             const targetKey=keyBase+((target|0)&65535);
             const webKey=keyBase+((webTarget|0)&65535);
             const alreadyBound=state.textureBindings.has(webKey)
-              && (state.textureBindings.get(webKey)|0)===(texture|0);
+              && (state.textureBindings.get(webKey)|0)===(texture|0)
+              && !(state.perfGl2 && state.perfGl2.textureDirty.has(webKey));
             const defaultsCandidate=target===0x8C2A && texture!==0
               && !state.textureBufferDefaults.has(texture|0);
             const object=(!alreadyBound || defaultsCandidate)
@@ -5024,6 +5221,12 @@ public final class BrowserOpenGL {
               state.textureBindings.set(aliasKey,texture|0);
             }
             if (!alreadyBound) gl.bindTexture(webTarget,object);
+            // Desktop buffer textures ignore sampler objects. Their 2D emulation must
+            // also ignore a sampler left on this unit by a previous ordinary texture.
+            // Keep the requested sampler so a later ordinary texture bind restores it.
+            if (target===0x8C2A) state.textureBufferUnits.add(unit|0);
+            else state.textureBufferUnits.delete(unit|0);
+            state.applySamplerBinding(unit);
             if (target===0x8C2A) {
               if (needsBufferDefaults) {
                 gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
@@ -5043,7 +5246,14 @@ public final class BrowserOpenGL {
               }
             }
             """)
-    public static native void bindTexture(int target, int texture);
+    private static native void bindTextureJs(int target, int texture);
+
+    public static void bindTexture(int target, int texture) {
+        if (BrowserOpenGLPerf.skipTexture(target, texture)) return;
+        int unit = BrowserOpenGLPerf.textureUnit();
+        bindTextureJs(target, texture);
+        BrowserOpenGLPerf.rememberTexture(unit, target, texture);
+    }
 
     @JSBody(params = {"target", "parameter", "value"},
             script = """
@@ -5067,8 +5277,58 @@ public final class BrowserOpenGL {
     public static void texImage2D(
             int target, int level, int internalFormat, int width, int height,
             int border, int format, int type, ByteBuffer pixels) {
+        if (JsArrays.LINEAR_MEMORY && pixels != null && pixels.isDirect()) {
+            texImage2DLinearJs(target, level, internalFormat, width, height, border, format, type,
+                    linearBase(pixels), pixels.capacity());
+            return;
+        }
         texImage2DJs(target, level, internalFormat, width, height, border, format, type, bytes(pixels));
     }
+
+    /**
+     * {@link #texImage2DJs} reading the pixels at a linear-memory address (WebAssembly GC):
+     * WebGL gets the cached whole-memory view with srcOffset, of the element type the original
+     * passes (Int8Array for BYTE, Uint8Array otherwise), and the upload recorders the byte count.
+     */
+    @JSBody(params = {
+            "target", "level", "internalFormat", "width", "height",
+            "border", "format", "type", "address", "length"
+    }, script = """
+            if (target === 0x8064) {
+              return;
+            }
+            if (internalFormat === 0x81A7 && format === 0x1902 && type === 0x1406) {
+              internalFormat = 0x8CAC;
+            }
+            if (internalFormat === 0x8231 || internalFormat === 0x8235) {
+              format = 0x8D94;
+              if (internalFormat === 0x8235) type = 0x1404;
+              else if (type === 0x1401) type = 0x1400;
+            }
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (type === 0x1400) {
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.textureUploadSignedViewSkips=(stats.textureUploadSignedViewSkips||0)+1;
+            }
+            const pixels=state.linearRangeInfo(length);
+            try {
+              gl.texImage2D(target,level,internalFormat,width,height,border,format,type,
+                state.linearByteView(type),address>>>0);
+              if (state.recordTextureUpload) {
+                state.recordTextureUpload(
+                  'texImage2D',target,level,0,0,width,height,internalFormat,format,type,pixels);
+              }
+            } catch (error) {
+              if (state.recordTextureError) {
+                state.recordTextureError(
+                  'texImage2D',target,level,width,height,format,type,pixels,error);
+              }
+              throw error;
+            }
+            """)
+    private static native void texImage2DLinearJs(
+            int target, int level, int internalFormat, int width, int height,
+            int border, int format, int type, int address, int length);
 
     @JSBody(params = {
             "target", "level", "internalFormat", "width", "height",
@@ -5080,9 +5340,10 @@ public final class BrowserOpenGL {
             if (internalFormat === 0x81A7 && format === 0x1902 && type === 0x1406) {
               internalFormat = 0x8CAC;
             }
-            if (internalFormat === 0x8231) {
+            if (internalFormat === 0x8231 || internalFormat === 0x8235) {
               format = 0x8D94;
-              if (type === 0x1401) type = 0x1400;
+              if (internalFormat === 0x8235) type = 0x1404;
+              else if (type === 0x1401) type = 0x1400;
             }
             if (pixels !== null && pixels !== undefined) {
               if (type !== 0x1400) {
@@ -5115,6 +5376,11 @@ public final class BrowserOpenGL {
     public static void texSubImage2D(
             int target, int level, int x, int y, int width, int height,
             int format, int type, ByteBuffer pixels) {
+        if (JsArrays.LINEAR_MEMORY && pixels != null && pixels.isDirect()) {
+            texSubImage2DLinearJs(target, level, x, y, width, height, format, type,
+                    linearBase(pixels), pixels.capacity());
+            return;
+        }
         texSubImage2DJs(target, level, x, y, width, height, format, type, bytes(pixels));
     }
 
@@ -5129,9 +5395,52 @@ public final class BrowserOpenGL {
                     target, level, x, y, width, height, format, type, (int) pixels);
             return;
         }
+        if (JsArrays.LINEAR_MEMORY && pixels != 0L) {
+            int length = textureUploadLength(width, height, format, type);
+            if (length > 0) {
+                texSubImage2DLinearJs(target, level, x, y, width, height, format, type,
+                        (int) pixels, length);
+                return;
+            }
+        }
         texSubImage2DJs(target, level, x, y, width, height, format, type,
                 pointerBytes(pixels, textureUploadLength(width, height, format, type)));
     }
+
+    /**
+     * {@link #texSubImage2DJs} reading the pixels at a linear-memory address (WebAssembly GC),
+     * like {@link #texImage2DLinearJs}.
+     */
+    @JSBody(params = {
+            "target", "level", "x", "y", "width", "height", "format", "type", "address", "length"
+    }, script = """
+            if (format === 0x1903 && type === 0x1400) {
+              format = 0x8D94;
+            }
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (type === 0x1400) {
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.textureUploadSignedViewSkips=(stats.textureUploadSignedViewSkips||0)+1;
+            }
+            const pixels=state.linearRangeInfo(length);
+            try {
+              gl.texSubImage2D(target,level,x,y,width,height,format,type,
+                state.linearByteView(type),address>>>0);
+              if (state.recordTextureUpload) {
+                state.recordTextureUpload(
+                  'texSubImage2D',target,level,x,y,width,height,0,format,type,pixels);
+              }
+            } catch (error) {
+              if (state.recordTextureError) {
+                state.recordTextureError(
+                  'texSubImage2D',target,level,width,height,format,type,pixels,error);
+              }
+              throw error;
+            }
+            """)
+    private static native void texSubImage2DLinearJs(
+            int target, int level, int x, int y, int width, int height,
+            int format, int type, int address, int length);
 
     @JSBody(params = {
             "target", "level", "x", "y", "width", "height", "format", "type", "offset"
@@ -5360,8 +5669,49 @@ public final class BrowserOpenGL {
     }
 
     public static void bufferData(int target, ByteBuffer data, int usage) {
+        if (JsArrays.LINEAR_MEMORY && data != null && data.isDirect()) {
+            bufferDataLinearJs(target, linearBase(data), data.capacity(), usage);
+            return;
+        }
         bufferDataJs(target, bytes(data), usage);
     }
+
+    /**
+     * {@link #bufferDataJs} reading the data at a linear-memory address (WebAssembly GC; see
+     * {@code linearByteView} in initializeLinearUploadsJs). A uniform buffer below 256 bytes still
+     * goes through the padded copy of prepareBufferDataUpload.
+     */
+    @JSBody(params = {"target", "address", "length", "usage"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (target===gl.ELEMENT_ARRAY_BUFFER) {
+              state.ensureLogicalElementBuffer(state.getVaoEmu());
+            }
+            const buffer=state.boundBuffers.get(target)|0;
+            const n=length|0;
+            let upload=null;
+            let actual=n;
+            if (target===0x8A11 && n<256) {
+              upload=state.prepareBufferDataUpload(state.linearBytes(address,n),true);
+              actual=upload.byteLength;
+              gl.bufferData(target,upload,usage);
+            } else if (n===0) {
+              gl.bufferData(target,state.linearEmptyBytes(),usage);
+            } else {
+              gl.bufferData(target,state.linearByteView(0),usage,address>>>0,n);
+            }
+            state.noteBufferUpload(n,actual,'data');
+            if (buffer) {
+              state.bufferSizes.set(buffer,actual);
+              const data=state.shouldShadowBufferTarget(target,buffer)
+                ? (upload || state.linearBytes(address,n)) : null;
+              state.shadowBufferDataForTarget(target,buffer,data,actual);
+              if (state.noteBufferBytes) {
+                state.noteBufferBytes(buffer,0,state.quadFastPathEnabled
+                  ? (upload || state.linearBytes(address,n)) : null,actual,true);
+              }
+            }
+            """)
+    private static native void bufferDataLinearJs(int target, int address, int length, int usage);
 
     @JSBody(params = {"target", "data", "usage"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
@@ -5383,7 +5733,53 @@ public final class BrowserOpenGL {
     private static native void bufferDataJs(int target, Int8Array data, int usage);
 
     public static void bufferSubData(int target, long offset, ByteBuffer data) {
+        if (JsArrays.LINEAR_MEMORY && data != null && data.isDirect()) {
+            bufferSubDataLinearWithCounters(target, (int) offset, linearBase(data), data.capacity());
+            return;
+        }
         bufferSubDataJs(target, (int) offset, bytes(data));
+    }
+
+    /**
+     * {@link #bufferSubDataJs} reading the data at a linear-memory address (WebAssembly GC). The
+     * shadow and quad-tracker helpers get a view of the range only when they read the bytes; the
+     * unshadowed branch of shadowBufferSubDataForTarget only reads its byte count.
+     */
+    @JSBody(params = {"target", "offset", "address", "length"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (target===gl.ELEMENT_ARRAY_BUFFER) {
+              state.ensureLogicalElementBuffer(state.getVaoEmu());
+            }
+            const n=length|0;
+            if (n===0) {
+              gl.bufferSubData(target,Number(offset),state.linearEmptyBytes());
+            } else {
+              gl.bufferSubData(target,Number(offset),state.linearByteView(0),address>>>0,n);
+            }
+            state.noteBufferUpload(n,n,'subData');
+            const buffer=state.boundBuffers.get(target)|0;
+            if (buffer) {
+              const start=Number(offset);
+              const end=start+n;
+              const known=state.bufferSizes.get(buffer);
+              const validRange=Number.isFinite(start) && start>=0
+                && Number.isFinite(end) && Number.isFinite(known) && known>=0 && end<=known;
+              if (validRange && n>0) {
+                state.shadowBufferSubDataForTarget(target,buffer,start,
+                  state.shouldShadowBufferTarget(target,buffer)
+                    ? state.linearBytes(address,n) : state.linearRangeInfo(n));
+                if (state.noteBufferBytes) {
+                  state.noteBufferBytes(buffer,start,
+                    state.linearQuadBytes(buffer,start,address,n),n,false);
+                }
+              }
+            }
+            """)
+    private static native void bufferSubDataLinearJs(int target, int offset, int address, int length);
+
+    private static void bufferSubDataLinearWithCounters(int target, int offset, int address, int length) {
+        BrowserOpenGLPerf.noteUpload(length);
+        bufferSubDataLinearJs(target, offset, address, length);
     }
 
     @JSBody(params = {"target", "offset", "data"}, script = """
@@ -5440,8 +5836,50 @@ public final class BrowserOpenGL {
     private static native void namedBufferDataSizeJs(int buffer, int size, int usage);
 
     public static void namedBufferData(int buffer, ByteBuffer data, int usage) {
+        if (JsArrays.LINEAR_MEMORY && data != null && data.isDirect()) {
+            namedBufferDataLinearJs(buffer, linearBase(data), data.capacity(), usage);
+            return;
+        }
         namedBufferDataJs(buffer, bytes(data), usage);
     }
+
+    /** {@link #namedBufferDataJs} reading the data at a linear-memory address (WebAssembly GC). */
+    @JSBody(params = {"buffer", "address", "length", "usage"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            const previousId=state.boundBuffers.get(gl.COPY_WRITE_BUFFER)|0;
+            const previous=previousId ? state.buffers.get(previousId) : null;
+            const n=length|0;
+            let upload=null;
+            let actual=n;
+            if (n<256) {
+              upload=state.prepareBufferDataUpload(state.linearBytes(address,n),true);
+              actual=upload.byteLength;
+            }
+            const bindingMatches=previousId===(buffer|0);
+            if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,state.buffers.get(buffer));
+            if (upload) {
+              gl.bufferData(gl.COPY_WRITE_BUFFER,upload,usage);
+            } else {
+              gl.bufferData(gl.COPY_WRITE_BUFFER,state.linearByteView(0),usage,address>>>0,n);
+            }
+            if (buffer) state.noteBufferWebglType(gl.COPY_WRITE_BUFFER,buffer);
+            state.noteBufferUpload(n,actual,'data');
+            if (buffer) {
+              state.bufferSizes.set(buffer,actual);
+              if (state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(buffer|0)) {
+                state.shadowBufferData(buffer,upload || state.linearBytes(address,n),actual);
+              } else {
+                if (!state.dropBufferShadow(buffer,'named-buffer')) state.bumpBufferVersion(buffer);
+              }
+              if (state.noteBufferBytes) {
+                state.noteBufferBytes(buffer,0,state.quadFastPathEnabled
+                  ? (upload || state.linearBytes(address,n)) : null,actual,true);
+              }
+            }
+            if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previous);
+            state.noteNamedBufferBindings(bindingMatches?0:2,bindingMatches?2:0);
+            """)
+    private static native void namedBufferDataLinearJs(int buffer, int address, int length, int usage);
 
     @JSBody(params = {"buffer", "data", "usage"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
@@ -5470,7 +5908,59 @@ public final class BrowserOpenGL {
     private static native void namedBufferDataJs(int buffer, Int8Array data, int usage);
 
     public static void namedBufferSubData(int buffer, long offset, ByteBuffer data) {
+        if (JsArrays.LINEAR_MEMORY && data != null && data.isDirect()) {
+            namedBufferSubDataLinearWithCounters(buffer, (int) offset, linearBase(data), data.capacity());
+            return;
+        }
         namedBufferSubDataJs(buffer, (int) offset, bytes(data));
+    }
+
+    /** {@link #namedBufferSubDataJs} reading the data at a linear-memory address (WebAssembly GC). */
+    @JSBody(params = {"buffer", "offset", "address", "length"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            const uploadTarget=state.perfGl2 ? state.perfGl2.uploadTarget(state.buffers.get(buffer)) : gl.COPY_WRITE_BUFFER;
+            const previousId=state.boundBuffers.get(uploadTarget)|0;
+            const previous=previousId ? state.buffers.get(previousId) : null;
+            const bindingMatches=previousId===(buffer|0);
+            if (!bindingMatches) gl.bindBuffer(uploadTarget,state.buffers.get(buffer));
+            const n=length|0;
+            if (n===0) {
+              gl.bufferSubData(uploadTarget,Number(offset),state.linearEmptyBytes());
+            } else {
+              gl.bufferSubData(uploadTarget,Number(offset),state.linearByteView(0),
+                address>>>0,n);
+            }
+            if (buffer) state.noteBufferWebglType(uploadTarget,buffer);
+            state.noteBufferUpload(n,n,'subData');
+            if (buffer) {
+              const start=Number(offset);
+              const end=start+n;
+              const known=state.bufferSizes.get(buffer);
+              const validRange=Number.isFinite(start) && start>=0
+                && Number.isFinite(end) && Number.isFinite(known) && known>=0 && end<=known;
+              if (validRange && n>0) {
+                if (state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(buffer|0)) {
+                  state.shadowBufferSubData(buffer,start,state.linearBytes(address,n));
+                } else {
+                  if (!state.dropBufferShadow(buffer,'named-buffer',start,n)) {
+                    state.bumpBufferVersion(buffer,start,n);
+                  }
+                }
+                if (state.noteBufferBytes) {
+                  state.noteBufferBytes(buffer,start,
+                    state.linearQuadBytes(buffer,start,address,n),n,false);
+                }
+              }
+            }
+            if (!bindingMatches) gl.bindBuffer(uploadTarget,previous);
+            state.noteNamedBufferBindings(bindingMatches?0:2,bindingMatches?2:0);
+            """)
+    private static native void namedBufferSubDataLinearJs(
+            int buffer, int offset, int address, int length);
+
+    private static void namedBufferSubDataLinearWithCounters(int buffer, int offset, int address, int length) {
+        BrowserOpenGLPerf.noteUpload(length);
+        namedBufferSubDataLinearJs(buffer, offset, address, length);
     }
 
     @JSBody(params = {"buffer", "offset", "data"}, script = """
@@ -5535,7 +6025,12 @@ public final class BrowserOpenGL {
         int mappedBytes = mapped.buffer.capacity();
         try {
             if (uploadOnUnmap) {
-                bufferSubDataJs(target, (int) mapped.offset, allBytes(mapped.buffer));
+                if (JsArrays.LINEAR_MEMORY && mapped.buffer.isDirect()) {
+                    bufferSubDataLinearWithCounters(target, (int) mapped.offset, linearBase(mapped.buffer),
+                            mapped.buffer.capacity());
+                } else {
+                    bufferSubDataJs(target, (int) mapped.offset, allBytes(mapped.buffer));
+                }
             }
         } finally {
             releaseMappedStorage(mapped);
@@ -5553,6 +6048,12 @@ public final class BrowserOpenGL {
         }
         int absoluteOffset = absoluteMappedOffset(mapped, offset, length);
         noteMappedBufferFlushJs((double) length);
+        if (JsArrays.LINEAR_MEMORY && mapped.buffer.isDirect()) {
+            checkSliceRange(mapped.buffer, offset, length);
+            bufferSubDataLinearWithCounters(target, absoluteOffset,
+                    linearBase(mapped.buffer) + (int) offset, (int) length);
+            return;
+        }
         bufferSubDataJs(target, absoluteOffset, bytesSlice(mapped.buffer, offset, length));
     }
 
@@ -5577,7 +6078,12 @@ public final class BrowserOpenGL {
         int mappedBytes = mapped.buffer.capacity();
         try {
             if (uploadOnUnmap) {
-                namedBufferSubDataJs(buffer, (int) mapped.offset, allBytes(mapped.buffer));
+                if (JsArrays.LINEAR_MEMORY && mapped.buffer.isDirect()) {
+                    namedBufferSubDataLinearWithCounters(buffer, (int) mapped.offset,
+                            linearBase(mapped.buffer), mapped.buffer.capacity());
+                } else {
+                    namedBufferSubDataJs(buffer, (int) mapped.offset, allBytes(mapped.buffer));
+                }
             }
         } finally {
             releaseMappedStorage(mapped);
@@ -5595,6 +6101,12 @@ public final class BrowserOpenGL {
         }
         int absoluteOffset = absoluteMappedOffset(mapped, offset, length);
         noteMappedNamedBufferFlushJs((double) length);
+        if (JsArrays.LINEAR_MEMORY && mapped.buffer.isDirect()) {
+            checkSliceRange(mapped.buffer, offset, length);
+            namedBufferSubDataLinearWithCounters(buffer, absoluteOffset,
+                    linearBase(mapped.buffer) + (int) offset, (int) length);
+            return;
+        }
         namedBufferSubDataJs(buffer, absoluteOffset, bytesSlice(mapped.buffer, offset, length));
     }
 
@@ -5612,6 +6124,7 @@ public final class BrowserOpenGL {
         int shift = mappedPoolShift(length);
         if (shift < 0) {
             ByteBuffer exact = MemoryUtil.memAlloc(length).order(ByteOrder.nativeOrder());
+            BrowserMemory.claimOwner(MemoryUtil.memAddress(exact), 4);
             return new MappedBuffer(logicalBuffer, offset, access, exact, 0L, -1);
         }
         long address;
@@ -5624,6 +6137,7 @@ public final class BrowserOpenGL {
             mappedPoolHits++;
         } else {
             address = MemoryUtil.nmemAlloc(1L << shift);
+            BrowserMemory.claimOwner(address, 4);
             mappedPoolMisses++;
         }
         if ((access & (MAP_INVALIDATE_RANGE_BIT | MAP_INVALIDATE_BUFFER_BIT
@@ -5631,7 +6145,8 @@ public final class BrowserOpenGL {
             MemoryUtil.memSet(address, 0, length);
         }
         ByteBuffer view = MemoryUtil.memByteBuffer(address, length).order(ByteOrder.nativeOrder());
-        noteMappedPoolJs((double) mappedPoolHits, (double) mappedPoolMisses, (double) mappedPoolBytes);
+        noteMappedPoolJs((double) mappedPoolHits, (double) mappedPoolMisses,
+                (double) mappedPoolBytes, (double) MAPPED_POOL_MAX_BYTES);
         return new MappedBuffer(logicalBuffer, offset, access, view, address, shift);
     }
 
@@ -5659,6 +6174,8 @@ public final class BrowserOpenGL {
         slots[count] = mapped.poolAddress();
         MAPPED_POOL_COUNTS[shift] = count + 1;
         mappedPoolBytes += size;
+        noteMappedPoolJs((double) mappedPoolHits, (double) mappedPoolMisses,
+                (double) mappedPoolBytes, (double) MAPPED_POOL_MAX_BYTES);
     }
 
     private static int mappedPoolShift(int length) {
@@ -5669,13 +6186,35 @@ public final class BrowserOpenGL {
         return Math.max(MAPPED_POOL_MIN_SHIFT, shift);
     }
 
-    @JSBody(params = {"hits", "misses", "pooledBytes"}, script = """
+    private static long mappedPoolBudget() {
+        try {
+            return mappedPoolBudgetJs();
+        } catch (Throwable ignored) {
+            return 32L * 1024L * 1024L;
+        }
+    }
+
+    @JSBody(script = """
+            if (!window.__gaiusWasmMemory) return 32*1024*1024;
+            let params;
+            try { params=new URLSearchParams(location.search || ''); } catch (ignored) { params=null; }
+            const configured=params && params.get('gaiusMappedPoolMB');
+            const profile=window.GaiusQuality && window.GaiusQuality.profile;
+            const tier=profile ? profile.resolve().memoryTier : window.__gaiusMemoryTier;
+            const fallback=tier && tier.lowMemory ? 4 : 8;
+            const value=configured===null || configured===undefined ? fallback : Number(configured);
+            return Math.floor((Number.isFinite(value) ? Math.max(0,Math.min(32,value)) : fallback)*1024*1024);
+            """)
+    private static native int mappedPoolBudgetJs();
+
+    @JSBody(params = {"hits", "misses", "pooledBytes", "limitBytes"}, script = """
             const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
             stats.mappedPoolHits=hits;
             stats.mappedPoolMisses=misses;
             stats.mappedPoolIdleBytes=pooledBytes;
+            stats.mappedPoolLimitBytes=limitBytes;
             """)
-    private static native void noteMappedPoolJs(double hits, double misses, double pooledBytes);
+    private static native void noteMappedPoolJs(double hits, double misses, double pooledBytes, double limitBytes);
 
     private static void checkMappedRange(long offset, long length) {
         if (offset < 0L || length < 0L || length > Integer.MAX_VALUE
@@ -6195,18 +6734,30 @@ public final class BrowserOpenGL {
             state.programVersion=((state.programVersion||0)+1)|0;
             state.bumpDrawProgramGeneration();
             """)
-    public static native void linkProgram(int program);
+    private static native void linkProgramJs(int program);
+
+    public static void linkProgram(int program) {
+        BrowserOpenGLPerf.forgetProgram(program);
+        linkProgramJs(program);
+    }
 
     @JSBody(params = {"program"}, script = """
             const state=window.__gaiusGL;
-            if ((state.currentProgram|0)===(program|0)) {
+            if ((state.currentProgram|0)===(program|0)
+                && !(state.perfGl2 && state.perfGl2.programDirty)) {
               return;
             }
             state.currentProgram=program|0;
             state.bumpDrawProgramGeneration();
             window.__gaiusWebGL.useProgram(program===0?null:state.programs.get(program));
             """)
-    public static native void useProgram(int program);
+    private static native void useProgramJs(int program);
+
+    public static void useProgram(int program) {
+        if (BrowserOpenGLPerf.skipProgram(program)) return;
+        useProgramJs(program);
+        BrowserOpenGLPerf.rememberProgram(program);
+    }
 
     @JSBody(params = {"program"}, script = """
             const state=window.__gaiusGL, object=state.programs.get(program);
@@ -6222,7 +6773,12 @@ public final class BrowserOpenGL {
             if (state.programAttachments) state.programAttachments.delete(program|0);
             if (state.terrainPrograms) state.terrainPrograms.delete(program|0);
             """)
-    public static native void deleteProgram(int program);
+    private static native void deleteProgramJs(int program);
+
+    public static void deleteProgram(int program) {
+        BrowserOpenGLPerf.forgetProgram(program);
+        deleteProgramJs(program);
+    }
 
     @JSBody(params = {"shader"}, script = """
             const state=window.__gaiusGL, object=state.shaders.get(shader);
@@ -6258,7 +6814,16 @@ public final class BrowserOpenGL {
     public static native String getShaderInfoLog(int shader, int maximumLength);
 
     public static int getUniformLocation(int program, CharSequence name) {
-        return getUniformLocationJs(program, name.toString());
+        String key = name.toString();
+        Integer cached = BrowserOpenGLPerf.uniformLocation(program, key);
+        if (cached != null) return cached;
+        int location = getUniformLocationJs(program, key);
+        BrowserOpenGLPerf.rememberUniform(program, key, location);
+        return location;
+    }
+
+    public static void publishPerfCounters() {
+        BrowserOpenGLPerf.publishCounters();
     }
 
     @JSBody(params = {"program", "name"}, script = """
@@ -6361,134 +6926,368 @@ public final class BrowserOpenGL {
     public static native void uniform4i(int location, int x, int y, int z, int w);
 
     public static void uniform1fv(int location, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 101, false, linearFloats(values), values.remaining());
+            return;
+        }
         uniform1fvJs(location, floats(values));
     }
 
     public static void uniform2fv(int location, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 102, false, linearFloats(values), values.remaining());
+            return;
+        }
         uniform2fvJs(location, floats(values));
     }
 
     public static void uniform3fv(int location, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 103, false, linearFloats(values), values.remaining());
+            return;
+        }
         uniform3fvJs(location, floats(values));
     }
 
     public static void uniform4fv(int location, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 104, false, linearFloats(values), values.remaining());
+            return;
+        }
         uniform4fvJs(location, floats(values));
     }
 
     public static void uniform1iv(int location, IntBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 201, false, linearInts(values), values.remaining());
+            return;
+        }
         uniform1ivJs(location, ints(values));
     }
 
     public static void uniform2iv(int location, IntBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 202, false, linearInts(values), values.remaining());
+            return;
+        }
         uniform2ivJs(location, ints(values));
     }
 
     public static void uniform3iv(int location, IntBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 203, false, linearInts(values), values.remaining());
+            return;
+        }
         uniform3ivJs(location, ints(values));
     }
 
     public static void uniform4iv(int location, IntBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 204, false, linearInts(values), values.remaining());
+            return;
+        }
         uniform4ivJs(location, ints(values));
     }
 
     public static void uniformMatrix2fv(int location, boolean transpose, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 302, transpose, linearFloats(values), values.remaining());
+            return;
+        }
         uniformMatrix2fvJs(location, transpose, floats(values));
     }
 
     public static void uniformMatrix3fv(int location, boolean transpose, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 303, transpose, linearFloats(values), values.remaining());
+            return;
+        }
         uniformMatrix3fvJs(location, transpose, floats(values));
     }
 
     public static void uniformMatrix4fv(int location, boolean transpose, FloatBuffer values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            uniformLinearJs(location, 304, transpose, linearFloats(values), values.remaining());
+            return;
+        }
         uniformMatrix4fvJs(location, transpose, floats(values));
     }
 
     public static void uniform1fv(int location, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform1fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 101, false, JsArrays.stageFloat32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform1fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform2fv(int location, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform2fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 102, false, JsArrays.stageFloat32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform2fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform3fv(int location, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform3fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 103, false, JsArrays.stageFloat32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform3fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform4fv(int location, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform4fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 104, false, JsArrays.stageFloat32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform4fvJs(location, JsArrays.float32(values));
     }
 
     public static void uniform1iv(int location, int[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform1ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 201, false, JsArrays.stageInt32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform1ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniform2iv(int location, int[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform2ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 202, false, JsArrays.stageInt32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform2ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniform3iv(int location, int[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform3ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 203, false, JsArrays.stageInt32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform3ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniform4iv(int location, int[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniform4ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 204, false, JsArrays.stageInt32(values, 0, values.length),
+                    values.length);
+            return;
+        }
         uniform4ivJs(location, JsArrays.int32(values));
     }
 
     public static void uniformMatrix2fv(int location, boolean transpose, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniformMatrix2fvJs(location, transpose, null);
+                return;
+            }
+            uniformLinearJs(location, 302, transpose,
+                    JsArrays.stageFloat32(values, 0, values.length), values.length);
+            return;
+        }
         uniformMatrix2fvJs(location, transpose, JsArrays.float32(values));
     }
 
     public static void uniformMatrix3fv(int location, boolean transpose, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniformMatrix3fvJs(location, transpose, null);
+                return;
+            }
+            uniformLinearJs(location, 303, transpose,
+                    JsArrays.stageFloat32(values, 0, values.length), values.length);
+            return;
+        }
         uniformMatrix3fvJs(location, transpose, JsArrays.float32(values));
     }
 
     public static void uniformMatrix4fv(int location, boolean transpose, float[] values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == null) {
+                uniformMatrix4fvJs(location, transpose, null);
+                return;
+            }
+            uniformLinearJs(location, 304, transpose,
+                    JsArrays.stageFloat32(values, 0, values.length), values.length);
+            return;
+        }
         uniformMatrix4fvJs(location, transpose, JsArrays.float32(values));
     }
 
     public static void uniform1fv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform1fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 101, false, (int) values, Math.max(0, count));
+            return;
+        }
         uniform1fvJs(location, pointerFloats(values, count));
     }
 
     public static void uniform2fv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform2fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 102, false, (int) values, Math.max(0, count * 2));
+            return;
+        }
         uniform2fvJs(location, pointerFloats(values, count * 2));
     }
 
     public static void uniform3fv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform3fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 103, false, (int) values, Math.max(0, count * 3));
+            return;
+        }
         uniform3fvJs(location, pointerFloats(values, count * 3));
     }
 
     public static void uniform4fv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform4fvJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 104, false, (int) values, Math.max(0, count * 4));
+            return;
+        }
         uniform4fvJs(location, pointerFloats(values, count * 4));
     }
 
     public static void uniform1iv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform1ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 201, false, (int) values, Math.max(0, count));
+            return;
+        }
         uniform1ivJs(location, pointerInts(values, count));
     }
 
     public static void uniform2iv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform2ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 202, false, (int) values, Math.max(0, count * 2));
+            return;
+        }
         uniform2ivJs(location, pointerInts(values, count * 2));
     }
 
     public static void uniform3iv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform3ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 203, false, (int) values, Math.max(0, count * 3));
+            return;
+        }
         uniform3ivJs(location, pointerInts(values, count * 3));
     }
 
     public static void uniform4iv(int location, int count, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniform4ivJs(location, null);
+                return;
+            }
+            uniformLinearJs(location, 204, false, (int) values, Math.max(0, count * 4));
+            return;
+        }
         uniform4ivJs(location, pointerInts(values, count * 4));
     }
 
     public static void uniformMatrix2fv(int location, int count, boolean transpose, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniformMatrix2fvJs(location, transpose, null);
+                return;
+            }
+            uniformLinearJs(location, 302, transpose, (int) values,
+                    Math.max(0, count * 4));
+            return;
+        }
         uniformMatrix2fvJs(location, transpose, pointerFloats(values, count * 4));
     }
 
     public static void uniformMatrix3fv(int location, int count, boolean transpose, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniformMatrix3fvJs(location, transpose, null);
+                return;
+            }
+            uniformLinearJs(location, 303, transpose, (int) values,
+                    Math.max(0, count * 9));
+            return;
+        }
         uniformMatrix3fvJs(location, transpose, pointerFloats(values, count * 9));
     }
 
     public static void uniformMatrix4fv(int location, int count, boolean transpose, long values) {
+        if (JsArrays.LINEAR_MEMORY) {
+            if (values == 0L) {
+                uniformMatrix4fvJs(location, transpose, null);
+                return;
+            }
+            uniformLinearJs(location, 304, transpose, (int) values,
+                    Math.max(0, count * 16));
+            return;
+        }
         uniformMatrix4fvJs(location, transpose, pointerFloats(values, count * 16));
     }
 
@@ -6594,6 +7393,1197 @@ public final class BrowserOpenGL {
             }
             """)
     private static native void uniformMatrix4fvJs(int location, boolean transpose, Float32Array values);
+
+    /**
+     * The uniform*v and uniformMatrix*fv uploads of the WebAssembly GC build: {@code count}
+     * values at a linear-memory address, passed to WebGL as (view, srcOffset, srcLength) of the
+     * cached linear view, behind the same value cache as the typed-array bodies above. kind is
+     * the cache kind of those bodies (101-104 float vectors, 201-204 int vectors, 302-304
+     * matrices).
+     */
+    @JSBody(params = {"location", "kind", "transpose", "address", "count"}, script = """
+            const state=window.__gaiusGL;
+            const object=state.uniforms&&state.uniforms.get(location);
+            if (object===undefined) return;
+            const type=kind|0;
+            const integer=type>=200 && type<300;
+            const L=globalThis.__gaiusLinear;
+            let n=count|0;
+            let view;
+            let offset=address>>>2;
+            if (n<=0) {
+              view=integer ? (state.linearEmptyInts || (state.linearEmptyInts=new Int32Array(0)))
+                : (state.linearEmptyFloats || (state.linearEmptyFloats=new Float32Array(0)));
+              n=0;
+              offset=0;
+            } else if (integer) {
+              view=L.i32.length ? L.i32 : L.refresh().i32;
+            } else {
+              view=L.f32.length ? L.f32 : L.refresh().f32;
+            }
+            if (!state.uniformLinearChanged(location,type,transpose,view,offset,n)) return;
+            const gl=window.__gaiusWebGL;
+            switch (type) {
+              case 101: gl.uniform1fv(object,view,offset,n); break;
+              case 102: gl.uniform2fv(object,view,offset,n); break;
+              case 103: gl.uniform3fv(object,view,offset,n); break;
+              case 104: gl.uniform4fv(object,view,offset,n); break;
+              case 201: gl.uniform1iv(object,view,offset,n); break;
+              case 202: gl.uniform2iv(object,view,offset,n); break;
+              case 203: gl.uniform3iv(object,view,offset,n); break;
+              case 204: gl.uniform4iv(object,view,offset,n); break;
+              case 302: gl.uniformMatrix2fv(object,!!transpose,view,offset,n); break;
+              case 303: gl.uniformMatrix3fv(object,!!transpose,view,offset,n); break;
+              case 304: gl.uniformMatrix4fv(object,!!transpose,view,offset,n); break;
+              default: break;
+            }
+            """)
+    private static native void uniformLinearJs(
+            int location, int kind, boolean transpose, int address, int count);
+
+    /**
+     * WebAssembly GC only: {@code uniformLinearChanged}, the (view, offset, length) form of
+     * {@code uniformArrayChanged} that shares its value cache, for {@link #uniformLinearJs}.
+     */
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            if (!state || state.__linearUploadsInit) return;
+            state.__linearUploadsInit=true;
+            state.uniformLinearChanged=function(location,kind,transpose,values,offset,length) {
+              const key=location|0;
+              const start=offset|0;
+              const n=length|0;
+              const transposed=!!transpose;
+              let entry=this.uniformValueCache.get(key);
+              let same=!!entry && (entry.kind|0)===(kind|0)
+                && (entry.count|0)===n && entry.transpose===transposed;
+              if (same) {
+                const cached=entry.values;
+                for (let i=0;i<n;i++) {
+                  if (!Object.is(cached[i],values[start+i])) {
+                    same=false;
+                    break;
+                  }
+                }
+                if (same) {
+                  this.noteUniformValueFastSkip();
+                  return false;
+                }
+              }
+              const integer=(kind|0)>=200 && (kind|0)<300;
+              if (!entry || !entry.values || entry.values.length!==n
+                  || (!!entry.integer)!==integer) {
+                entry={kind:kind|0,count:n,transpose:transposed,integer:integer,
+                  values:integer ? new Int32Array(n) : new Float32Array(n)};
+                this.uniformValueCache.set(key,entry);
+              } else {
+                entry.kind=kind|0;
+                entry.count=n;
+                entry.transpose=transposed;
+                entry.integer=integer;
+              }
+              for (let i=0;i<n;i++) entry.values[i]=values[start+i];
+              this.uniform1iValues.delete(key);
+              this.uniform1fValues.delete(key);
+              return true;
+            };
+            // Byte uploads (buffer and texture data, see bufferSubDataLinearJs): WebGL reads the
+            // cached whole-memory view at srcOffset, so a call creates no typed array. A view of
+            // the range is only made for a consumer that keeps or scans the bytes: a buffer
+            // shadow copy, the quad index tracker, the 256-byte uniform buffer padding.
+            state.linearByteView=function(type) {
+              const L=globalThis.__gaiusLinear;
+              if (!L.u8.length) L.refresh();
+              return (type|0)===0x1400 ? L.i8 : L.u8;
+            };
+            state.linearBytes=function(address,length) {
+              const base=address>>>0;
+              return this.linearByteView(0x1400).subarray(base,base+(length|0));
+            };
+            // The byte count of a range for the consumers that only read data.byteLength
+            // (upload telemetry, the unshadowed buffer branch); reused, never kept by them.
+            state.linearRangeInfo=function(length) {
+              const info=this.linearRange || (this.linearRange={byteLength:0});
+              info.byteLength=length|0;
+              return info;
+            };
+            state.linearEmptyBytes=function() {
+              return this.linearEmpty || (this.linearEmpty=new Uint8Array(0));
+            };
+            // noteBufferBytes reads the bytes only when the quad tracker is on and the buffer
+            // has a pattern entry or the store starts at 0; otherwise null gives the same result.
+            state.linearQuadBytes=function(buffer,start,address,length) {
+              if (!this.quadFastPathEnabled) return null;
+              if (start!==0 && !(this.quadPatterns && this.quadPatterns.has(buffer|0))) return null;
+              return this.linearBytes(address,length);
+            };
+            """)
+    private static native void initializeLinearUploadsJs();
+
+    /**
+     * WebAssembly GC only: the physical buffer layer, {@code state.bufferLayer}. It wraps the
+     * buffer entry points of the WebGL context itself (so every path of this class, and any
+     * other caller, goes through it) and does two things.
+     *
+     * <p><b>Large uniform buffers live in 256 KiB segments.</b> ANGLE's D3D11 backend (and
+     * drivers like it) can copy a whole buffer when a range of it is written while earlier,
+     * not yet executed draws still read the buffer. Transform and chunk-section uniform
+     * storages write a block and bind it for the next draw many times per frame, so a large
+     * backing store can amplify this cost. A buffer of at least 1 MiB that is bound with
+     * bindBufferRange(UNIFORM_BUFFER)
+     * gets a segment buffer per 256 KiB of its storage, created on first use: writes into it go
+     * to the segments while eligible, and each uniform range is bound to its segment at the same offset modulo
+     * 256 KiB (a multiple of the 256-byte uniform offset alignment). The storages' own
+     * MappableRingBuffer rotation (one slab per frame in flight) owns the logical slabs.
+     * Overlapping writes after a draw rotate the physical segment; zero-timeout fences
+     * gate reuse. In-flight metadata is bounded and pressure deletes, never reuses, a
+     * pending segment. Other buffer kinds retain their original backing store. The big buffer
+     * stays the reference for everything else: a segment is filled
+     * from it (GPU copy) before its first partial write or binding, and segments are copied
+     * back to it before it is read (copyBufferSubData source, getBufferSubData). A buffer used
+     * whole (bindBufferBase, a range across two segments, a copy into it, vertex, pixel or
+     * transform-feedback use) goes back to its single storage, the latter kinds for good.
+     * ?gaiusUboRing=0 (or {@code bufferLayer.setSegmentsEnabled(false)} at run time) keeps every
+     * buffer whole. ?gaiusGlVerify=1 keeps a CPU copy of each segmented buffer (every write
+     * applied in order, which is what the single storage would hold) and compares each bound
+     * segment range with it byte for byte ({@code __gaiusGLStats.largeBuffers}).
+     *
+     * <p><b>Write versions and dirty ranges</b> of buffers a consumer watches
+     * ({@code bufferLayer.watch(buffer)}, used by the texel buffer cache below).
+     */
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (!gl || !state || state.bufferLayer) return;
+            let params=null;
+            try {
+              params=new URLSearchParams(String(location.search || ''));
+            } catch (ignored) {
+              params=null;
+            }
+            const flag=function(name) {
+              if (!params) return '';
+              const value=params.get(name);
+              return value===null ? '' : String(value).toLowerCase();
+            };
+            const off=function(value) {
+              return value==='0' || value==='false' || value==='off';
+            };
+            const SEGMENT=262144,LARGE=1048576;
+            const UNIFORM=0x8A11,ARRAY=0x8892,ELEMENT=0x8893,COPY_READ=0x8F36,COPY_WRITE=0x8F37,
+              PACK=0x88EB,UNPACK=0x88EC,FEEDBACK=0x8C8E,DYNAMIC_DRAW=0x88E8;
+            const raw={
+              bindBuffer:gl.bindBuffer,bufferData:gl.bufferData,bufferSubData:gl.bufferSubData,
+              bindBufferRange:gl.bindBufferRange,bindBufferBase:gl.bindBufferBase,
+              copyBufferSubData:gl.copyBufferSubData,getBufferSubData:gl.getBufferSubData,
+              deleteBuffer:gl.deleteBuffer,createBuffer:gl.createBuffer,
+              fenceSync:gl.fenceSync,clientWaitSync:gl.clientWaitSync,deleteSync:gl.deleteSync,
+              vertexAttribPointer:gl.vertexAttribPointer,
+              vertexAttribIPointer:gl.vertexAttribIPointer
+            };
+            const stats={redirectedWrites:0,redirectedWriteBytes:0,redirectedBinds:0,
+              segmentedBuffers:0,segmentsCreated:0,liveSegmentBytes:0,segmentFills:0,
+              segmentFlushes:0,demotions:0,lastDemotion:'',verifyChecks:0,
+              verifyMismatches:0,lastVerifyMismatch:'',ringRotations:0,ringReuses:0,
+              retiredSegmentBytes:0,ringPressureDeletes:0,fenceFailures:0,
+              wholeLargeWrites:0,wholeLargeWriteBytes:0};
+            const verifyFlag=flag('gaiusGlVerify');
+            const layer={
+              segmentsEnabled:!off(flag('gaiusUboRing')) && globalThis.__gaiusUboRing!==false,
+              verify:verifyFlag==='1' || verifyFlag==='true' || verifyFlag==='on',
+              bound:new Map(),
+              sizes:new WeakMap(),
+              whole:new WeakSet(),
+              held:new WeakSet(),
+              infos:new Map(),
+              uniform:[],
+              watched:new WeakMap(),
+              retired:[],
+              stats:stats
+            };
+            state.bufferLayer=layer;
+            const glStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            glStats.largeBuffers=stats;
+            const range={view:null,start:0,count:0};
+            // (view, start, count) of the bytes of a WebGL source argument, start and count in
+            // elements of a byte-sized view; false for a shape WebGL would reject.
+            const byteRange=function(data,srcOffset,length,argc) {
+              if (!data) return false;
+              if (data instanceof ArrayBuffer) {
+                if (argc>3) return false;
+                range.view=new Uint8Array(data);
+                range.start=0;
+                range.count=data.byteLength;
+                return true;
+              }
+              if (!ArrayBuffer.isView(data)) return false;
+              if (data instanceof DataView) {
+                if (argc>3) return false;
+                range.view=new Uint8Array(data.buffer,data.byteOffset,data.byteLength);
+                range.start=0;
+                range.count=data.byteLength;
+                return true;
+              }
+              const elements=data.length;
+              const start=argc>3 ? Number(srcOffset)||0 : 0;
+              const count=argc>4 && Number(length)>0 ? Number(length) : elements-start;
+              if (!(start>=0) || !(count>=0) || start+count>elements) return false;
+              const size=data.BYTES_PER_ELEMENT|0;
+              if (size===1) {
+                range.view=data;
+                range.start=start;
+                range.count=count;
+              } else {
+                range.view=new Uint8Array(data.buffer,data.byteOffset+start*size,count*size);
+                range.start=0;
+                range.count=count*size;
+              }
+              return true;
+            };
+            const dataSize=function(source,srcOffset,length,argc) {
+              if (typeof source==='number') return Math.max(0,source);
+              if (!source) return 0;
+              if (source instanceof ArrayBuffer) return source.byteLength;
+              if (ArrayBuffer.isView(source)) {
+                if (source instanceof DataView) return source.byteLength;
+                const size=source.BYTES_PER_ELEMENT|0;
+                const start=argc>3 ? Number(srcOffset)||0 : 0;
+                const count=argc>4 && Number(length)>0 ? Number(length) : source.length-start;
+                return Math.max(0,count)*size;
+              }
+              return Math.max(0,Number(source)||0);
+            };
+            const noteWrite=function(buffer,start,length,whole) {
+              const dirty=layer.watched.get(buffer);
+              if (!dirty) return;
+              dirty.version++;
+              const end=start+length;
+              if (whole || !(start>=0) || !(end>=start)) {
+                dirty.start=0;
+                dirty.end=Infinity;
+              } else if (dirty.start>=dirty.end) {
+                dirty.start=start;
+                dirty.end=end;
+              } else {
+                if (start<dirty.start) dirty.start=start;
+                if (end>dirty.end) dirty.end=end;
+              }
+            };
+            // The write version of buffer and the byte range written since `base` (the version a
+            // consumer last caught up with); it records only after the first watch.
+            layer.watch=function(buffer) {
+              if (!buffer) return null;
+              let dirty=layer.watched.get(buffer);
+              if (!dirty) {
+                dirty={version:1,base:0,start:0,end:Infinity};
+                layer.watched.set(buffer,dirty);
+              }
+              return dirty;
+            };
+            const segmentLength=function(info,index) {
+              return Math.min(SEGMENT,info.size-index*SEGMENT);
+            };
+            const restoreCopyBindings=function() {
+              raw.bindBuffer.call(gl,COPY_READ,layer.bound.get(COPY_READ) || null);
+              raw.bindBuffer.call(gl,COPY_WRITE,layer.bound.get(COPY_WRITE) || null);
+            };
+            const segmentOf=function(info,index) {
+              let segment=info.segments[index];
+              if (!segment) {
+                const object=raw.createBuffer.call(gl);
+                const bytes=segmentLength(info,index);
+                raw.bindBuffer.call(gl,COPY_WRITE,object);
+                raw.bufferData.call(gl,COPY_WRITE,bytes,DYNAMIC_DRAW);
+                raw.bindBuffer.call(gl,COPY_WRITE,layer.bound.get(COPY_WRITE) || null);
+                segment={object:object,valid:false,reads:[]};
+                info.segments[index]=segment;
+                info.bytes+=bytes;
+                stats.segmentsCreated++;
+                stats.liveSegmentBytes+=bytes;
+              }
+              return segment;
+            };
+            const dropRetired=function(entry) {
+              if (entry.fence) raw.deleteSync.call(gl,entry.fence);
+              raw.deleteBuffer.call(gl,entry.object);
+              stats.retiredSegmentBytes-=entry.bytes;
+            };
+            const clearRetired=function(info) {
+              for (let index=layer.retired.length-1;index>=0;index--) {
+                const entry=layer.retired[index];
+                if (entry.info!==info) continue;
+                layer.retired.splice(index,1);
+                dropRetired(entry);
+              }
+            };
+            const rotate=function(info,buffer,index,piece,start,end) {
+              if (!piece.reads.some(function(read) { return start<read.end && end>read.start; })) return;
+              const bytes=segmentLength(info,index);
+              let object=null;
+              for (let pending=0;pending<layer.retired.length;pending++) {
+                const entry=layer.retired[pending];
+                if (entry.bytes!==bytes || !entry.fence) continue;
+                const status=raw.clientWaitSync.call(gl,entry.fence,0,0);
+                if (status!==0x911A && status!==0x911C) continue;
+                layer.retired.splice(pending,1);
+                raw.deleteSync.call(gl,entry.fence);
+                stats.retiredSegmentBytes-=entry.bytes;
+                object=entry.object;
+                stats.ringReuses++;
+                break;
+              }
+              if (!object) {
+                object=raw.createBuffer.call(gl);
+                raw.bindBuffer.call(gl,COPY_WRITE,object);
+                raw.bufferData.call(gl,COPY_WRITE,bytes,DYNAMIC_DRAW);
+                stats.segmentsCreated++;
+              }
+              raw.bindBuffer.call(gl,COPY_READ,piece.object);
+              raw.bindBuffer.call(gl,COPY_WRITE,object);
+              raw.copyBufferSubData.call(gl,COPY_READ,COPY_WRITE,0,0,bytes);
+              const fence=raw.fenceSync ? raw.fenceSync.call(gl,0x9117,0) : null;
+              if (!fence) stats.fenceFailures++;
+              layer.retired.push({object:piece.object,fence:fence,bytes:bytes,info:info});
+              stats.retiredSegmentBytes+=bytes;
+              const previous=piece.object;
+              piece.object=object;
+              piece.reads.length=0;
+              for (let slot=0;slot<layer.uniform.length;slot++) {
+                const binding=layer.uniform[slot];
+                if (!binding || binding.buffer!==buffer || binding.segment!==previous) continue;
+                raw.bindBufferRange.call(gl,UNIFORM,slot,object,binding.offset-index*SEGMENT,binding.size);
+                binding.segment=object;
+              }
+              raw.bindBuffer.call(gl,UNIFORM,layer.bound.get(UNIFORM) || null);
+              restoreCopyBindings();
+              if (layer.retired.length>32) {
+                dropRetired(layer.retired.shift());
+                stats.ringPressureDeletes++;
+              }
+              stats.ringRotations++;
+            };
+            const noteDraw=function() {
+              for (let slot=0;slot<layer.uniform.length;slot++) {
+                const binding=layer.uniform[slot];
+                if (!binding || !binding.segment) continue;
+                const info=layer.infos.get(binding.buffer);
+                if (!info) continue;
+                const index=Math.floor(binding.offset/SEGMENT);
+                const piece=info.segments[index];
+                const start=binding.offset-index*SEGMENT,end=start+binding.size;
+                if (piece.reads.length>=64) {
+                  piece.reads[0]={start:0,end:segmentLength(info,index)};
+                  piece.reads.length=1;
+                } else {
+                  const last=piece.reads[piece.reads.length-1];
+                  if (last && start<=last.end && end>=last.start) {
+                    last.start=Math.min(start,last.start);
+                    last.end=Math.max(end,last.end);
+                  } else piece.reads.push({start:start,end:end});
+                }
+              }
+            };
+            ['drawArrays','drawElements','drawArraysInstanced',
+                'drawElementsInstanced','drawRangeElements'].forEach(function(name) {
+              const draw=gl[name];
+              if (typeof draw!=='function') return;
+              gl[name]=function() {
+                const result=draw.apply(this,arguments);
+                noteDraw();
+                return result;
+              };
+            });
+            // A segment that is not valid holds nothing yet: the big buffer has its bytes.
+            const fill=function(info,buffer,index,segment) {
+              raw.bindBuffer.call(gl,COPY_READ,buffer);
+              raw.bindBuffer.call(gl,COPY_WRITE,segment.object);
+              raw.copyBufferSubData.call(gl,COPY_READ,COPY_WRITE,index*SEGMENT,0,
+                segmentLength(info,index));
+              restoreCopyBindings();
+              segment.valid=true;
+              stats.segmentFills++;
+            };
+            // Copies the segments first..last that are newer than the big buffer into it.
+            const flush=function(info,buffer,first,last) {
+              let copied=false;
+              for (let index=first;index<=last;index++) {
+                if (!info.stale[index]) continue;
+                raw.bindBuffer.call(gl,COPY_READ,info.segments[index].object);
+                raw.bindBuffer.call(gl,COPY_WRITE,buffer);
+                raw.copyBufferSubData.call(gl,COPY_READ,COPY_WRITE,0,index*SEGMENT,
+                  segmentLength(info,index));
+                info.stale[index]=0;
+                stats.segmentFlushes++;
+                copied=true;
+              }
+              if (copied) restoreCopyBindings();
+            };
+            const setSlot=function(slot,buffer,offset,size,segment,whole) {
+              if (!buffer) {
+                layer.uniform[slot]=null;
+                return;
+              }
+              let binding=layer.uniform[slot];
+              if (!binding) {
+                binding={};
+                layer.uniform[slot]=binding;
+              }
+              binding.buffer=buffer;
+              binding.offset=offset;
+              binding.size=size;
+              binding.segment=segment;
+              binding.whole=whole;
+            };
+            // Back to the single storage: newer segment bytes are copied into the big buffer
+            // unless its contents are being replaced, and every uniform range bound to a
+            // segment is bound to the same range of the big buffer again.
+            const release=function(info,buffer,keepContents,reason) {
+              if (keepContents) flush(info,buffer,0,info.segments.length-1);
+              let rebound=false;
+              for (let slot=0;slot<layer.uniform.length;slot++) {
+                const binding=layer.uniform[slot];
+                if (!binding || binding.buffer!==buffer || !binding.segment) continue;
+                raw.bindBufferRange.call(gl,UNIFORM,slot,buffer,binding.offset,binding.size);
+                binding.segment=null;
+                rebound=true;
+              }
+              if (rebound) raw.bindBuffer.call(gl,UNIFORM,layer.bound.get(UNIFORM) || null);
+              for (let index=0;index<info.segments.length;index++) {
+                const segment=info.segments[index];
+                if (segment) raw.deleteBuffer.call(gl,segment.object);
+              }
+              clearRetired(info);
+              stats.liveSegmentBytes=Math.max(0,stats.liveSegmentBytes-info.bytes);
+              layer.infos.delete(buffer);
+              stats.segmentedBuffers=layer.infos.size;
+              if (reason) {
+                stats.demotions++;
+                stats.lastDemotion=reason;
+              }
+            };
+            // Vertex, pixel and transform-feedback buffers stay whole for good; a range across
+            // segments or a copy into the buffer keeps it whole until its storage is replaced.
+            const keepWhole=function(buffer,reason,untilRespecified) {
+              (untilRespecified ? layer.held : layer.whole).add(buffer);
+              const info=layer.infos.size ? layer.infos.get(buffer) : undefined;
+              if (info) release(info,buffer,true,reason);
+            };
+            const readBack=function(object,offset,out) {
+              raw.bindBuffer.call(gl,COPY_READ,object);
+              raw.getBufferSubData.call(gl,COPY_READ,offset,out);
+              raw.bindBuffer.call(gl,COPY_READ,layer.bound.get(COPY_READ) || null);
+            };
+            const compare=function(info,object,objectOffset,logicalOffset,length) {
+              if (!info.mirror || length<=0) return;
+              const actual=new Uint8Array(length);
+              readBack(object,objectOffset,actual);
+              stats.verifyChecks++;
+              for (let i=0;i<length;i++) {
+                if (actual[i]!==info.mirror[logicalOffset+i]) {
+                  stats.verifyMismatches++;
+                  stats.lastVerifyMismatch='offset '+(logicalOffset+i)+' of '+info.size;
+                  return;
+                }
+              }
+            };
+            // Segments buffer, unless one of its uniform ranges (other than slot's, which is
+            // being rebound) must stay on the single storage.
+            const segment=function(buffer,slot) {
+              const size=layer.sizes.get(buffer);
+              for (let other=0;other<layer.uniform.length;other++) {
+                const binding=layer.uniform[other];
+                if (other===slot || !binding || binding.buffer!==buffer) continue;
+                const first=Math.floor(binding.offset/SEGMENT);
+                if (binding.whole || !(binding.size>0) || !(binding.offset>=0)
+                    || binding.offset+binding.size>size
+                    || Math.floor((binding.offset+binding.size-1)/SEGMENT)!==first) return null;
+              }
+              const count=Math.ceil(size/SEGMENT);
+              const info={size:size,segments:new Array(count),stale:new Uint8Array(count),
+                bytes:0,mirror:null};
+              if (layer.verify) {
+                info.mirror=new Uint8Array(size);
+                readBack(buffer,0,info.mirror);
+              }
+              layer.infos.set(buffer,info);
+              stats.segmentedBuffers=layer.infos.size;
+              let rebound=false;
+              for (let next=0;next<layer.uniform.length;next++) {
+                const moved=layer.uniform[next];
+                if (next===slot || !moved || moved.buffer!==buffer) continue;
+                const index=Math.floor(moved.offset/SEGMENT);
+                const piece=segmentOf(info,index);
+                if (!piece.valid) fill(info,buffer,index,piece);
+                raw.bindBufferRange.call(gl,UNIFORM,next,piece.object,
+                  moved.offset-index*SEGMENT,moved.size);
+                moved.segment=piece.object;
+                rebound=true;
+              }
+              if (rebound) raw.bindBuffer.call(gl,UNIFORM,layer.bound.get(UNIFORM) || null);
+              return info;
+            };
+            const writeSegments=function(info,buffer,offset,data,srcOffset,length,argc) {
+              const start=Number(offset);
+              if (!byteRange(data,srcOffset,length,argc) || !(start>=0)
+                  || start+range.count>info.size) {
+                // Out of range or an unusual source: the single storage reports the error.
+                release(info,buffer,true,'write-shape');
+                return false;
+              }
+              const view=range.view,first=range.start,count=range.count;
+              if (info.mirror) info.mirror.set(view.subarray(first,first+count),start);
+              let done=0;
+              let position=start;
+              while (done<count) {
+                const index=Math.floor(position/SEGMENT);
+                const segmentOffset=position-index*SEGMENT;
+                const part=Math.min(SEGMENT-segmentOffset,count-done);
+                const piece=segmentOf(info,index);
+                rotate(info,buffer,index,piece,segmentOffset,segmentOffset+part);
+                if (!piece.valid && part<segmentLength(info,index)) fill(info,buffer,index,piece);
+                raw.bindBuffer.call(gl,COPY_WRITE,piece.object);
+                raw.bufferSubData.call(gl,COPY_WRITE,segmentOffset,view,first+done,part);
+                piece.valid=true;
+                info.stale[index]=1;
+                done+=part;
+                position+=part;
+              }
+              raw.bindBuffer.call(gl,COPY_WRITE,layer.bound.get(COPY_WRITE) || null);
+              stats.redirectedWrites++;
+              stats.redirectedWriteBytes+=count;
+              range.view=null;
+              return true;
+            };
+            gl.bindBuffer=function(target,buffer) {
+              if (target!==ELEMENT) {
+                layer.bound.set(target,buffer || null);
+                if (buffer && (target===PACK || target===UNPACK || target===FEEDBACK)) {
+                  keepWhole(buffer,'bound:'+target);
+                }
+              }
+              return raw.bindBuffer.call(this,target,buffer);
+            };
+            gl.bufferData=function(target,source,usage,srcOffset,length) {
+              if (target!==ELEMENT) {
+                const buffer=layer.bound.get(target);
+                if (buffer) {
+                  const info=layer.infos.size ? layer.infos.get(buffer) : undefined;
+                  if (info) release(info,buffer,false,'');
+                  layer.held.delete(buffer);
+                  layer.sizes.set(buffer,dataSize(source,srcOffset,length,arguments.length));
+                  noteWrite(buffer,0,0,true);
+                }
+              }
+              return raw.bufferData.apply(this,arguments);
+            };
+            gl.bufferSubData=function(target,offset,data,srcOffset,length) {
+              if (target!==ELEMENT) {
+                const buffer=layer.bound.get(target);
+                if (buffer) {
+                  const argc=arguments.length;
+                  if (layer.watched.has(buffer)) {
+                    const known=byteRange(data,srcOffset,length,argc);
+                    noteWrite(buffer,Number(offset),known ? range.count : 0,!known);
+                    range.view=null;
+                  }
+                  const info=layer.infos.size ? layer.infos.get(buffer) : undefined;
+                  if (info && writeSegments(info,buffer,offset,data,srcOffset,length,argc)) return;
+                }
+              }
+              const wholeBuffer=target===ELEMENT ? null : layer.bound.get(target);
+              if (wholeBuffer && (layer.sizes.get(wholeBuffer) || 0)>=LARGE
+                  && byteRange(data,srcOffset,length,arguments.length)) {
+                stats.wholeLargeWrites++;
+                stats.wholeLargeWriteBytes+=range.count;
+                range.view=null;
+              }
+              return raw.bufferSubData.apply(this,arguments);
+            };
+            gl.bindBufferRange=function(target,index,buffer,offset,size) {
+              if (target!==UNIFORM) {
+                if (target===FEEDBACK && buffer) keepWhole(buffer,'transform-feedback');
+                return raw.bindBufferRange.apply(this,arguments);
+              }
+              layer.bound.set(UNIFORM,buffer || null);
+              const slot=index|0;
+              const start=Number(offset);
+              const bytes=Number(size);
+              if (buffer && layer.segmentsEnabled) {
+                let info=layer.infos.size ? layer.infos.get(buffer) : undefined;
+                if (!info && (layer.sizes.get(buffer)|0)>=LARGE && !layer.whole.has(buffer)
+                    && !layer.held.has(buffer)) info=segment(buffer,slot);
+                if (info) {
+                  const first=Math.floor(start/SEGMENT);
+                  if (bytes>0 && start>=0 && start+bytes<=info.size
+                      && Math.floor((start+bytes-1)/SEGMENT)===first) {
+                    const piece=segmentOf(info,first);
+                    if (!piece.valid) fill(info,buffer,first,piece);
+                    raw.bindBufferRange.call(gl,UNIFORM,slot,piece.object,start-first*SEGMENT,bytes);
+                    // bindBufferRange also sets the generic binding: keep the buffer itself there.
+                    raw.bindBuffer.call(gl,UNIFORM,buffer);
+                    setSlot(slot,buffer,start,bytes,piece.object,false);
+                    stats.redirectedBinds++;
+                    if (info.mirror) compare(info,piece.object,start-first*SEGMENT,start,bytes);
+                    return;
+                  }
+                  keepWhole(buffer,'straddle',true);
+                }
+              }
+              const result=raw.bindBufferRange.apply(this,arguments);
+              setSlot(slot,buffer,start,bytes,null,false);
+              return result;
+            };
+            gl.bindBufferBase=function(target,index,buffer) {
+              if (target===UNIFORM) {
+                layer.bound.set(UNIFORM,buffer || null);
+                if (buffer) {
+                  const info=layer.infos.size ? layer.infos.get(buffer) : undefined;
+                  if (info) release(info,buffer,true,'whole-binding');
+                }
+                setSlot(index|0,buffer,0,-1,null,true);
+              } else if (target===FEEDBACK && buffer) {
+                keepWhole(buffer,'transform-feedback');
+              }
+              return raw.bindBufferBase.apply(this,arguments);
+            };
+            gl.copyBufferSubData=function(readTarget,writeTarget,readOffset,writeOffset,size) {
+              const source=readTarget===ELEMENT ? null : layer.bound.get(readTarget);
+              const target=writeTarget===ELEMENT ? null : layer.bound.get(writeTarget);
+              if (layer.infos.size) {
+                const sourceInfo=source ? layer.infos.get(source) : undefined;
+                if (sourceInfo) {
+                  const start=Number(readOffset);
+                  const bytes=Number(size);
+                  if (bytes>0 && start>=0 && start+bytes<=sourceInfo.size) {
+                    flush(sourceInfo,source,Math.floor(start/SEGMENT),
+                      Math.floor((start+bytes-1)/SEGMENT));
+                  } else {
+                    flush(sourceInfo,source,0,sourceInfo.segments.length-1);
+                  }
+                }
+                if (target && layer.infos.has(target)) keepWhole(target,'copy-target',true);
+              }
+              if (target && layer.watched.has(target)) {
+                noteWrite(target,Number(writeOffset),Number(size),false);
+              }
+              return raw.copyBufferSubData.apply(this,arguments);
+            };
+            gl.getBufferSubData=function(target) {
+              if (target!==ELEMENT && layer.infos.size) {
+                const buffer=layer.bound.get(target);
+                const info=buffer ? layer.infos.get(buffer) : undefined;
+                if (info) flush(info,buffer,0,info.segments.length-1);
+              }
+              return raw.getBufferSubData.apply(this,arguments);
+            };
+            gl.deleteBuffer=function(buffer) {
+              if (buffer) {
+                const info=layer.infos.size ? layer.infos.get(buffer) : undefined;
+                if (info) {
+                  for (let index=0;index<info.segments.length;index++) {
+                    const segment=info.segments[index];
+                    if (segment) raw.deleteBuffer.call(gl,segment.object);
+                  }
+                  clearRetired(info);
+                  stats.liveSegmentBytes=Math.max(0,stats.liveSegmentBytes-info.bytes);
+                  layer.infos.delete(buffer);
+                  stats.segmentedBuffers=layer.infos.size;
+                }
+                layer.bound.forEach(function(bound,target) {
+                  if (bound===buffer) layer.bound.set(target,null);
+                });
+                for (let slot=0;slot<layer.uniform.length;slot++) {
+                  const binding=layer.uniform[slot];
+                  if (binding && binding.buffer===buffer) layer.uniform[slot]=null;
+                }
+              }
+              return raw.deleteBuffer.apply(this,arguments);
+            };
+            gl.vertexAttribPointer=function() {
+              const buffer=layer.bound.get(ARRAY);
+              if (buffer) keepWhole(buffer,'vertex-source');
+              return raw.vertexAttribPointer.apply(this,arguments);
+            };
+            gl.vertexAttribIPointer=function() {
+              const buffer=layer.bound.get(ARRAY);
+              if (buffer) keepWhole(buffer,'vertex-source');
+              return raw.vertexAttribIPointer.apply(this,arguments);
+            };
+            layer.setSegmentsEnabled=function(enabled) {
+              const next=!!enabled;
+              if (next===layer.segmentsEnabled) return;
+              if (!next) {
+                Array.from(layer.infos.keys()).forEach(function(buffer) {
+                  release(layer.infos.get(buffer),buffer,true,'');
+                });
+              }
+              layer.segmentsEnabled=next;
+            };
+            if (gl.canvas && gl.canvas.addEventListener) {
+              gl.canvas.addEventListener('webglcontextlost',function() {
+                layer.infos.clear();
+                layer.bound.clear();
+                layer.uniform.length=0;
+                layer.retired.length=0;
+                layer.sizes=new WeakMap();
+                layer.whole=new WeakSet();
+                layer.held=new WeakSet();
+                layer.watched=new WeakMap();
+                stats.retiredSegmentBytes=0;
+                stats.segmentedBuffers=0;
+                stats.liveSegmentBytes=0;
+              },false);
+            }
+            """)
+    private static native void initializeBufferLayerJs();
+
+    /**
+     * WebAssembly GC only: {@code state.texelBufferCache}, the texBuffer emulation without
+     * repeated uploads. WebGL2 has no buffer textures, so {@link #texBuffer} copies the source
+     * buffer's CPU shadow into the bound 2D texture (up to 4096 texels per row). The clouds
+     * bind their texel buffer for every cloud draw, but rebuild it only when the cloud cells or
+     * the camera's cloud layer change, so the old path re-uploaded the same 392 KB several times
+     * a frame. Each texture remembers which buffer and which write version
+     * ({@code bufferLayer.watch}) it holds: an unchanged source is not uploaded again, a
+     * changed one uploads only the rows of the bytes written since (texSubImage2D straight from
+     * the shadow; only a partial last row goes through a reused one-row scratch), and storage
+     * is (re)allocated only when the size or format changes. ?gaiusTexelCache=0 (or
+     * {@code texelBufferCache.enabled=false}) keeps the old path. With ?gaiusGlVerify=1 each
+     * texture also keeps a CPU copy of what it was given and compares it with the shadow on
+     * every bind ({@code __gaiusGLStats.texelBufferCache}).
+     */
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (!gl || !state || !state.bufferLayer || state.texelBufferCache) return;
+            let params=null;
+            try {
+              params=new URLSearchParams(String(location.search || ''));
+            } catch (ignored) {
+              params=null;
+            }
+            const flag=function(name) {
+              if (!params) return '';
+              const value=params.get(name);
+              return value===null ? '' : String(value).toLowerCase();
+            };
+            const switchValue=flag('gaiusTexelCache');
+            const layer=state.bufferLayer;
+            const stats={binds:0,skips:0,partialUploads:0,fullUploads:0,uploadBytes:0,
+              allocations:0,verifyChecks:0,verifyMismatches:0,lastVerifyMismatch:''};
+            // Keyed by the WebGLTexture, so a deleted texture's entry goes with it.
+            const cache={
+              enabled:!(switchValue==='0' || switchValue==='false' || switchValue==='off'),
+              textures:new WeakMap(),
+              rowScratch:null,
+              stats:stats
+            };
+            state.texelBufferCache=cache;
+            const glStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            glStats.texelBufferCache=stats;
+            cache.setEnabled=function(enabled) {
+              cache.enabled=!!enabled;
+              cache.textures=new WeakMap();
+            };
+            // Uploads rows [firstRow,lastRow) of the texture from bytes (zero past its end).
+            const uploadRows=function(entry,bytes,firstRow,lastRow) {
+              const rowBytes=entry.width*entry.bytesPerTexel;
+              const fullEnd=Math.min(lastRow,Math.floor(bytes.byteLength/rowBytes));
+              let view=bytes;
+              if (entry.signedInteger) {
+                if (entry.signedSource!==bytes) {
+                  entry.signedSource=bytes;
+                  entry.signedView=entry.signed32
+                    ? new Int32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength / 4)
+                    : new Int8Array(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+                }
+                view=entry.signedView;
+              }
+              if (fullEnd>firstRow) {
+                gl.texSubImage2D(gl.TEXTURE_2D,0,0,firstRow,entry.width,fullEnd-firstRow,
+                  entry.webFormat,entry.webType,view,firstRow*(entry.signed32 ? rowBytes / 4 : rowBytes));
+              }
+              for (let row=Math.max(firstRow,fullEnd);row<lastRow;row++) {
+                let scratch=cache.rowScratch;
+                if (!scratch || scratch.byteLength<rowBytes) {
+                  scratch=new ArrayBuffer(Math.max(rowBytes,4096));
+                  cache.rowScratch=scratch;
+                }
+                const out=new Uint8Array(scratch,0,rowBytes);
+                const from=row*rowBytes;
+                const available=Math.max(0,Math.min(rowBytes,bytes.byteLength-from));
+                if (available>0) out.set(bytes.subarray(from,from+available),0);
+                out.fill(0,available);
+                gl.texSubImage2D(gl.TEXTURE_2D,0,0,row,entry.width,1,entry.webFormat,entry.webType,
+                  entry.signedInteger
+                    ? (entry.signed32 ? new Int32Array(scratch,0,rowBytes / 4)
+                      : new Int8Array(scratch,0,rowBytes))
+                    : out);
+              }
+              stats.uploadBytes+=(lastRow-firstRow)*rowBytes;
+            };
+            const verify=function(entry,bytes,firstRow,lastRow) {
+              if (!layer.verify) return;
+              const rowBytes=entry.width*entry.bytesPerTexel;
+              const total=entry.height*rowBytes;
+              if (!entry.copy || entry.copy.byteLength!==total) entry.copy=new Uint8Array(total);
+              for (let row=firstRow;row<lastRow;row++) {
+                const from=row*rowBytes;
+                const available=Math.max(0,Math.min(rowBytes,bytes.byteLength-from));
+                if (available>0) entry.copy.set(bytes.subarray(from,from+available),from);
+                entry.copy.fill(0,from+available,from+rowBytes);
+              }
+              stats.verifyChecks++;
+              for (let i=0;i<total;i++) {
+                const expected=i<bytes.byteLength ? bytes[i] : 0;
+                if (entry.copy[i]!==expected) {
+                  stats.verifyMismatches++;
+                  stats.lastVerifyMismatch='texel byte '+i+' of '+total;
+                  return;
+                }
+              }
+            };
+            cache.bind=function(target,internalFormat,buffer) {
+              if (target !== 0x8C2A) return;
+              const unit=state.activeTextureUnit || 0;
+              const keyBase=unit*65536;
+              const texture=(state.textureBindings.get(keyBase+35882)
+                || state.textureBindings.get(keyBase+(gl.TEXTURE_2D&65535)) || 0)|0;
+              const object=texture===0?null:state.textures.get(texture);
+              if (!object) return;
+              stats.binds++;
+              state.markBufferShadowRequired(buffer,'texture-buffer');
+              const physical=state.buffers.get(buffer|0) || null;
+              const dirty=physical ? layer.watch(physical) : null;
+              let bytes=state.bufferBytes.get(buffer);
+              const size=state.bufferSizes.get(buffer) || (bytes ? bytes.byteLength : 0);
+              if (!bytes && size>0) {
+                bytes=state.ensureBufferShadow(buffer,'texture-buffer',false);
+              }
+              if (!bytes && size>0) {
+                const missingStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                missingStats.texBufferMissingExactShadow=
+                  (missingStats.texBufferMissingExactShadow||0)+1;
+                return;
+              }
+              if (!bytes) bytes=new Uint8Array(0);
+              let webInternalFormat=internalFormat;
+              let webFormat=gl.RED;
+              let webType=gl.UNSIGNED_BYTE;
+              let bytesPerTexel=1;
+              let signedInteger=false;
+              let signed32=false;
+              if (internalFormat === 0x8231 || internalFormat === 0x8229 || internalFormat === 0x8235) {
+                signed32=internalFormat === 0x8235;
+                webInternalFormat=signed32 ? 0x8235 : 0x8231;
+                webFormat=0x8D94;
+                webType=signed32 ? gl.INT : gl.BYTE;
+                signedInteger=true;
+                bytesPerTexel=signed32 ? 4 : 1;
+              } else if (internalFormat === gl.RGBA8) {
+                webInternalFormat=gl.RGBA8;
+                webFormat=gl.RGBA;
+                bytesPerTexel=4;
+              }
+              const texels=Math.max(1,Math.ceil(bytes.byteLength / bytesPerTexel));
+              const width=Math.max(1,Math.min(4096,texels));
+              const height=Math.max(1,Math.ceil(texels / width));
+              // BrowserOpenGL's own version of the buffer (bumped by its write paths) and of the
+              // texture (bumped by any other upload into it): a change the write versions did
+              // not see means a full upload.
+              const logicalVersion=state.bufferVersions.get(buffer)||0;
+              const textureInfo=state.textureInfo.get(texture);
+              const textureVersion=textureInfo ? textureInfo.version|0 : 0;
+              let entry=cache.textures.get(object);
+              const allocated=!!entry && entry.width===width && entry.height===height
+                && entry.webInternalFormat===webInternalFormat
+                && entry.textureVersion===textureVersion;
+              const sameSource=allocated && entry.buffer===(buffer|0) && !!dirty;
+              state.applyTextureParameter(texture,gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+              state.applyTextureParameter(texture,gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+              state.applyTextureParameter(texture,gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+              state.applyTextureParameter(texture,gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+              state.applyTextureParameter(texture,gl.TEXTURE_2D,gl.TEXTURE_BASE_LEVEL,0);
+              state.applyTextureParameter(texture,gl.TEXTURE_2D,gl.TEXTURE_MAX_LEVEL,0);
+              if (sameSource && entry.version===dirty.version
+                  && entry.logicalVersion===logicalVersion) {
+                stats.skips++;
+                if (layer.verify) verify(entry,bytes,0,0);
+                return;
+              }
+              let firstRow=0;
+              let lastRow=height;
+              if (sameSource && entry.version===dirty.base && dirty.version!==entry.version) {
+                const rowBytes=width*bytesPerTexel;
+                const end=Math.min(dirty.end,height*rowBytes);
+                firstRow=Math.min(height,Math.floor(dirty.start/rowBytes));
+                lastRow=end>dirty.start ? Math.min(height,Math.ceil(end/rowBytes)) : firstRow;
+              }
+              const previousAlignment=state.unpackAlignment|0;
+              const previousRowLength=state.unpackRowLength|0;
+              const previousSkipRows=state.unpackSkipRows|0;
+              const previousSkipPixels=state.unpackSkipPixels|0;
+              try {
+                if (previousAlignment!==1) gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+                if (previousRowLength!==0) gl.pixelStorei(gl.UNPACK_ROW_LENGTH,0);
+                if (previousSkipRows!==0) gl.pixelStorei(gl.UNPACK_SKIP_ROWS,0);
+                if (previousSkipPixels!==0) gl.pixelStorei(gl.UNPACK_SKIP_PIXELS,0);
+                if (!allocated) {
+                  gl.texImage2D(gl.TEXTURE_2D,0,webInternalFormat,width,height,0,webFormat,
+                    webType,null);
+                  entry={width:width,height:height,textureVersion:textureVersion,
+                    webInternalFormat:webInternalFormat,webFormat:webFormat,webType:webType,
+                    bytesPerTexel:bytesPerTexel,signedInteger:signedInteger,signed32:signed32,buffer:0,version:-1,
+                    logicalVersion:-1,signedSource:null,signedView:null,copy:null,info:null};
+                  cache.textures.set(object,entry);
+                  stats.allocations++;
+                  firstRow=0;
+                  lastRow=height;
+                }
+                if (lastRow>firstRow) uploadRows(entry,bytes,firstRow,lastRow);
+              } finally {
+                if (previousAlignment!==1) gl.pixelStorei(gl.UNPACK_ALIGNMENT,previousAlignment);
+                if (previousRowLength!==0) gl.pixelStorei(gl.UNPACK_ROW_LENGTH,previousRowLength);
+                if (previousSkipRows!==0) gl.pixelStorei(gl.UNPACK_SKIP_ROWS,previousSkipRows);
+                if (previousSkipPixels!==0) gl.pixelStorei(gl.UNPACK_SKIP_PIXELS,previousSkipPixels);
+              }
+              if (firstRow===0 && lastRow===height) stats.fullUploads++;
+              else stats.partialUploads++;
+              entry.buffer=buffer|0;
+              entry.logicalVersion=logicalVersion;
+              entry.version=dirty ? dirty.version : -1;
+              if (dirty) {
+                dirty.base=dirty.version;
+                dirty.start=0;
+                dirty.end=0;
+              }
+              if (layer.verify) verify(entry,bytes,firstRow,lastRow);
+              let info=entry.info;
+              if (!info) {
+                info={};
+                entry.info=info;
+              }
+              info.buffer=buffer;
+              info.internalFormat=internalFormat;
+              info.webInternalFormat=webInternalFormat;
+              info.width=width;
+              info.height=height;
+              info.byteLength=bytes.byteLength;
+              info.signedInteger=signedInteger;
+              info.at=Date.now();
+              state.textureBufferInfo.set(texture,info);
+            };
+            """)
+    private static native void initializeTexelBufferCacheJs();
+
+    /**
+     * WebAssembly GC only: fewer GPU readbacks for the CPU buffer shadows. A required shadow
+     * (a cross-kind copy source, a texel buffer, a misaligned attribute source, an index
+     * buffer the base-vertex or terrain paths rewrite) that is missing when it is needed is
+     * rebuilt with getBufferSubData, which waits for the GPU process to finish every queued
+     * command (several ms behind a busy frame). Two of the ways a shadow went missing are
+     * avoidable:
+     * <ul>
+     *   <li>bufferData(size) without data left no shadow, so the first partial write into a
+     *       fresh (or reallocated) required buffer read the whole buffer back. WebGL defines
+     *       new storage as zeros, so the shadow starts as zeros.</li>
+     *   <li>Over the shadow budget the least recently used shadow went first, required or
+     *       not. Shadows nothing requires (kept only because they were complete) now go
+     *       first.</li>
+     *   <li>The first cross-kind copy from a buffer without a shadow (a new staging buffer of
+     *       StagedVertexBuffer, whose index range is copied into an element buffer) read back
+     *       only the copied range, and the next partial write into the buffer, now required,
+     *       read the whole buffer back again. It is now read back once, whole.</li>
+     * </ul>
+     * ?gaiusShadowKeep=0 keeps the old behaviour. Every readback is counted by reason in
+     * {@code __gaiusGLStats.bufferReadbacks}.
+     */
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (!gl || !state || state.shadowRetention) return;
+            let params=null;
+            try {
+              params=new URLSearchParams(String(location.search || ''));
+            } catch (ignored) {
+              params=null;
+            }
+            const value=params ? String(params.get('gaiusShadowKeep') || '').toLowerCase() : '';
+            const retention={
+              enabled:!(value==='0' || value==='false' || value==='off'),
+              readbacks:{calls:0,bytes:0,byReason:{}}
+            };
+            state.shadowRetention=retention;
+            const glStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            glStats.bufferReadbacks=retention.readbacks;
+            if (window.__gaiusWasmMemory) {
+              const configured=params && params.get('gaiusShadowBudgetMB');
+              const legacy=configured==='off';
+              const tier=window.__gaiusMemoryTier;
+              const fallback=tier && tier.lowMemory ? 16 : 32;
+              const value=configured===null || configured===undefined ? fallback : Number(configured);
+              const budget=(Number.isFinite(value) ? Math.max(0,Math.min(64,value)) : fallback)*1024*1024;
+              const maximum=state.maxTotalBufferShadowBytes;
+              if (!legacy) state.maxTotalBufferShadowBytes=function() {
+                return Math.min(maximum.call(this),budget);
+              };
+              glStats.memoryShadowBudgetBytes=legacy ? maximum.call(state) : budget;
+            }
+            const noteBufferWebglType=state.noteBufferWebglType;
+            state.noteBufferWebglType=function(target,buffer) {
+              const result=noteBufferWebglType.call(this,target,buffer);
+              if (retention.enabled && buffer && (target===0x8F36 || target===0x8F37)) {
+                this.markBufferShadowRequired(buffer,'staged-copy-source');
+              }
+              return result;
+            };
+            const count=function(reason,bytes) {
+              const readbacks=retention.readbacks;
+              readbacks.calls++;
+              readbacks.bytes+=Math.max(0,Number(bytes)||0);
+              const key=String(reason || 'unknown');
+              readbacks.byReason[key]=(readbacks.byReason[key]||0)+1;
+            };
+            const readBufferShadow=state.readBufferShadow;
+            state.readBufferShadow=function(buffer,size,reason) {
+              const result=readBufferShadow.call(this,buffer,size,reason);
+              if (result) count(reason || 'shadow',result.byteLength);
+              return result;
+            };
+            const crossKindBufferCopy=state.crossKindBufferCopy;
+            state.crossKindBufferCopy=function(sourceTarget,targetTarget,sourceBuffer,targetBuffer,
+                sourceOffset,targetOffset,size) {
+              // A source without a complete shadow (a staging buffer's first cross-kind copy) is
+              // read back once, whole, as its shadow: the copy then reads the shadow, and the
+              // next partial write into the buffer (now a required shadow) needs no second
+              // readback to rebuild it.
+              if (retention.enabled && sourceBuffer) {
+                const known=Number(this.bufferSizes.get(sourceBuffer|0));
+                const current=this.bufferBytes.get(sourceBuffer|0);
+                if (Number.isFinite(known) && known>0 && known<=this.maxSingleBufferShadowBytes()
+                    && !(current && current.byteLength===known)) {
+                  this.markBufferShadowRequired(sourceBuffer,'cross-kind-copy-source');
+                  this.readBufferShadow(sourceBuffer|0,known,'cross-kind-copy-source');
+                }
+              }
+              const stats=window.__gaiusGLStats || {};
+              const before=stats.crossKindBufferCopyReadbacks|0;
+              const result=crossKindBufferCopy.call(this,sourceTarget,targetTarget,sourceBuffer,
+                targetBuffer,sourceOffset,targetOffset,size);
+              if ((stats.crossKindBufferCopyReadbacks|0)!==before) count('cross-kind-copy',size);
+              return result;
+            };
+            const shadowBufferData=state.shadowBufferData;
+            state.shadowBufferData=function(buffer,data,size) {
+              const actual=Number(size !== undefined && size !== null ? size : 0);
+              if (!retention.enabled || data || !buffer || !(actual>0)
+                  || actual>this.maxSingleBufferShadowBytes()) {
+                return shadowBufferData.call(this,buffer,data,size);
+              }
+              // New storage is zero-filled by WebGL: so is its shadow.
+              this.deleteBufferShadow(buffer);
+              if (!this.reserveBufferShadowBytes(buffer,actual)) {
+                return shadowBufferData.call(this,buffer,data,size);
+              }
+              const copy=new Uint8Array(actual);
+              this.bufferBytes.set(buffer,copy);
+              this.bufferShadowTotalBytes=(Number(this.bufferShadowTotalBytes)||0)+actual;
+              this.touchBufferShadow(buffer,actual);
+              this.bumpBufferVersion(buffer);
+              this.updateBufferShadowTelemetry();
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.bufferShadowZeroAllocations=(stats.bufferShadowZeroAllocations||0)+1;
+            };
+            const evictOldestBufferShadow=state.evictOldestBufferShadow;
+            state.evictOldestBufferShadow=function() {
+              if (!retention.enabled || !this.shadowRequiredBuffers
+                  || !this.shadowRequiredBuffers.size) {
+                return evictOldestBufferShadow.call(this);
+              }
+              let victim=null;
+              const required=this.shadowRequiredBuffers;
+              const keys=this.bufferShadowTouch.keys();
+              for (let step=keys.next();!step.done;step=keys.next()) {
+                if (!required.has(step.value|0) && this.bufferBytes.has(step.value)) {
+                  victim=step.value;
+                  break;
+                }
+              }
+              if (victim===null) return evictOldestBufferShadow.call(this);
+              const bytes=this.deleteBufferShadow(victim);
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.bufferShadowEvictions=(stats.bufferShadowEvictions||0)+1;
+              stats.bufferShadowEvictedBytes=(stats.bufferShadowEvictedBytes||0)+bytes;
+              stats.bufferShadowUnrequiredEvictions=(stats.bufferShadowUnrequiredEvictions||0)+1;
+              return bytes;
+            };
+            """)
+    private static native void initializeShadowRetentionJs();
+
+    /**
+     * WebAssembly GC only: vertexAttribDivisor calls that would not change the bound vertex
+     * array are skipped. The vertex array emulation re-applies every attribute's divisor when a
+     * draw binds its format (about 70 calls a frame), and unlike the pointers and enables, which
+     * the emulation already compares, each one went to the GPU process. The divisors are kept
+     * per WebGL vertex array object (the context's bindVertexArray, vertexAttribDivisor and
+     * deleteVertexArray are wrapped, so every caller is seen; a deleted array and a lost
+     * context forget theirs). ?gaiusDivisorCache=0 keeps every call (at run time,
+     * {@code divisorCache.enabled=false} passes every call on and keeps recording).
+     */
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (!gl || !state || state.divisorCache) return;
+            let params=null;
+            try {
+              params=new URLSearchParams(String(location.search || ''));
+            } catch (ignored) {
+              params=null;
+            }
+            const value=params ? String(params.get('gaiusDivisorCache') || '').toLowerCase() : '';
+            if (value==='0' || value==='false' || value==='off') return;
+            const bindVertexArray=gl.bindVertexArray;
+            const vertexAttribDivisor=gl.vertexAttribDivisor;
+            const deleteVertexArray=gl.deleteVertexArray;
+            const defaultArray={};
+            const cache={enabled:true,divisors:new WeakMap(),current:defaultArray,skipped:0,applied:0};
+            state.divisorCache=cache;
+            const divisorsOf=function(array) {
+              let divisors=cache.divisors.get(array);
+              if (!divisors) {
+                divisors=new Map();
+                cache.divisors.set(array,divisors);
+              }
+              return divisors;
+            };
+            gl.bindVertexArray=function(array) {
+              cache.current=array || defaultArray;
+              return bindVertexArray.call(this,array);
+            };
+            gl.vertexAttribDivisor=function(index,divisor) {
+              const divisors=divisorsOf(cache.current);
+              const slot=index|0;
+              const next=divisor>>>0;
+              if (cache.enabled && divisors.get(slot)===next) {
+                cache.skipped++;
+                return;
+              }
+              cache.applied++;
+              const result=vertexAttribDivisor.call(this,index,divisor);
+              divisors.set(slot,next);
+              return result;
+            };
+            gl.deleteVertexArray=function(array) {
+              if (array) {
+                cache.divisors.delete(array);
+                if (cache.current===array) cache.current=defaultArray;
+              }
+              return deleteVertexArray.call(this,array);
+            };
+            if (gl.canvas && gl.canvas.addEventListener) {
+              gl.canvas.addEventListener('webglcontextlost',function() {
+                cache.divisors=new WeakMap();
+                cache.current=defaultArray;
+              },false);
+            }
+            """)
+    private static native void initializeDivisorCacheJs();
 
     @JSBody(params = {"index"}, script = """
             const state=window.__gaiusGL,vao=state.getVaoEmu(),idx=index|0;
@@ -6965,7 +8955,8 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"array"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
-            if ((state.currentVaoId|0)===(array|0)) {
+            if ((state.currentVaoId|0)===(array|0)
+                && !(state.perfGl2 && state.perfGl2.vaoDirty)) {
               return;
             }
             state.currentVaoId=array|0;
@@ -6975,7 +8966,13 @@ public final class BrowserOpenGL {
             const vao=state.currentVaoCache || state.getVaoEmu();
             state.boundBuffers.set(gl.ELEMENT_ARRAY_BUFFER,vao.elementArrayBuffer|0);
             """)
-    public static native void bindVertexArray(int array);
+    private static native void bindVertexArrayJs(int array);
+
+    public static void bindVertexArray(int array) {
+        if (BrowserOpenGLPerf.skipVao(array)) return;
+        bindVertexArrayJs(array);
+        BrowserOpenGLPerf.rememberVao(array);
+    }
 
     @JSBody(params = {"array"}, script = """
             const state=window.__gaiusGL, object=state.vaos.get(array);
@@ -7250,6 +9247,10 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"target", "internalFormat", "buffer"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (state.texelBufferCache && state.texelBufferCache.enabled) {
+              state.texelBufferCache.bind(target,internalFormat,buffer);
+              return;
+            }
             if (target !== 0x8C2A) {
               return;
             }
@@ -7280,12 +9281,14 @@ public final class BrowserOpenGL {
             let webType=gl.UNSIGNED_BYTE;
             let bytesPerTexel=1;
             let signedInteger=false;
-            if (internalFormat === 0x8231 || internalFormat === 0x8229) {
-              webInternalFormat=0x8231;
+            let signed32=false;
+            if (internalFormat === 0x8231 || internalFormat === 0x8229 || internalFormat === 0x8235) {
+              signed32=internalFormat === 0x8235;
+              webInternalFormat=signed32 ? 0x8235 : 0x8231;
               webFormat=0x8D94;
-              webType=gl.BYTE;
+              webType=signed32 ? gl.INT : gl.BYTE;
               signedInteger=true;
-              bytesPerTexel=1;
+              bytesPerTexel=signed32 ? 4 : 1;
             } else if (internalFormat === gl.RGBA8) {
               webInternalFormat=gl.RGBA8;
               webFormat=gl.RGBA;
@@ -7305,7 +9308,9 @@ public final class BrowserOpenGL {
                 source=padded;
               }
               upload=signedInteger
-                ? new Int8Array(source.buffer,source.byteOffset || 0,paddedLength)
+                ? (signed32
+                  ? new Int32Array(source.buffer,source.byteOffset || 0,paddedLength / 4)
+                  : new Int8Array(source.buffer,source.byteOffset || 0,paddedLength))
                 : source;
               if (!signedInteger) {
                 const unsignedStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
@@ -7313,7 +9318,9 @@ public final class BrowserOpenGL {
                   (unsignedStats.texBufferUnsignedViewSkips||0)+1;
               }
             } else {
-              upload=signedInteger ? new Int8Array(paddedLength) : new Uint8Array(paddedLength);
+              upload=signedInteger
+                ? (signed32 ? new Int32Array(paddedLength / 4) : new Int8Array(paddedLength))
+                : new Uint8Array(paddedLength);
             }
             const previousAlignment=state.unpackAlignment|0;
             const previousRowLength=state.unpackRowLength|0;
@@ -7341,6 +9348,10 @@ public final class BrowserOpenGL {
                 texture,gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
               state.applyTextureParameter(
                 texture,gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+              state.applyTextureParameter(
+                texture,gl.TEXTURE_2D,gl.TEXTURE_BASE_LEVEL,0);
+              state.applyTextureParameter(
+                texture,gl.TEXTURE_2D,gl.TEXTURE_MAX_LEVEL,0);
               gl.texImage2D(gl.TEXTURE_2D,0,webInternalFormat,width,height,0,webFormat,webType,upload);
             } finally {
               if (changeAlignment) gl.pixelStorei(gl.UNPACK_ALIGNMENT,previousAlignment);
@@ -7603,11 +9614,8 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"unit", "sampler"}, script = """
             const state=window.__gaiusGL;
-            if (state.samplerBindings.has(unit|0)
-                && (state.samplerBindings.get(unit|0)|0)===(sampler|0)) return;
-            window.__gaiusWebGL.bindSampler(
-              unit,sampler===0?null:state.samplers.get(sampler));
             state.samplerBindings.set(unit|0,sampler|0);
+            state.applySamplerBinding(unit);
             """)
     public static native void bindSampler(int unit, int sampler);
 
@@ -7615,7 +9623,11 @@ public final class BrowserOpenGL {
             const state=window.__gaiusGL, object=state.samplers.get(sampler);
             if (object) window.__gaiusWebGL.deleteSampler(object); state.samplers.delete(sampler);
             state.samplerBindings.forEach(function(bound,unit) {
-              if ((bound|0)===(sampler|0)) state.samplerBindings.delete(unit|0);
+              if ((bound|0)===(sampler|0)) {
+                state.samplerBindings.delete(unit|0);
+                state.effectiveSamplerBindings.delete(unit|0);
+                state.applySamplerBinding(unit);
+              }
             });
             """)
     public static native void deleteSampler(int sampler);
@@ -7931,6 +9943,40 @@ public final class BrowserOpenGL {
             """)
     public static native boolean shouldReportMinecraftState();
 
+    @JSBody(script = """
+            const capture = globalThis.__gaiusCapture;
+            if (!capture || capture.enabled !== true) return -1;
+            const tick = capture.animationTick;
+            if (!Number.isInteger(tick) || tick < 0 || tick > 1200) return -1;
+            capture.animationHook = 'vanilla-replay-v1';
+            capture.animationApplications = (capture.animationApplications || 0) + 1;
+            capture.appliedAnimationTick = tick;
+            return tick;
+            """)
+    private static native int requestedCaptureAnimationTick();
+
+    @JSBody(params = {"cloudsOff", "particlesMinimal"}, script = """
+            const capture = globalThis.__gaiusCapture;
+            if (capture && capture.enabled === true) {
+                capture.optionsObserved = {cloudsOff: cloudsOff, particlesMinimal: particlesMinimal};
+            }
+            """)
+    private static native void reportCaptureOptions(boolean cloudsOff, boolean particlesMinimal);
+
+    @JSBody(params = {"enabled"}, script = "globalThis.__gaiusCloudsEnabled = !!enabled;")
+    private static native void publishCloudOption(boolean enabled);
+
+    public static int captureAnimationTick() {
+        int tick = requestedCaptureAnimationTick();
+        if (tick >= 0) {
+            Minecraft minecraft = Minecraft.getInstance();
+            publishCloudOption(minecraft.options.cloudStatus().get().ordinal() != 0);
+            reportCaptureOptions(minecraft.options.cloudStatus().get().ordinal() == 0,
+                    minecraft.options.particles().get().ordinal() == 2);
+        }
+        return tick;
+    }
+
     public static void reportMinecraftState(
             Object screen, Object overlay, Object level, Object player, Object gameMode, Object hitResult,
             boolean noRender, boolean running, boolean pause) {
@@ -8018,6 +10064,7 @@ public final class BrowserOpenGL {
         try {
             Minecraft minecraft = Minecraft.getInstance();
             if (minecraft != null && minecraft.options != null) {
+                publishCloudOption(minecraft.options.cloudStatus().get().ordinal() != 0);
                 rawRenderDistance = minecraft.options.renderDistance().get();
                 effectiveRenderDistance = minecraft.options.getEffectiveRenderDistance();
                 rawSimulationDistance = minecraft.options.simulationDistance().get();
@@ -8108,19 +10155,83 @@ public final class BrowserOpenGL {
         } else {
             MINECRAFT_STATE_DETAILS.clearHit();
         }
-        // Two calls: TeaVM's WebAssembly GC backend limits JSBody natives to 32 parameters.
-        stageMinecraftPlayerStateJs(
-                className(player), playerX, playerY, playerZ, playerYaw, playerPitch,
-                playerCollisionKnown, playerCollisionFree,
-                playerMode, selectedSlot, selectedItem, selectedCount);
+        // One call: the numbers go in one packed array (TeaVM's WebAssembly GC backend limits
+        // JSBody natives to 32 parameters), the strings stay arguments.
+        double[] state = MINECRAFT_STATE_VALUES;
+        state[S_PLAYER_X] = playerX;
+        state[S_PLAYER_Y] = playerY;
+        state[S_PLAYER_Z] = playerZ;
+        state[S_PLAYER_YAW] = playerYaw;
+        state[S_PLAYER_PITCH] = playerPitch;
+        state[S_PLAYER_COLLISION_KNOWN] = playerCollisionKnown ? 1 : 0;
+        state[S_PLAYER_COLLISION_FREE] = playerCollisionFree ? 1 : 0;
+        state[S_SELECTED_SLOT] = selectedSlot;
+        state[S_SELECTED_COUNT] = selectedCount;
+        state[S_SCREEN_WIDTH] = screenWidth;
+        state[S_SCREEN_HEIGHT] = screenHeight;
+        state[S_LOADED_CHUNK_COUNT] = loadedChunkCount;
+        state[S_RAW_RENDER_DISTANCE] = rawRenderDistance;
+        state[S_EFFECTIVE_RENDER_DISTANCE] = effectiveRenderDistance;
+        state[S_RAW_SIMULATION_DISTANCE] = rawSimulationDistance;
+        state[S_SERVER_SIMULATION_DISTANCE] = serverSimulationDistance;
+        state[S_NO_RENDER] = noRender ? 1 : 0;
+        state[S_RUNNING] = running ? 1 : 0;
+        state[S_PAUSE] = pause ? 1 : 0;
+        if (JsArrays.LINEAR_MEMORY) {
+            String[] fields = minecraftStateArguments;
+            if (fields == null) {
+                fields = new String[14];
+                minecraftStateArguments = fields;
+                minecraftStateSent = new String[14];
+            }
+            fields[0] = className(player);
+            fields[1] = playerMode;
+            fields[2] = selectedItem;
+            fields[3] = className(screen);
+            fields[4] = screenTitle;
+            fields[5] = screenWidgetsJson;
+            fields[6] = className(overlay);
+            fields[7] = className(level);
+            fields[8] = hitClass;
+            fields[9] = hitType;
+            fields[10] = hitBlockPos;
+            fields[11] = hitDirection;
+            fields[12] = hitBlockState;
+            fields[13] = hitEntity;
+            int changed = minecraftStateChanges(fields);
+            reportMinecraftStateChangedJs(JsArrays.float64(state), changed,
+                    fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
+                    fields[7], fields[8], fields[9], fields[10], fields[11], fields[12], fields[13]);
+            return;
+        }
         reportMinecraftStateJs(
-                className(screen), screenTitle, screenWidth, screenHeight, screenWidgetsJson,
+                JsArrays.float64(state),
+                className(player), playerMode, selectedItem,
+                className(screen), screenTitle, screenWidgetsJson,
                 className(overlay), className(level),
-                loadedChunkCount, playerMode,
-                hitClass, hitType, hitBlockPos, hitDirection, hitBlockState, hitEntity,
-                rawRenderDistance, effectiveRenderDistance, rawSimulationDistance,
-                serverSimulationDistance,
-                noRender, running, pause);
+                hitClass, hitType, hitBlockPos, hitDirection, hitBlockState, hitEntity);
+    }
+
+    /**
+     * WebAssembly GC: the bit mask of the state report fields whose text differs from what JS
+     * last received (bit i for {@code fields[i]}); an unchanged field is set to null in
+     * {@code fields}, so only changed texts become JS strings (the title screen reports 14
+     * mostly unchanged strings, among them the widget JSON, every 50 ms).
+     */
+    private static int minecraftStateChanges(String[] fields) {
+        String[] sent = minecraftStateSent;
+        int changed = 0;
+        for (int i = 0; i < fields.length; i++) {
+            String value = fields[i];
+            String previous = sent[i];
+            if (value == null ? previous == null : value.equals(previous)) {
+                fields[i] = null;
+            } else {
+                sent[i] = value;
+                changed |= 1 << i;
+            }
+        }
+        return changed;
     }
 
     public static Object fallbackClientLevel(Object minecraft, Object level) {
@@ -8225,14 +10336,80 @@ public final class BrowserOpenGL {
         builder.append('"');
     }
 
+    /**
+     * Writes {@code window.__gaiusMinecraftState}. {@code v} holds the numbers at the
+     * {@code S_*} indices (booleans as 0/1); the strings are arguments. Also samples the memory
+     * footprint into {@code __gaiusMemoryTelemetry.footprint} at most once a second, plus once
+     * at the first screen and at the first title screen (startup snapshots): JS heap
+     * ({@code performance.memory}), WebAssembly linear memory ({@code memory.buffer.byteLength},
+     * 0 on the JavaScript build) and the BrowserMemory live and peak bytes last published to
+     * {@code __gaiusMemoryTelemetry.browserMemory}.
+     */
     @JSBody(params = {
-            "playerClass",
-            "playerX", "playerY", "playerZ", "playerYaw", "playerPitch",
-            "playerCollisionKnown", "playerCollisionFree",
-            "playerMode", "selectedSlot", "selectedItem", "selectedCount"
-    }, script = """
+            "v",
+            "playerClass", "playerMode", "selectedItem",
+            "screen", "screenTitle", "screenWidgetsJson",
+            "overlay", "level",
+            "hitClass", "hitType", "hitBlockPos", "hitDirection", "hitBlockState", "hitEntity"
+    }, script = MINECRAFT_STATE_SCRIPT)
+    private static native void reportMinecraftStateJs(
+            Float64Array values,
+            String playerClass, String playerMode, String selectedItem,
+            String screen, String screenTitle, String screenWidgetsJson,
+            String overlay, String level,
+            String hitClass, String hitType, String hitBlockPos, String hitDirection,
+            String hitBlockState, String hitEntity);
+
+    /**
+     * {@link #reportMinecraftStateJs} for WebAssembly GC, where every Java String argument
+     * becomes a new JS string: only the fields whose bit is set in {@code changed} carry their
+     * text ({@link #minecraftStateChanges}); JS keeps the others from the previous reports
+     * (globalThis.__gaiusMinecraftStateStrings). The rest of the script is the same.
+     */
+    @JSBody(params = {
+            "v", "changed",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13"
+    }, script = MINECRAFT_STATE_CHANGED_PREFIX + MINECRAFT_STATE_SCRIPT)
+    private static native void reportMinecraftStateChangedJs(
+            Float64Array values, int changed,
+            String s0, String s1, String s2, String s3, String s4, String s5, String s6,
+            String s7, String s8, String s9, String s10, String s11, String s12, String s13);
+
+    /** The field cache of {@link #reportMinecraftStateChangedJs}, in the order of its parameters. */
+    private static final String MINECRAFT_STATE_CHANGED_PREFIX = """
+            var c = globalThis.__gaiusMinecraftStateStrings;
+            if (!c) {
+              c = [null, null, null, null, null, null, null, null, null, null, null, null, null, null];
+              globalThis.__gaiusMinecraftStateStrings = c;
+            }
+            if (changed !== 0) {
+              if (changed & 1) c[0] = s0;
+              if (changed & 2) c[1] = s1;
+              if (changed & 4) c[2] = s2;
+              if (changed & 8) c[3] = s3;
+              if (changed & 16) c[4] = s4;
+              if (changed & 32) c[5] = s5;
+              if (changed & 64) c[6] = s6;
+              if (changed & 128) c[7] = s7;
+              if (changed & 256) c[8] = s8;
+              if (changed & 512) c[9] = s9;
+              if (changed & 1024) c[10] = s10;
+              if (changed & 2048) c[11] = s11;
+              if (changed & 4096) c[12] = s12;
+              if (changed & 8192) c[13] = s13;
+            }
+            var playerClass = c[0], playerMode = c[1], selectedItem = c[2];
+            var screen = c[3], screenTitle = c[4], screenWidgetsJson = c[5];
+            var overlay = c[6], level = c[7];
+            var hitClass = c[8], hitType = c[9], hitBlockPos = c[10], hitDirection = c[11];
+            var hitBlockState = c[12], hitEntity = c[13];
+            """;
+
+    /** The script of the two report bodies above (after the prefix in the wasm one). */
+    private static final String MINECRAFT_STATE_SCRIPT = """
             var playerState = null;
             if (playerClass !== null) {
+              var playerX = v[0], playerY = v[1], playerZ = v[2], playerYaw = v[3], playerPitch = v[4];
               playerState = {
                 "className": playerClass,
                 "x": Number.isFinite(playerX) ? playerX : null,
@@ -8240,34 +10417,15 @@ public final class BrowserOpenGL {
                 "z": Number.isFinite(playerZ) ? playerZ : null,
                 "yaw": Number.isFinite(playerYaw) ? playerYaw : null,
                 "pitch": Number.isFinite(playerPitch) ? playerPitch : null,
-                "collisionFree": playerCollisionKnown ? !!playerCollisionFree : null,
+                "collisionFree": v[5] ? !!v[6] : null,
                 "gameMode": playerMode,
-                "selectedItem": selectedSlot >= 0 ? {
-                  "slot": selectedSlot,
+                "selectedItem": v[7] >= 0 ? {
+                  "slot": v[7],
                   "item": selectedItem,
-                  "count": selectedCount
+                  "count": v[8]
                 } : null
               };
             }
-            window.__gaiusMinecraftPlayerStateStage = playerState;
-            """)
-    private static native void stageMinecraftPlayerStateJs(
-            String playerClass,
-            double playerX, double playerY, double playerZ, float playerYaw, float playerPitch,
-            boolean playerCollisionKnown, boolean playerCollisionFree,
-            String playerMode, int selectedSlot, String selectedItem, int selectedCount);
-
-    @JSBody(params = {
-            "screen", "screenTitle", "screenWidth", "screenHeight", "screenWidgetsJson",
-            "overlay", "level",
-            "loadedChunkCount", "playerMode",
-            "hitClass", "hitType", "hitBlockPos", "hitDirection", "hitBlockState", "hitEntity",
-            "rawRenderDistance", "effectiveRenderDistance", "rawSimulationDistance",
-            "serverSimulationDistance",
-            "noRender", "running", "pause"
-    }, script = """
-            var playerState = window.__gaiusMinecraftPlayerStateStage || null;
-            window.__gaiusMinecraftPlayerStateStage = null;
             var hitState = null;
             if (hitClass !== null || hitType !== null) {
               hitState = {
@@ -8287,6 +10445,9 @@ public final class BrowserOpenGL {
                 screenWidgetState = [{"type":"<parse-error>","text":String(screenWidgetsJson).slice(0,160)}];
               }
             }
+            var screenWidth = v[9], screenHeight = v[10], loadedChunkCount = v[11];
+            var rawRenderDistance = v[12], effectiveRenderDistance = v[13];
+            var rawSimulationDistance = v[14], serverSimulationDistance = v[15];
             window.__gaiusMinecraftState = {
               "screen": screen,
               "screenTitle": screenTitle,
@@ -8310,22 +10471,80 @@ public final class BrowserOpenGL {
                   ? serverSimulationDistance : null,
                 "sampledAtMillis": Date.now()
               },
-              "noRender": noRender,
-              "running": running,
-              "pause": pause,
+              "noRender": !!v[16],
+              "running": !!v[17],
+              "pause": !!v[18],
               "at": Date.now()
             };
-            """)
-    private static native void reportMinecraftStateJs(
-            String screen, String screenTitle, int screenWidth, int screenHeight, String screenWidgetsJson,
-            String overlay, String level,
-            int loadedChunkCount, String playerMode,
-            String hitClass, String hitType, String hitBlockPos, String hitDirection, String hitBlockState,
-            String hitEntity,
-            int rawRenderDistance, int effectiveRenderDistance,
-            int rawSimulationDistance,
-            int serverSimulationDistance,
-            boolean noRender, boolean running, boolean pause);
+            var now = (typeof performance !== 'undefined' && performance.now)
+              ? performance.now() : Date.now();
+            var memoryRoot = globalThis.__gaiusMemoryTelemetry;
+            if (!memoryRoot || typeof memoryRoot !== 'object' || Array.isArray(memoryRoot)) {
+              memoryRoot = {};
+              globalThis.__gaiusMemoryTelemetry = memoryRoot;
+            }
+            var footprint = memoryRoot.footprint;
+            var titleScreen = screen !== null && String(screen).endsWith('.TitleScreen');
+            if (!footprint || now - footprint.sampledAt >= 1000
+                || (screen !== null && !footprint.firstScreen)
+                || (titleScreen && !footprint.firstTitleScreen)) {
+              if (!footprint) {
+                footprint = {
+                  "runtime": null,
+                  "samples": 0,
+                  "sampledAt": 0,
+                  "usedJSHeapSize": null,
+                  "totalJSHeapSize": null,
+                  "jsHeapSizeLimit": null,
+                  "linearMemoryBytes": 0,
+                  "footprintBytes": null,
+                  "browserMemoryLiveBytes": null,
+                  "browserMemoryPeakBytes": null,
+                  "peakUsedJSHeapSize": 0,
+                  "peakLinearMemoryBytes": 0,
+                  "peakFootprintBytes": 0,
+                  "firstScreen": null,
+                  "firstTitleScreen": null
+                };
+                memoryRoot.footprint = footprint;
+              }
+              var heap = typeof performance !== 'undefined' ? performance.memory : null;
+              var wasmMemory = globalThis.__gaiusWasmMemory;
+              var linearBytes = wasmMemory && wasmMemory.buffer ? wasmMemory.buffer.byteLength : 0;
+              var browserMemory = memoryRoot.browserMemory;
+              footprint.runtime = wasmMemory ? 'wasm' : 'js';
+              footprint.usedJSHeapSize = heap ? heap.usedJSHeapSize : null;
+              footprint.totalJSHeapSize = heap ? heap.totalJSHeapSize : null;
+              footprint.jsHeapSizeLimit = heap ? heap.jsHeapSizeLimit : null;
+              footprint.linearMemoryBytes = linearBytes;
+              footprint.footprintBytes = heap ? heap.usedJSHeapSize + linearBytes : null;
+              footprint.browserMemoryLiveBytes = browserMemory
+                ? Number(browserMemory.liveBytes) || 0 : null;
+              footprint.browserMemoryPeakBytes = browserMemory
+                ? Number(browserMemory.peakLiveBytes) || 0 : null;
+              footprint.peakUsedJSHeapSize = Math.max(footprint.peakUsedJSHeapSize,
+                footprint.usedJSHeapSize || 0);
+              footprint.peakLinearMemoryBytes = Math.max(footprint.peakLinearMemoryBytes, linearBytes);
+              footprint.peakFootprintBytes = Math.max(footprint.peakFootprintBytes,
+                footprint.footprintBytes || 0);
+              footprint.samples = (footprint.samples + 1) | 0;
+              footprint.sampledAt = now;
+              if ((screen !== null && !footprint.firstScreen)
+                  || (titleScreen && !footprint.firstTitleScreen)) {
+                var snapshot = {
+                  "screen": screen,
+                  "atMillis": now,
+                  "usedJSHeapSize": footprint.usedJSHeapSize,
+                  "linearMemoryBytes": linearBytes,
+                  "footprintBytes": footprint.footprintBytes,
+                  "browserMemoryLiveBytes": footprint.browserMemoryLiveBytes,
+                  "browserMemoryPeakBytes": footprint.browserMemoryPeakBytes
+                };
+                if (!footprint.firstScreen) footprint.firstScreen = snapshot;
+                if (titleScreen && !footprint.firstTitleScreen) footprint.firstTitleScreen = snapshot;
+              }
+            }
+            """;
 
     @JSBody(params = {"type"}, script = """
             const counters = window.__gaiusMinecraftCounters || (window.__gaiusMinecraftCounters = {});
@@ -8547,6 +10766,23 @@ public final class BrowserOpenGL {
         reportMinecraftEventJs(event, detail);
     }
 
+    /** Diagnostic-only client chunk packet position telemetry. */
+    public static void reportMinecraftChunkPacket(int x, int z) {
+        reportMinecraftChunkPacketJs(x, z);
+    }
+
+    @JSBody(params = {"x", "z"}, script = """
+            var packet = globalThis.__gaiusClientChunkPacketPositions;
+            if (!packet) {
+              packet = {positions: [], count: 0};
+              globalThis.__gaiusClientChunkPacketPositions = packet;
+            }
+            packet.count = (packet.count || 0) + 1;
+            packet.positions.push([x | 0, z | 0]);
+            if (packet.positions.length > 20000) packet.positions.splice(0, packet.positions.length - 20000);
+            """)
+    private static native void reportMinecraftChunkPacketJs(int x, int z);
+
     public static void reportMinecraftThrowable(String phase, Throwable throwable) {
         String detail = describeThrowable(throwable);
         reportMinecraftEvent("throwable." + phase, detail);
@@ -8714,15 +10950,71 @@ public final class BrowserOpenGL {
         return Int8Array.fromJavaBuffer(slice);
     }
 
+    /** WebAssembly GC: the range check of {@link #bytesSlice} for the (address, length) flushes. */
+    private static void checkSliceRange(ByteBuffer buffer, long offset, long length) {
+        if (offset < 0L || length < 0L || length > Integer.MAX_VALUE
+                || offset > buffer.capacity() - length) {
+            throw new IllegalArgumentException(
+                    "Unsupported WebGL mapped buffer flush range: " + offset + " + " + length);
+        }
+    }
+
+    /**
+     * WebAssembly GC: the linear-memory address of element 0 of a direct buffer. With its
+     * capacity this is the range {@code Int8Array.fromJavaBuffer} exports (the backing view, not
+     * the position/limit window), so the (address, length) uploads send the same bytes.
+     */
+    private static int linearBase(ByteBuffer buffer) {
+        return (int) MemoryUtil.memAddress(buffer) - buffer.position();
+    }
+
     private static Int8Array pointerBytes(long address, int length) {
         if (address == 0L) {
             return null;
         }
         if (length <= 0) {
+            if (JsArrays.LINEAR_MEMORY) {
+                if (emptyBytes == null) {
+                    emptyBytes = Int8Array.create(0);
+                }
+                return emptyBytes;
+            }
             return JsArrays.int8(new byte[0]);
         }
         ByteBuffer bytes = MemoryUtil.memByteBuffer(address, length);
         return Int8Array.fromJavaBuffer(bytes);
+    }
+
+    /**
+     * WebAssembly GC: linear-memory address of the remaining floats of {@code buffer}; a direct
+     * little-endian buffer is read in place, any other buffer is staged in the {@link JsArrays}
+     * scratch area.
+     */
+    private static int linearFloats(FloatBuffer buffer) {
+        if (buffer.isDirect() && buffer.order() == ByteOrder.LITTLE_ENDIAN) {
+            return (int) MemoryUtil.memAddress(buffer);
+        }
+        int count = buffer.remaining();
+        int position = buffer.position();
+        long address = JsArrays.scratch(count << 2);
+        for (int i = 0; i < count; i++) {
+            MemoryUtil.memPutFloat(address + ((long) i << 2), buffer.get(position + i));
+        }
+        return (int) address;
+    }
+
+    /** WebAssembly GC: {@link #linearFloats} for ints. */
+    private static int linearInts(IntBuffer buffer) {
+        if (buffer.isDirect() && buffer.order() == ByteOrder.LITTLE_ENDIAN) {
+            return (int) MemoryUtil.memAddress(buffer);
+        }
+        int count = buffer.remaining();
+        int position = buffer.position();
+        long address = JsArrays.scratch(count << 2);
+        for (int i = 0; i < count; i++) {
+            MemoryUtil.memPutInt(address + ((long) i << 2), buffer.get(position + i));
+        }
+        return (int) address;
     }
 
     private static Float32Array floats(FloatBuffer buffer) {

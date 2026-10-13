@@ -6,7 +6,7 @@
 
 use gaius_kernel_abi::{kind, release_descriptor, run_kernel, JobHeader, RunDescriptor};
 use gaius_noise::synth32::{NormalNoiseParameters, Normalization};
-use gaius_noise::{Profile, RandomKind};
+use gaius_noise::{RandomKind, Semantics};
 use gaius_noise_wasm::job::{run_noise_points, NoisePointsJob, NoiseSpec};
 use std::path::PathBuf;
 
@@ -31,13 +31,13 @@ fn positions(count: usize, integral: bool) -> Vec<f64> {
 
 fn jobs() -> Vec<NoisePointsJob> {
     let mut jobs = Vec::new();
-    for profile in Profile::ALL {
+    for &semantics in Semantics::all() {
         for (random, fork) in [
             (RandomKind::Xoroshiro, Some("minecraft:continentalness")),
             (RandomKind::Legacy, None),
         ] {
             jobs.push(NoisePointsJob {
-                profile,
+                semantics,
                 random,
                 seed: 7331008642,
                 fork: fork.map(String::from),
@@ -49,7 +49,7 @@ fn jobs() -> Vec<NoisePointsJob> {
             });
         }
         jobs.push(NoisePointsJob {
-            profile,
+            semantics,
             random: RandomKind::Xoroshiro,
             seed: -42,
             fork: Some("minecraft:terrain".into()),
@@ -57,8 +57,10 @@ fn jobs() -> Vec<NoisePointsJob> {
             xyz: positions(32, true),
         });
     }
-    jobs.push(NoisePointsJob {
-        profile: Profile::V26_3,
+    // NormalNoise recipes exist only with the float synth classes.
+    let float = Semantics::all().iter().copied().find(|s| s.uses_synth32());
+    jobs.extend(float.map(|semantics| NoisePointsJob {
+        semantics,
         random: RandomKind::Xoroshiro,
         seed: 12345,
         fork: Some("minecraft:ridge".into()),
@@ -70,7 +72,7 @@ fn jobs() -> Vec<NoisePointsJob> {
             amplitude_modifiers: vec![1.0, 2.0, 1.0, 0.0, 0.0, 0.0],
         }),
         xyz: positions(64, false),
-    });
+    }));
     jobs
 }
 

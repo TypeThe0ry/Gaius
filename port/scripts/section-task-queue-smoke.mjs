@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {existsSync} from "node:fs";
@@ -7,6 +8,8 @@ import {copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promise
 import {tmpdir} from "node:os";
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
+import {stageSources} from "../tools/sourcesets/sourcesets.mjs";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const config = JSON.parse(await readFile(
@@ -48,8 +51,8 @@ if (configuredProfileId !== version) {
 }
 // SectionTaskDynamicQueue and its SectionTask/RenderSection surface are byte-identical in
 // 26.2 and 26.3 (after the renderpearl renames), so both modern profiles run the same checks.
-if (version !== "26.2" && version !== "26.3") {
-  throw new Error(`section task queue smoke supports profiles 26.2 and 26.3; got ${version}`);
+if (version !== CANONICAL_PROFILE.id && version !== RENDERPEARL_PROFILE.id) {
+  throw new Error(`section task queue smoke supports profiles ${CANONICAL_PROFILE.id} and ${RENDERPEARL_PROFILE.id}; got ${version}`);
 }
 const overlayJar = process.env.GAIUS_SECTION_QUEUE_JAR
   ? nativePath(process.env.GAIUS_SECTION_QUEUE_JAR)
@@ -125,10 +128,8 @@ function selectJavaTools() {
 
 const javaTools = selectJavaTools();
 
-const patcher = await readFile(
-  new URL("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java", import.meta.url),
-  "utf8",
-);
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = stepSource("MinecraftClientPatcher");
 for (const contract of [
   "browserDirtyTasks",
   "browserTaskOrder",
@@ -638,15 +639,14 @@ try {
   await mkdir(path.dirname(strictMathFile), {recursive: true});
   await writeFile(strictMathFile, strictMathTwin, "utf8");
   // The mesh kernel patches make RenderSection and SectionCompiler implement the interfaces of
-  // dev.gaius.browser.kernel.mesh.MeshKernelAccess (port/src, per profile); compile them from
-  // the profile's sources (javac pulls in what they reference through -sourcepath).
-  const sourceRoots = [
-    path.join(repositoryRoot, `port/src/versions/${version}/java`),
-    path.join(repositoryRoot, "port/src/main/java"),
-  ];
+  // dev.gaius.browser.kernel.mesh.MeshKernelAccess (port/mc/shared, per profile); compile them
+  // from the profile's staged sources (javac pulls in what they reference through -sourcepath).
+  const profileSources = path.join(temporaryRoot, "profile-src");
+  stageSources(profile, "src", "js", profileSources, repositoryRoot);
+  const sourceRoots = [profileSources];
   const portSources = ["dev/gaius/browser/kernel/mesh/MeshKernelAccess.java"]
-    .map((relative) => sourceRoots.map((sourceRoot) => path.join(sourceRoot, relative)).find((file) => existsSync(file)))
-    .filter(Boolean);
+    .map((relative) => path.join(profileSources, relative))
+    .filter((file) => existsSync(file));
   run(javaTools.javac, [
     "-proc:none",
     "-implicit:class",

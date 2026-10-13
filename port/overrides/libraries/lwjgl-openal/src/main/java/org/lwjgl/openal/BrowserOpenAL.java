@@ -1,7 +1,9 @@
 package org.lwjgl.openal;
 
 import dev.gaius.browser.JsArrays;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.ShortBuffer;
@@ -9,6 +11,7 @@ import java.util.Set;
 import java.util.function.IntFunction;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.FunctionProviderLocal;
+import org.lwjgl.system.MemoryUtil;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.typedarrays.Int8Array;
 
@@ -115,6 +118,10 @@ public final class BrowserOpenAL {
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
             const DEFAULT_FORWARD = [0, 0, -1];
             const DEFAULT_UP = [0, 1, 0];
+            // Vanilla creates an AL source for every sound it plays and deletes it when the sound
+            // ends; the gain/panner pair of a deleted source waits here for the next source
+            // instead of becoming garbage (still connected to the master gain, with no input).
+            const MAX_POOLED_GRAPHS = 32;
             const state = {
               next: 1,
               context: null,
@@ -122,6 +129,7 @@ public final class BrowserOpenAL {
               sources: new Map(),
               resumeHooked: false,
               masterGainNode: null,
+              graphPool: [],
               directionalAudio: false,
               listener: {
                 gain: 1,
@@ -149,6 +157,10 @@ public final class BrowserOpenAL {
                 webAudioConnections: 0,
                 webAudioDisconnects: 0,
                 webAudioNaturalEnds: 0,
+                webAudioGraphsPooled: 0,
+                webAudioGraphReuses: 0,
+                audioParamWrites: 0,
+                audioParamWritesSkipped: 0,
                 directionalAudio: false,
                 panningModel: 'equalpower',
                 hrtfFallbacks: 0,
@@ -158,17 +170,36 @@ public final class BrowserOpenAL {
                 contextState: AudioContextClass ? 'created-lazily' : 'unavailable'
               }
             };
+            // Only this file writes these AudioParams, so the last value it wrote is the value the
+            // param holds: an unchanged value (the listener transform every frame, a source that
+            // did not move) schedules no automation event.
             function setParam(param, value) {
               if (!param) return;
+              const number = Number(value) || 0;
+              if (param.__gaiusValue === number) {
+                state.stats.audioParamWritesSkipped++;
+                return;
+              }
               try {
                 if (state.context && typeof param.setValueAtTime === 'function') {
-                  param.setValueAtTime(Number(value) || 0, state.context.currentTime);
+                  param.setValueAtTime(number, state.context.currentTime);
                 } else {
-                  param.value = Number(value) || 0;
+                  param.value = number;
                 }
+                param.__gaiusValue = number;
+                state.stats.audioParamWrites++;
               } catch (ignored) {
-                try { param.value = Number(value) || 0; } catch (ignoredAgain) {}
+                param.__gaiusValue = undefined;
+                try { param.value = number; } catch (ignoredAgain) {}
               }
+            }
+            // The same for the plain attributes of a PannerNode (model names, distances, cones).
+            function setAttribute(node, name, value) {
+              const cache = node.__gaiusAttributes || (node.__gaiusAttributes = {});
+              if (cache[name] === value) return;
+              cache[name] = undefined;
+              node[name] = value;
+              cache[name] = value;
             }
             function finiteNumber(value, fallback) {
               const number = Number(value);
@@ -346,17 +377,17 @@ public final class BrowserOpenAL {
                   finiteNumber(source.referenceDistance, 1));
                 const maxDistance = Math.max(referenceDistance,
                   finiteNumber(source.maxDistance, 10000));
-                panner.distanceModel = distanceModelName(model);
-                panner.refDistance = referenceDistance;
-                panner.rolloffFactor = model === 0x0000 ? 0
-                  : Math.max(0, finiteNumber(source.rolloffFactor, 1));
-                panner.maxDistance = maxDistance;
-                panner.coneInnerAngle = Math.max(0, Math.min(360,
-                  finiteNumber(source.coneInnerAngle, 360)));
-                panner.coneOuterAngle = Math.max(0, Math.min(360,
-                  finiteNumber(source.coneOuterAngle, 360)));
-                panner.coneOuterGain = Math.max(0, Math.min(1,
-                  finiteNumber(source.coneOuterGain, 0)));
+                setAttribute(panner, 'distanceModel', distanceModelName(model));
+                setAttribute(panner, 'refDistance', referenceDistance);
+                setAttribute(panner, 'rolloffFactor', model === 0x0000 ? 0
+                  : Math.max(0, finiteNumber(source.rolloffFactor, 1)));
+                setAttribute(panner, 'maxDistance', maxDistance);
+                setAttribute(panner, 'coneInnerAngle', Math.max(0, Math.min(360,
+                  finiteNumber(source.coneInnerAngle, 360))));
+                setAttribute(panner, 'coneOuterAngle', Math.max(0, Math.min(360,
+                  finiteNumber(source.coneOuterAngle, 360))));
+                setAttribute(panner, 'coneOuterGain', Math.max(0, Math.min(1,
+                  finiteNumber(source.coneOuterGain, 0))));
                 const p = source.position || [0, 0, 0];
                 const d = normalizedVector(
                   source.direction, DEFAULT_FORWARD, source.normalizedDirection);
@@ -393,6 +424,16 @@ public final class BrowserOpenAL {
                 trackNodeCreated(state.masterGainNode, 'master-gain');
                 connectTrackedNode(state.masterGainNode, ctx.destination);
                 applyListener();
+              }
+              if (!source.gainNode && state.graphPool.length > 0) {
+                // A pooled pair is still connected (panner -> gain -> master) and has no input;
+                // every parameter of the new source is applied below.
+                const pooled = state.graphPool.pop();
+                state.stats.webAudioGraphsPooled = state.graphPool.length;
+                state.stats.webAudioGraphReuses++;
+                source.gainNode = pooled.gainNode;
+                source.panner = pooled.panner;
+                if (source.panner) applyPanningModel(source.panner);
               }
               if (!source.gainNode) {
                 source.gainNode = ctx.createGain();
@@ -537,10 +578,31 @@ public final class BrowserOpenAL {
             function disposeSourceGraph(source) {
               if (!source) return;
               stopNodes(source);
-              disposeTrackedNode(source.panner, false);
-              disposeTrackedNode(source.gainNode, false);
+              const gainNode = source.gainNode;
+              const panner = source.panner;
               source.panner = null;
               source.gainNode = null;
+              // stopNodes disconnected every input, so the pair is silent. Keep it for the next
+              // source while it is intact: gain -> master, and the panner (if any) -> gain.
+              if (gainNode && !gainNode.__gaiusDisposed && gainNode.__gaiusConnected
+                  && state.masterGainNode && !state.masterGainNode.__gaiusDisposed
+                  && (!panner || (!panner.__gaiusDisposed && panner.__gaiusConnected))
+                  && state.graphPool.length < MAX_POOLED_GRAPHS) {
+                state.graphPool.push({gainNode: gainNode, panner: panner});
+                state.stats.webAudioGraphsPooled = state.graphPool.length;
+                return;
+              }
+              disposeTrackedNode(panner, false);
+              disposeTrackedNode(gainNode, false);
+            }
+            function disposeGraphPool() {
+              const pool = state.graphPool;
+              state.graphPool = [];
+              state.stats.webAudioGraphsPooled = 0;
+              for (var poolIndex = 0; poolIndex < pool.length; poolIndex++) {
+                disposeTrackedNode(pool[poolIndex].panner, false);
+                disposeTrackedNode(pool[poolIndex].gainNode, false);
+              }
             }
             function processedCount(source) {
               if (!source || !source.scheduled || source.scheduled.length === 0) return 0;
@@ -632,6 +694,7 @@ public final class BrowserOpenAL {
             state.setSourceActive = setSourceActive;
             state.retireScheduledEntry = retireScheduledEntry;
             state.disposeSourceGraph = disposeSourceGraph;
+            state.disposeGraphPool = disposeGraphPool;
             state.processedCount = processedCount;
             state.refreshState = refreshState;
             state.scheduleBuffer = scheduleBuffer;
@@ -661,6 +724,7 @@ public final class BrowserOpenAL {
             state.sources.forEach(function(source) { state.disposeSourceGraph(source); });
             state.sources.clear();
             state.buffers.clear();
+            state.disposeGraphPool();
             if (state.masterGainNode) {
               const master = state.masterGainNode;
               state.masterGainNode = null;
@@ -1344,31 +1408,125 @@ public final class BrowserOpenAL {
     public static native boolean isBuffer(int buffer);
 
     public static void bufferData(int buffer, int format, ByteBuffer data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int length = data == null ? 0 : data.remaining();
+            bufferDataLinearJs(buffer, format, linearAddress(data, length), length, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, bytes(data), frequency);
     }
 
     public static void bufferData(int buffer, int format, ShortBuffer data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int length = data == null ? 0 : data.remaining() * 2;
+            bufferDataLinearJs(buffer, format, linearAddress(data, length), length, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, shorts(data), frequency);
     }
 
     public static void bufferData(int buffer, int format, IntBuffer data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int length = data == null ? 0 : data.remaining() * 4;
+            bufferDataLinearJs(buffer, format, linearAddress(data, length), length, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, ints(data), frequency);
     }
 
     public static void bufferData(int buffer, int format, FloatBuffer data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int length = data == null ? 0 : data.remaining() * 4;
+            bufferDataLinearJs(buffer, format, linearAddress(data, length), length, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, floats(data), frequency);
     }
 
     public static void bufferData(int buffer, int format, short[] data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int count = data == null ? 0 : data.length;
+            int address = count == 0 ? 0 : JsArrays.stageInt16(data, 0, count);
+            bufferDataLinearJs(buffer, format, address, count * 2, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, shorts(data), frequency);
     }
 
     public static void bufferData(int buffer, int format, int[] data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int count = data == null ? 0 : data.length;
+            int address = count == 0 ? 0 : JsArrays.stageInt32(data, 0, count);
+            bufferDataLinearJs(buffer, format, address, count * 4, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, ints(data), frequency);
     }
 
     public static void bufferData(int buffer, int format, float[] data, int frequency) {
+        if (JsArrays.LINEAR_MEMORY) {
+            int count = data == null ? 0 : data.length;
+            int address = count == 0 ? 0 : JsArrays.stageFloat32(data, 0, count);
+            bufferDataLinearJs(buffer, format, address, count * 4, frequency);
+            return;
+        }
         bufferDataJs(buffer, format, floats(data), frequency);
+    }
+
+    /**
+     * WebAssembly GC: linear-memory address of the {@code byteLength} remaining bytes of a
+     * buffer, in place when it is direct (linear memory is little-endian, the byte order the
+     * JavaScript build writes) and staged otherwise; 0 for no data.
+     */
+    private static int linearAddress(Buffer data, int byteLength) {
+        JsArrays.installLinearViews();
+        if (data == null || byteLength <= 0) {
+            return 0;
+        }
+        if (data.isDirect() && littleEndian(data)) {
+            return (int) MemoryUtil.memAddress(data);
+        }
+        int address = JsArrays.scratch(byteLength);
+        long target = address;
+        int position = data.position();
+        int count = data.remaining();
+        if (data instanceof ByteBuffer bytes) {
+            for (int i = 0; i < count; i++) {
+                MemoryUtil.memPutByte(target + i, bytes.get(position + i));
+            }
+        } else if (data instanceof ShortBuffer shorts) {
+            for (int i = 0; i < count; i++) {
+                MemoryUtil.memPutShort(target + ((long) i << 1), shorts.get(position + i));
+            }
+        } else if (data instanceof IntBuffer ints) {
+            for (int i = 0; i < count; i++) {
+                MemoryUtil.memPutInt(target + ((long) i << 2), ints.get(position + i));
+            }
+        } else if (data instanceof FloatBuffer floats) {
+            for (int i = 0; i < count; i++) {
+                MemoryUtil.memPutFloat(target + ((long) i << 2), floats.get(position + i));
+            }
+        } else {
+            throw new IllegalArgumentException("Unsupported OpenAL buffer data: " + data);
+        }
+        return address;
+    }
+
+    /** True when a buffer's elements are stored little-endian (bytes always are). */
+    private static boolean littleEndian(Buffer data) {
+        ByteOrder order;
+        if (data instanceof ByteBuffer) {
+            return true;
+        } else if (data instanceof ShortBuffer shorts) {
+            order = shorts.order();
+        } else if (data instanceof IntBuffer ints) {
+            order = ints.order();
+        } else if (data instanceof FloatBuffer floats) {
+            order = floats.order();
+        } else {
+            return false;
+        }
+        return order == ByteOrder.LITTLE_ENDIAN;
     }
 
     @JSBody(params = {"buffer", "format", "data", "frequency"}, script = """
@@ -1419,6 +1577,66 @@ public final class BrowserOpenAL {
             if (state.context) state.stats.contextState = state.context.state || 'unknown';
             """)
     private static native void bufferDataJs(int buffer, int format, Int8Array data, int frequency);
+
+    /**
+     * {@link #bufferDataJs} reading {@code length} bytes at a linear-memory address (WebAssembly
+     * GC); the decoding is the same.
+     */
+    @JSBody(params = {"buffer", "format", "address", "length", "frequency"}, script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            const ctx = state.ensureContext();
+            format = format|0;
+            frequency = Math.max(1, frequency|0);
+            const byteLength = Math.max(0, length | 0);
+            var bytes = new Uint8Array(0);
+            if ((address | 0) !== 0 && byteLength > 0) {
+              const linear = globalThis.__gaiusLinear;
+              const memory = linear.u8.length ? linear.u8 : linear.refresh().u8;
+              bytes = memory.subarray(address >>> 0, (address >>> 0) + byteLength);
+            }
+            const channels = (format === 0x1102 || format === 0x1103) ? 2 : 1;
+            const bits = (format === 0x1101 || format === 0x1103) ? 16 : 8;
+            const bytesPerSample = bits >> 3;
+            const frameCount = Math.max(0, Math.floor(bytes.length / Math.max(1, channels * bytesPerSample)));
+            var audio = null;
+            if (ctx && frameCount > 0) {
+              audio = ctx.createBuffer(channels, frameCount, frequency);
+              if (bits === 16) {
+                                const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+                                for (var channel = 0; channel < channels; channel++) {
+                                    var out = audio.getChannelData(channel);
+                                    for (var frame = 0; frame < frameCount; frame++) {
+                                        var offset = (frame * channels + channel) * 2;
+                    out[frame] = Math.max(-1, Math.min(1, view.getInt16(offset, true) / 32768));
+                  }
+                }
+              } else {
+                                for (var channel = 0; channel < channels; channel++) {
+                                    var out = audio.getChannelData(channel);
+                                    for (var frame = 0; frame < frameCount; frame++) {
+                    out[frame] = ((bytes[frame * channels + channel] || 0) - 128) / 128;
+                  }
+                }
+              }
+            }
+                        state.buffers.set(buffer|0, {
+                            format: format,
+                            frequency: frequency,
+                            size: bytes.length,
+                            channels: channels,
+                            bits: bits,
+                            audio: audio
+                        });
+            state.stats.buffers = state.buffers.size;
+            state.stats.bufferUploads++;
+            state.stats.lastFormat = format;
+            state.stats.lastFrequency = frequency;
+            state.stats.lastUploadBytes = bytes.length;
+            if (state.context) state.stats.contextState = state.context.state || 'unknown';
+            """)
+    private static native void bufferDataLinearJs(
+            int buffer, int format, int address, int length, int frequency);
 
     public static int getBufferi(int buffer, int parameter) {
         return getBufferiJs(buffer, parameter);

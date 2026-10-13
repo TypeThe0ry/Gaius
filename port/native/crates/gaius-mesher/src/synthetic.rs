@@ -72,7 +72,7 @@ pub fn table(epoch: u32) -> ModelTable {
         v1: 0.5625,
     };
     let mut t = ModelTable {
-        profile: 2,
+        semantics: 2,
         epoch,
         masks: vec![MASK_NONE, MASK_ALL],
         geometry: cube_faces(),

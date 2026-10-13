@@ -1,5 +1,6 @@
 package dev.gaius.browser;
 
+import java.util.Optional;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.DisconnectedScreen;
@@ -8,6 +9,7 @@ import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.server.WorldStem;
 import net.minecraft.network.chat.Component;
+import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import org.teavm.jso.JSBody;
 
@@ -24,17 +26,48 @@ public final class BrowserSingleplayerClient {
     private BrowserSingleplayerClient() {
     }
 
-    /** Returns false when Worker/MessageChannel support is unavailable so vanilla can fall back. */
+    /**
+     * Starts the world in the integrated server Worker and always returns true: vanilla's
+     * in-page integrated server cannot run here (its client connection is a netty LocalAddress,
+     * which the browser channel does not carry), so a Worker that cannot start ends on an error
+     * screen instead of falling back to it.
+     */
     public static boolean open(
             Minecraft minecraft,
             LevelStorageSource.LevelStorageAccess storage,
             WorldStem worldStem,
             boolean newWorld) {
+        return open(minecraft, storage, worldStem, Optional.empty(), newWorld);
+    }
+
+    /**
+     * As {@link #open(Minecraft, LevelStorageSource.LevelStorageAccess, WorldStem, boolean)} for
+     * the profiles whose {@code Minecraft.doWorldLoad} also receives the game rules chosen on the
+     * Create World screen. The world data reaches the Worker through the saved level, but those
+     * rules are a separate argument of vanilla's integrated server, so they travel in the start
+     * message instead (see {@link BrowserGameRulesHandoff}).
+     */
+    public static boolean open(
+            Minecraft minecraft,
+            LevelStorageSource.LevelStorageAccess storage,
+            WorldStem worldStem,
+            Optional<GameRules> initialGameRules,
+            boolean newWorld) {
         if (!isSupported()) {
-            return false;
+            return failLaunch(minecraft, storage, worldStem,
+                    "This browser cannot start the singleplayer server (it needs Web Workers and MessageChannel)");
         }
         if (!storageConfigurationValid()) {
-            return false;
+            return failLaunch(minecraft, storage, worldStem,
+                    "The singleplayer storage configuration does not match this game version");
+        }
+
+        String encodedGameRules;
+        try {
+            encodedGameRules = BrowserGameRulesHandoff.encode(initialGameRules);
+        } catch (RuntimeException exception) {
+            return failLaunch(minecraft, storage, worldStem,
+                    "The game rules of the new world could not be sent to the singleplayer server");
         }
 
         String worldId = storage.getLevelId();
@@ -45,13 +78,17 @@ public final class BrowserSingleplayerClient {
                 worldId,
                 newWorld,
                 renderDistance,
-                simulationDistance);
+                simulationDistance,
+                encodedGameRules);
         String launchGeneration = sessionId == null || sessionId.isEmpty()
                 ? ""
                 : localWorkerGeneration(sessionId);
         if (sessionId == null || sessionId.isEmpty() ||
                 launchGeneration == null || launchGeneration.isEmpty()) {
-            return false;
+            String detail = lastLaunchError();
+            return failLaunch(minecraft, storage, worldStem, detail == null || detail.isEmpty()
+                    ? "The singleplayer server Worker could not be started"
+                    : detail);
         }
         activeSessionId = sessionId;
 
@@ -69,6 +106,37 @@ public final class BrowserSingleplayerClient {
         connectWhenWorkerReady(minecraft, sessionId, launchGeneration, 0);
         return true;
     }
+
+    private static boolean failLaunch(
+            Minecraft minecraft,
+            LevelStorageSource.LevelStorageAccess storage,
+            WorldStem worldStem,
+            String detail) {
+        try {
+            worldStem.close();
+        } finally {
+            storage.safeClose();
+        }
+        minecraft.gaius$setScreen(new DisconnectedScreen(
+                new TitleScreen(),
+                Component.literal("Singleplayer startup failed"),
+                Component.literal(detail)));
+        return true;
+    }
+
+    /** The detail of the last singleplayer:worker-launch-error event, or an empty string. */
+    @JSBody(script = """
+            const events = globalThis.__gaiusMinecraftEvents;
+            if (!Array.isArray(events)) return '';
+            for (let index = events.length - 1; index >= 0; index--) {
+              const entry = events[index];
+              if (entry && entry.event === 'singleplayer:worker-launch-error') {
+                return String(entry.detail || '').split('\\n')[0].slice(0, 300);
+              }
+            }
+            return '';
+            """)
+    private static native String lastLaunchError();
 
     private static void connectWhenWorkerReady(
             Minecraft minecraft,
@@ -191,6 +259,8 @@ public final class BrowserSingleplayerClient {
             """)
     private static native boolean isSupported();
 
+    // The storage allow-list rows of this script are generated from port/versions/*.json by
+    // port/tools/profilegen (node port/tools/profilegen/profilegen.mjs); edit the profiles instead.
     @JSBody(script = """
             try {
               const profile=String(globalThis.__gaiusProfileId || '').trim();
@@ -289,7 +359,9 @@ public final class BrowserSingleplayerClient {
             String launchGeneration,
             String detail);
 
-    @JSBody(params = {"worldId", "newWorld", "renderDistance", "simulationDistance"}, script = """
+    // The storage allow-list rows of this script are generated from port/versions/*.json by
+    // port/tools/profilegen (node port/tools/profilegen/profilegen.mjs); edit the profiles instead.
+    @JSBody(params = {"worldId", "newWorld", "renderDistance", "simulationDistance", "initialGameRules"}, script = """
             let sessionId = '';
             let launchGeneration = '';
             let channel = null;
@@ -364,6 +436,91 @@ public final class BrowserSingleplayerClient {
                   bridge && typeof bridge.failLocalSession === 'function') {
                 bridge.failLocalSession(sessionId, detail, launchGeneration);
               }
+            };
+            // The Worker script of a page opened from disk: it keeps every message until
+            // {type: 'gaius-worker-bootstrap', source, files} arrives, imports the bootstrap
+            // from a Blob of its own, publishes the files ({name: ArrayBuffer}) as
+            // self.__gaiusWorkerFiles for the bootstrap, and then hands the kept messages over.
+            const FILE_WORKER_LOADER = '(' + function() {
+              var kept = [];
+              self.onmessage = function(event) {
+                var data = event.data;
+                if (!data || data.type !== 'gaius-worker-bootstrap') {
+                  kept.push(event);
+                  return;
+                }
+                self.onmessage = null;
+                self.__gaiusWorkerFiles = data.files || {};
+                var url = URL.createObjectURL(new Blob([String(data.source || '')],
+                  {type: 'text/javascript'}));
+                try {
+                  importScripts(url);
+                } catch (error) {
+                  self.postMessage({
+                    type: 'bootstrap-crash',
+                    detail: String(error && (error.stack || error.message) || error)
+                  });
+                  return;
+                } finally {
+                  URL.revokeObjectURL(url);
+                }
+                for (var i = 0; i < kept.length; i++) {
+                  self.dispatchEvent(new MessageEvent('message', {
+                    data: kept[i].data,
+                    ports: kept[i].ports ? Array.prototype.slice.call(kept[i].ports) : []
+                  }));
+                }
+                kept = null;
+              };
+            }.toString() + ')();';
+            // The files the integrated server Worker reads, from the page's file payloads:
+            // the bootstrap, the server of the selected runtime (gaius-boot.js serverRuntime)
+            // with its runtime scripts, and the worldgen kernel scripts when the page has them.
+            const loadFileWorkerFiles = function() {
+              const boot = globalThis.__gaiusBoot;
+              if (!boot || typeof boot.filePayload !== 'function' ||
+                  typeof boot.hasFilePayload !== 'function') {
+                return Promise.reject(new Error('this page has no file payloads'));
+              }
+              const runtimes = globalThis.__gaiusRuntimes;
+              const wasmServer = boot.serverRuntime === 'wasm';
+              const bootstrapName = 'singleplayer-server-worker.js';
+              const required = [bootstrapName];
+              if (wasmServer) {
+                required.push(String(runtimes && runtimes.wasm && runtimes.wasm.server ||
+                  'singleplayer-server.wasm'), 'gaius-wasm-gc-runtime.js', 'gaius-jspi.js',
+                  'gaius-wasm-worker.js');
+              } else {
+                required.push('singleplayer-server.js');
+              }
+              const missing = required.filter(function(name) {
+                return !boot.hasFilePayload(name);
+              });
+              if (missing.length) {
+                return Promise.reject(new Error('no file payload for ' + missing.join(', ')));
+              }
+              const names = required.concat(['kernels/worldgen-job.js', 'kernels/worldgen-kernel.js']
+                .filter(function(name) { return boot.hasFilePayload(name); }));
+              return Promise.all(names.map(function(name) {
+                return boot.filePayload(name);
+              })).then(function(contents) {
+                const bundle = {source: '', files: {}, transfer: []};
+                for (let index = 0; index < names.length; index++) {
+                  const bytes = contents[index];
+                  if (names[index] === bootstrapName) {
+                    bundle.source = new TextDecoder().decode(bytes);
+                    continue;
+                  }
+                  // filePayload hands out bytes this page owns: they can move to the Worker.
+                  const buffer = bytes.byteOffset === 0 &&
+                    bytes.byteLength === bytes.buffer.byteLength
+                    ? bytes.buffer
+                    : bytes.slice().buffer;
+                  bundle.files[names[index]] = buffer;
+                  bundle.transfer.push(buffer);
+                }
+                return bundle;
+              });
             };
             try {
               const profileId = String(globalThis.__gaiusProfileId || '').trim();
@@ -466,6 +623,19 @@ public final class BrowserSingleplayerClient {
                   }
                 }
               } catch (ignored) {}
+              // A page opened from disk cannot start a Worker from a sibling file, and that
+              // Worker could not read its siblings either. It starts from a blob loader that
+              // waits for the bootstrap and the files the server needs; the page decodes them
+              // from its file payloads (gaius-boot.js filePayload) and posts them before start.
+              let fileWorkerFiles = null;
+              if (location.protocol === 'file:' && String(workerUrl).indexOf('blob:') !== 0) {
+                fileWorkerFiles = loadFileWorkerFiles();
+                fileWorkerFiles.catch(function() {});
+                workerUrl = URL.createObjectURL(new Blob([FILE_WORKER_LOADER],
+                  {type: 'text/javascript'}));
+                const loaderUrl = workerUrl;
+                setTimeout(function() { URL.revokeObjectURL(loaderUrl); }, 60000);
+              }
               worker = new Worker(workerUrl, {name: 'Gaius Integrated Server'});
               try {
                 const diagnosticUrl = new URL(location.href);
@@ -1104,7 +1274,10 @@ public final class BrowserSingleplayerClient {
                   try { worker.terminate(); } catch (ignored) {}
                   if (ownsSession()) workers.delete(sessionId);
                 } else if (message &&
-                    (message.type === 'crash' || message.type === 'bootstrap-crash')) {
+                    (message.type === 'crash' || message.type === 'bootstrap-crash' ||
+                      message.type === 'runtime-error')) {
+                  // runtime-error: the WebAssembly GC server's main thread ended with an
+                  // error, a trap included (server-worker-bootstrap.js startMain).
                   terminateFailedWorker(String(message.detail || message.type));
                 }
               };
@@ -1117,12 +1290,17 @@ public final class BrowserSingleplayerClient {
                 terminateFailedWorker(detail);
               };
 
+              const lowMemory = !!(globalThis.__gaiusMemoryTier &&
+                globalThis.__gaiusMemoryTier.lowMemory);
+              const requestedView = Number(renderDistance) || 8;
+              const requestedSimulation = Number(simulationDistance) || 6;
               const init = {
                 type: 'start',
                 sessionId: sessionId,
                 launchGeneration: launchGeneration,
                 worldId: String(worldId),
                 newWorld: !!newWorld,
+                initialGameRules: String(initialGameRules || ''),
                 profileId: globalThis.__gaiusProfileId || null,
                 skinDescriptor: globalThis.__gaiusSkinDescriptor || null,
                 worldVersion: globalThis.__gaiusWorldVersion || null,
@@ -1132,8 +1310,9 @@ public final class BrowserSingleplayerClient {
                 storageOpfsDirectory: globalThis.__gaiusStorageOpfsDirectory || null,
                 bridgeUrl: globalThis.__gaiusBridgeUrl || null,
                 bridgeToken: globalThis.__gaiusBridgeToken || null,
-                renderDistance: Math.max(2, Math.min(32, Number(renderDistance) || 8)),
-                simulationDistance: Math.max(2, Math.min(32, Number(simulationDistance) || 6)),
+                renderDistance: Math.max(2, Math.min(32, lowMemory ? Math.min(requestedView, 6) : requestedView)),
+                simulationDistance: Math.max(2, Math.min(32,
+                  lowMemory ? Math.min(requestedSimulation, 4) : requestedSimulation)),
                 worldgenSliceMillis: 8,
                 distanceRampIntervalMillis: 250,
                 serverScriptUrl: globalThis.__gaiusSingleplayerServerUrl || null,
@@ -1385,12 +1564,38 @@ public final class BrowserSingleplayerClient {
                   });
                 });
               };
+              // From disk: the loader Worker imports the bootstrap first; messages posted before
+              // that (diagnostic-config) wait in the loader and reach the bootstrap in order.
+              const deliverFileWorkerFiles = function() {
+                if (!fileWorkerFiles) return true;
+                return fileWorkerFiles.then(function(bundle) {
+                  try {
+                    worker.postMessage({
+                      type: 'gaius-worker-bootstrap',
+                      source: bundle.source,
+                      files: bundle.files
+                    }, bundle.transfer);
+                  } catch (error) {
+                    terminateFailedWorker('Singleplayer files could not be passed to the Worker: ' +
+                      String(error && (error.message || error) || error));
+                    return false;
+                  }
+                  return true;
+                }, function(error) {
+                  terminateFailedWorker('Singleplayer files could not be read from disk: ' +
+                    String(error && (error.message || error) || error));
+                  return false;
+                });
+              };
               Promise.all(previousWorkers.map(stopPreviousWorker)).then(function() {
                 const flush = typeof globalThis.__gaiusFsFlush === 'function'
                   ? globalThis.__gaiusFsFlush()
                   : null;
                 return flush && typeof flush.then === 'function' ? flush : null;
-              }).then(start, start);
+              }).then(function() {}, function() {}).then(deliverFileWorkerFiles)
+                .then(function(delivered) {
+                  if (delivered) start();
+                });
               return sessionId;
             } catch (error) {
               const detail = String(error && (error.stack || error.message) || error);
@@ -1409,7 +1614,8 @@ public final class BrowserSingleplayerClient {
             String worldId,
             boolean newWorld,
             int renderDistance,
-            int simulationDistance);
+            int simulationDistance,
+            String initialGameRules);
 
     @JSBody(params = {"renderDistance", "simulationDistance"}, script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;

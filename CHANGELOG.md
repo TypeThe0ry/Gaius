@@ -2,6 +2,34 @@
 
 All notable changes to Gaius are documented here.
 
+## [0.4.0] - draft
+
+### Added
+
+- Three profile-scoped browser clients: Minecraft Java `1.21.11`, `26.2`, and `26.3`.
+- A WasmGC + JSPI runtime with Rust hot-path kernels in Workers. The launcher automatically chooses WasmGC when WebAssembly GC, `try_table`, JSPI and the profile's Wasm assets are available; otherwise it uses the frozen JavaScript runtime.
+- Automatic GPU selection: WebGPU is used through the vanilla render SPI for the selected generation when an adapter and shader assets are available, with WebGL2 fallback.
+- Exact-or-decline kernel routing. Noise, meshing, lighting, world generation and shader translation use JVM goldens and mirror locks; unsupported or failed jobs run through vanilla Java.
+
+### Player-facing changes
+
+- Existing singleplayer and multiplayer flows remain available from portable HTML files. The selected profile still needs a compatible server protocol and a Gaius Paper plugin or RelayNode for multiplayer.
+- `26.2` and `26.3` retain the in-game Edit Profile screen; `1.21.11` has no profile editor.
+- <!-- pending verification: prune after browser acceptance --> WebGPU selection and the WasmGC client/server path have been accepted in Chrome/Chromium for all three profiles.
+
+### Requirements and fallback
+
+- Use a current Chrome or Chromium with WebAssembly GC, `try_table` exception handling, JSPI, and (for WebGPU) a working WebGPU adapter. The page must also be able to inflate gzip-only release modules when the Service Worker does not control the first visit.
+- Browsers without the WasmGC prerequisites continue with the frozen JavaScript client and WebGL2. WebGPU is optional; a missing adapter or shader translator keeps the Wasm client on WebGL2.
+- Portable `file://` pages do not have Service Worker control; the launcher uses the page inflation path and IndexedDB storage fallback where required.
+
+### Known limitations
+
+- <!-- pending verification: prune after browser acceptance --> Real browser acceptance for automatic runtime selection, WebGPU fallback and Wasm integrated-server startup is still pending.
+- <!-- pending verification: prune after browser acceptance --> Browser WebGPU device-loss recovery and shader corpus coverage remain acceptance items.
+- Native kernels decline unsupported inputs and do not change vanilla semantics; a declined chunk or job can take the Java path.
+- Multiplayer still depends on a compatible server protocol and reachable relay or Paper endpoint. Generated client and game assets retain their licensing requirements.
+
 ## [0.3.3] - 2026-10-02
 
 ### Fixed

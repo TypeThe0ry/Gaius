@@ -17,7 +17,7 @@ CHUNKS=("$@")
 if (( ${#CHUNKS[@]} == 0 )); then
     CHUNKS=(0,0 7,-3 -20,11)
 fi
-JDK="${GOLDEN_JAVA_HOME:-/c/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot}"
+JDK="${GOLDEN_JAVA_HOME:-${GAIUS_JAVA_HOME:-${JAVA_HOME:-$(dirname -- "$(dirname -- "$(command -v javac)")")}}}"
 if [[ -z "${GAIUS_WORK:-}" ]]; then
     common_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
     GAIUS_WORK="$(dirname -- "$common_dir")/port/work"
@@ -30,14 +30,14 @@ OUT="$BUILD/reference-$PROFILE"
 case "$PROFILE" in
     26.3)
         sources=(
-            "$ROOT/port/src/versions/26.3/java/dev/gaius/browser/kernel/worldgen/WorldgenExport263.java"
+            "$ROOT/port/mc/shared/renderpearl-1/src/java/dev/gaius/browser/kernel/worldgen/WorldgenExport263.java"
             "$HERE/v26_3/dev/gaius/golden/worldgen/WorldgenReference.java"
         )
         main=dev.gaius.golden.worldgen.WorldgenReference
         ;;
     26.2)
         sources=(
-            "$ROOT/port/src/versions/26.2/java/net/minecraft/world/level/levelgen/GaiusWorldgenExport262.java"
+            "$ROOT/port/mc/shared/canonical/src/java/net/minecraft/world/level/levelgen/GaiusWorldgenExport262.java"
             "$HERE/v26_2/net/minecraft/world/level/levelgen/GaiusWorldgenReference262.java"
         )
         main=net.minecraft.world.level.levelgen.GaiusWorldgenReference262
@@ -67,7 +67,7 @@ rm -rf "$BUILD/classes"
 mkdir -p "$BUILD/classes" "$OUT"
 rm -f "$OUT"/*.ref
 classes="$(native_path "$BUILD/classes")"
-native_sources=("$(native_path "$ROOT/port/src/main/java/dev/gaius/browser/kernel/worldgen/WorldgenIr.java")")
+native_sources=("$(native_path "$ROOT/port/src/main/java/dev/gaius/browser/kernel/worldgen/WorldgenIr.java")" "$(native_path "$HERE/StageTiming.java")")
 for source in "${sources[@]}"; do
     native_sources+=("$(native_path "$source")")
 done

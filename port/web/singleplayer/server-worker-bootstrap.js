@@ -142,6 +142,9 @@ let startupPort;
 let pendingPortResolve;
 let pendingPortReject;
 let pendingPortTimer;
+// "js" (singleplayer-server.js) or "wasm" (singleplayer-server.wasm through
+// gaius-wasm-worker.js, v0.4.0 WP10); chosen by the start message.
+let serverRuntime = "";
 
 function clampRegionCacheBudget(value) {
   const parsed = Number(value);
@@ -590,6 +593,10 @@ function markStartup(phase, startedAt) {
 
 root.onmessage = async (event) => {
   const message = event.data;
+  if (message && message.type === "ping") {
+    answerPing(message);
+    return;
+  }
   // The portable launcher uses a Blob URL, which cannot safely carry a
   // diagnostic query parameter.  Accept the opt-in before the start handshake
   // so Mob-AI telemetry is available in both external-script and portable
@@ -630,14 +637,31 @@ root.onmessage = async (event) => {
     postMessage({type: "start-duplicate-ignored", detail: activeSessionId});
     return;
   }
+  const requestedSessionId = typeof message.sessionId === "string" ? message.sessionId : "";
+  const requestedProfile = typeof message.profileId === "string" ? message.profileId : "";
+  const currentProfile = typeof root.__gaiusProfileId === "string" ? root.__gaiusProfileId : "";
+  if (!requestedSessionId || requestedSessionId.length > 128 ||
+      (currentProfile && requestedProfile !== currentProfile)) {
+    closeTransferredPort(message, event);
+    postMessage({type: "runtime-start-failed", reason: "invalid-session-or-profile",
+      detail: "session/profile validation failed"});
+    return;
+  }
   const launchGeneration = String(message.launchGeneration || "");
   if (!/^[1-9][0-9]*$/.test(launchGeneration)) {
     closeTransferredPort(message, event);
     postMessage({type: "start-invalid-generation", detail: activeSessionId});
     return;
   }
+  if (!validateInitialGameRules(message.initialGameRules)) {
+    closeTransferredPort(message, event);
+    postMessage({type: "runtime-start-failed", reason: "invalid-initial-game-rules",
+      detail: "initialGameRules must be bounded JSON"});
+    return;
+  }
   startAccepted = true;
-  activeSessionId = String(message.sessionId || "");
+  activeSessionId = requestedSessionId;
+  serverRuntime = message.serverRuntime === "wasm" ? "wasm" : "js";
   root.onmessage = handleControlMessage;
   startupCancelPromise = new Promise((resolve) => {
     startupCancelResolve = resolve;
@@ -666,6 +690,10 @@ root.onmessage = async (event) => {
         }
       : null;
     root.__gaiusServerSeed = String(message.seed || "");
+    // The game rules of a freshly created world: the JSON text of vanilla's GameRules codec,
+    // empty when vanilla passed none (BrowserGameRulesHandoff). Java reads it when it builds the
+    // DedicatedServer, exactly where vanilla's integrated server receives its Optional<GameRules>.
+    root.__gaiusServerInitialGameRules = message.initialGameRules || "";
     root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 8);
     root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 6);
     const requestedWorldgenSlice = message.worldgenSliceMillis ??
@@ -707,7 +735,9 @@ root.onmessage = async (event) => {
         if (storageStartupInFlight === storageReady) storageStartupInFlight = undefined;
       },
     );
-    const assetReady = prepareServerScript(message, startupStarted);
+    const assetReady = serverRuntime === "wasm"
+      ? prepareWasmServer(message, startupStarted)
+      : prepareServerScript(message, startupStarted);
     // A stop must not remain hostage to a portable asset fetch that never
     // resolves. Promise.all is still observed so a late rejection cannot
     // become an unhandled rejection, but cancellation wins the bootstrap
@@ -735,12 +765,22 @@ root.onmessage = async (event) => {
     });
 
     const importStarted = monotonicMillis();
-    importScripts(script.url);
-    markStartup("runtime-imported", importStarted);
+    if (script.runtime === "wasm") {
+      // The exported Java entry points and the input pump become Worker globals here
+      // (gaius-wasm-worker.js), as importScripts(singleplayer-server.js) defines them below.
+      await Promise.race([
+        root.GaiusWasmWorker.instantiate(),
+        startupCancelPromise.then(() => { throw startupCancellationError(); }),
+      ]);
+      markStartup("runtime-imported", importStarted);
+    } else {
+      importScripts(script.url);
+      markStartup("runtime-imported", importStarted);
+    }
     if (script.temporaryUrl) {
       URL.revokeObjectURL(script.temporaryUrl);
     }
-    if (typeof main !== "function") {
+    if (script.runtime !== "wasm" && typeof main !== "function") {
       throw new Error("Singleplayer TeaVM output did not expose main(args)");
     }
     root.__gaiusIntegratedServerNetworkSignal =
@@ -755,7 +795,17 @@ root.onmessage = async (event) => {
     if (stopRequested) {
       throw startupCancellationError();
     }
-    main([]);
+    if (script.runtime === "wasm") {
+      // The main thread's JSPI activation runs up to its first suspension, as main([]) does.
+      root.GaiusWasmWorker.startMain([]).catch((error) => {
+        postMessage({
+          type: "runtime-error",
+          detail: String(error && (error.stack || error.message) || error),
+        });
+      });
+    } else {
+      main([]);
+    }
     runtimeStarted = true;
     // TeaVM returns here on the first cooperative suspension while Java main continues.
     releaseStartupRegionPins();
@@ -789,6 +839,11 @@ root.onmessage = async (event) => {
     }
     releaseLocalSession("Singleplayer Worker bootstrap failed");
     postMessage({
+      type: "runtime-start-failed",
+      reason: "bootstrap-failed",
+      detail: String(error && (error.stack || error.message) || error),
+    });
+    postMessage({
       type: "bootstrap-crash",
       detail: String(error && (error.stack || error.message) || error),
     });
@@ -799,6 +854,26 @@ root.onmessage = async (event) => {
     return;
   }
 };
+
+function validateInitialGameRules(value) {
+  if (value === undefined || value === null || value === "") return true;
+  if (typeof value !== "string") return false;
+  const bytes = new TextEncoder().encode(value).length;
+  if (bytes > 64 * 1024) return false;
+  let depth = 0;
+  let members = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index++) {
+    const ch = value[index];
+    if (inString) { if (escaped) escaped = false; else if (ch === "\\") escaped = true; else if (ch === '"') inString = false; continue; }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === "{" || ch === "[") { if (++depth > 32) return false; if (ch === "{") members++; }
+    else if (ch === "}" || ch === "]") depth--;
+    if (members > 512 || depth < 0) return false;
+  }
+  return !inString && depth === 0;
+}
 
 function isMessagePort(value) {
   return value && typeof value.postMessage === "function" &&
@@ -962,7 +1037,50 @@ function releaseLocalSession(reason) {
   root.__gaiusServerClientPort = undefined;
 }
 
+// The files a page opened from disk hands its Worker (BrowserSingleplayerClient starts that
+// Worker from a blob loader, which publishes them as root.__gaiusWorkerFiles = {name:
+// ArrayBuffer} before it imports this script): such a Worker can neither fetch nor import its
+// file:// siblings. A file is found by its logical name (singleplayer-server.js,
+// kernels/worldgen-job.js) or by the path of the sibling URL the page would have used.
+function workerFile(nameOrUrl) {
+  const files = root.__gaiusWorkerFiles;
+  if (!files || typeof files !== "object" || !nameOrUrl) return null;
+  const key = String(nameOrUrl);
+  if (Object.prototype.hasOwnProperty.call(files, key)) return files[key];
+  let path;
+  try {
+    path = decodeURIComponent(new URL(key, "file:///").pathname);
+  } catch (ignored) {
+    return null;
+  }
+  for (const name of Object.keys(files)) {
+    if (path === "/" + name || path.endsWith("/" + name)) return files[name];
+  }
+  return null;
+}
+
+// importScripts() of a file the page handed over; false when there is no such file.
+function importWorkerFile(nameOrUrl) {
+  const bytes = workerFile(nameOrUrl);
+  if (!bytes) return false;
+  const url = URL.createObjectURL(new Blob([bytes], {type: "text/javascript"}));
+  try {
+    importScripts(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return true;
+}
+
 async function prepareServerScript(message, startupStarted) {
+  // A Worker started from disk got the server script from the page.
+  const handedOver = workerFile(message.serverScriptUrl || "singleplayer-server.js") ||
+    workerFile("singleplayer-server.js");
+  if (handedOver) {
+    const temporaryUrl = URL.createObjectURL(new Blob([handedOver], {type: "text/javascript"}));
+    markStartup("runtime-transferred", startupStarted);
+    return {url: temporaryUrl, temporaryUrl};
+  }
   // Portable file:// pages transfer the embedded gzip bytes directly. A Blob
   // URL created in the page is opaque to a dedicated Worker and fetch(blob:)
   // fails in Chrome, so prefer the transferable payload when present.
@@ -1021,9 +1139,94 @@ async function prepareServerScript(message, startupStarted) {
   return {url: resolved.href, temporaryUrl: null};
 }
 
+// The integrated server on WebAssembly GC (v0.4.0 WP10). The start message names the module
+// and the runtime scripts this Worker imports: {serverRuntime: "wasm", serverWasmUrl,
+// wasmRuntimeScripts: [{name, url} | {name, source}]} (gaius-boot.js serverRuntimeConfig), or
+// carries the module itself as serverWasmBytes (or, from a portable page, its gzip bytes as
+// serverWasmGzipData). A Worker started from disk finds the module and the scripts among the
+// files the page handed over (workerFile). The module compiles while storage opens.
+async function prepareWasmServer(message, startupStarted) {
+  const scripts = Array.isArray(message.wasmRuntimeScripts) ? message.wasmRuntimeScripts : [];
+  for (const entry of scripts) {
+    if (!entry || typeof entry !== "object") continue;
+    let temporaryUrl = null;
+    try {
+      if (typeof entry.source === "string") {
+        temporaryUrl = URL.createObjectURL(new Blob([entry.source], {type: "text/javascript"}));
+        importScripts(temporaryUrl);
+      } else if (importWorkerFile(entry.name) || importWorkerFile(entry.url)) {
+        // imported from the page's files
+      } else if (entry.url) {
+        importScripts(String(entry.url));
+      }
+    } finally {
+      if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+    }
+  }
+  if (!root.GaiusWasmWorker || !root.TeaVM || !root.GaiusJspi) {
+    throw new Error("The WebAssembly GC server runtime scripts did not load");
+  }
+  markStartup("runtime-scripts-imported", startupStarted);
+  let source = message.serverWasmBytes ||
+    workerFile(message.serverWasmUrl || "singleplayer-server.wasm") || null;
+  if (!source && message.serverWasmGzipData) {
+    // A portable page passes the module's gzip bytes: it inflates while it compiles.
+    if (typeof DecompressionStream !== "function") {
+      throw new Error("This browser cannot decompress the portable singleplayer server");
+    }
+    const inflated = new Blob([message.serverWasmGzipData]).stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    source = new Response(inflated, {headers: {"Content-Type": "application/wasm"}});
+    markStartup("runtime-transferred", startupStarted);
+  }
+  if (!source && message.serverWasmUrl) source = String(message.serverWasmUrl);
+  if (!source) {
+    throw new Error("The start message names no singleplayer-server.wasm");
+  }
+  await root.GaiusWasmWorker.compile(source);
+  markStartup("runtime-compiled", startupStarted);
+  return {runtime: "wasm", url: null, temporaryUrl: null};
+}
+
+// {type: "ping", sequence?, echo?: ArrayBuffer} -> {type: "pong", ...}: answered before and after
+// the start handshake. A started server answers through its own runtime (isIntegratedServerStopped),
+// and a wasm server adds its module state; an echo buffer comes back transferred.
+function answerPing(message) {
+  const reply = {
+    type: "pong",
+    sequence: Number(message.sequence) || 0,
+    sessionId: activeSessionId,
+    runtime: serverRuntime || "none",
+    started: startAccepted,
+    runtimeStarted,
+    stopping: stopRequested || stopping,
+    at: Date.now(),
+  };
+  if (root.GaiusWasmWorker && typeof root.GaiusWasmWorker.info === "function") {
+    reply.wasm = root.GaiusWasmWorker.info();
+  }
+  if (runtimeStarted && typeof isIntegratedServerStopped === "function") {
+    try {
+      reply.serverStopped = isIntegratedServerStopped() === true;
+    } catch (error) {
+      reply.serverStoppedError = String(error && error.message || error);
+    }
+  }
+  const transfer = [];
+  if (message.echo instanceof ArrayBuffer) {
+    reply.echo = message.echo;
+    transfer.push(message.echo);
+  }
+  postMessage(reply, transfer);
+}
+
 function handleControlMessage(event) {
   const message = event.data;
   if (!message) {
+    return;
+  }
+  if (message.type === "ping") {
+    answerPing(message);
     return;
   }
   if (message.type === "diagnostic-config") {
@@ -2786,13 +2989,14 @@ if (typeof root.addEventListener === "function") root.addEventListener("message"
   }
 });
 
-const DEFAULT_KERNEL_HOST_SCRIPTS = ["kernels/worldgen-job.js", "kernels/worldgen-kernel.js"];
+const DEFAULT_KERNEL_HOST_SCRIPTS = ["kernels/kernel-mirror.js", "kernels/worldgen-job.js", "kernels/worldgen-kernel.js"];
 const loadedKernelHostScripts = new Set();
 
 // Imports the kernel scripts the page listed (or, from a dist layout, kernels/<name> next to this
 // worker script). A script that fails to load only keeps its kernel off: Java checks
 // globalThis.GaiusWorldgenKernel per chunk and keeps the vanilla path without it.
 function loadKernelHostScripts(message) {
+  root.__gaiusKernelSemantics = message.kernelSemantics || null;
   if (message.worldgenKernel && typeof message.worldgenKernel === "object") {
     root.__gaiusWorldgenKernelConfig = Object.assign({}, root.__gaiusWorldgenKernelConfig || {},
       message.worldgenKernel);
@@ -2801,7 +3005,11 @@ function loadKernelHostScripts(message) {
     root.__gaiusLightKernelConfig = Object.assign({}, root.__gaiusLightKernelConfig || {},
       message.lightKernel);
   }
-  const entries = Array.isArray(message.kernelScripts) ? message.kernelScripts : defaultKernelHostScripts();
+  let entries = Array.isArray(message.kernelScripts) ? message.kernelScripts : defaultKernelHostScripts();
+  if (entries.length === 0) {
+    // A page opened from disk lists nothing it could load; it may have handed the scripts over.
+    entries = DEFAULT_KERNEL_HOST_SCRIPTS.filter((name) => workerFile(name)).map((name) => ({name}));
+  }
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
     const name = String(entry.name || entry.url || "");
@@ -2811,6 +3019,8 @@ function loadKernelHostScripts(message) {
       if (typeof entry.source === "string") {
         temporaryUrl = URL.createObjectURL(new Blob([entry.source], {type: "text/javascript"}));
         importScripts(temporaryUrl);
+      } else if (importWorkerFile(name)) {
+        // imported from the page's files
       } else if (entry.url) {
         importScripts(String(entry.url));
       } else {
@@ -2871,13 +3081,20 @@ function createKernelClient(port) {
   };
   port.start();
   const available = (kernel) => status.enabled === true &&
-    (kernel === undefined || !!(status.kernels[kernel] && status.kernels[kernel].available));
+    (kernel === undefined ? Object.keys(status.kernels) : [kernel]).some((name) =>
+      !!(status.kernels[name] && status.kernels[name].available)
+      && !!root.GaiusKernelMirror && root.GaiusKernelMirror.enabled(name));
   return {
     available,
     status: () => status,
     stats,
     submit(kind, payload, opts) {
       const options = opts || {};
+      if (!root.GaiusKernelMirror || !root.GaiusKernelMirror.allowed(kind, options.kernel)) {
+        const error = new Error("NEEDS_VANILLA: kernel mirror is disabled");
+        error.code = "needs-vanilla";
+        return Promise.reject(error);
+      }
       if (!available(options.kernel)) {
         stats.unavailable++;
         const error = new Error("kernel runtime is not available");

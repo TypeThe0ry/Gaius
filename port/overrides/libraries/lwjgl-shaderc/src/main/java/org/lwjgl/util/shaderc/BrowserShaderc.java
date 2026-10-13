@@ -199,6 +199,11 @@ public final class BrowserShaderc {
                 BrowserShadercJob.OP_PRESERVE_BINDINGS, preserve ? 1 : 0, 0));
     }
 
+    public static void shaderc_compile_options_set_auto_map_locations(long options, boolean autoMap) {
+        optionsFor(options).ops.add(new BrowserShadercJob.Op(
+                BrowserShadercJob.OP_AUTO_MAP_LOCATIONS, autoMap ? 1 : 0, 0));
+    }
+
     public static void shaderc_compile_options_set_include_callbacks(
             long options,
             ShadercIncludeResolveI resolver,

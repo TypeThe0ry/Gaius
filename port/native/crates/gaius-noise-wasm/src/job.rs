@@ -5,9 +5,9 @@
 //! the payload start):
 //!
 //! ```text
-//! u8   profile       0 = 1.21.11, 1 = 26.2, 2 = 26.3
+//! u8   semantics     kernelSemantics.code of the profile (port/versions/<id>.json)
 //! u8   noise         0 = NormalNoise(first_octave, amplitudes)
-//!                    1 = NormalNoise recipe (26.3 codec fields)
+//!                    1 = NormalNoise recipe (26.3 codec fields; synth f32 only)
 //!                    2 = BlendedNoise
 //! u8   random        0 = XoroshiroRandomSource(seed), 1 = LegacyRandomSource(seed)
 //! u8   reserved      0
@@ -35,7 +35,7 @@
 use gaius_kernel_abi::{KernelError, Reader, Status};
 use gaius_noise::batch::{PointSampler, ProfileNormalNoise};
 use gaius_noise::synth32::{BlendedNoiseParameters, NormalNoiseParameters, Normalization};
-use gaius_noise::{synth64, Profile, RandomKind, RandomSource};
+use gaius_noise::{synth64, RandomKind, RandomSource, Semantics};
 
 /// Upper bounds that keep a hostile payload from asking for unbounded work.
 const MAX_AMPLITUDES: u32 = 256;
@@ -50,7 +50,7 @@ pub enum NoiseSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NoisePointsJob {
-    pub profile: Profile,
+    pub semantics: Semantics,
     pub random: RandomKind,
     pub seed: i64,
     pub fork: Option<String>,
@@ -62,23 +62,10 @@ fn bad(message: &str) -> KernelError {
     KernelError::new(Status::BadPayload, message)
 }
 
-fn profile_code(profile: Profile) -> u8 {
-    match profile {
-        Profile::V1_21_11 => 0,
-        Profile::V26_2 => 1,
-        Profile::V26_3 => 2,
-    }
-}
-
 impl NoisePointsJob {
     pub fn decode(payload: &[u8]) -> Result<NoisePointsJob, KernelError> {
         let mut r = Reader::new(payload);
-        let profile = match r.u8()? {
-            0 => Profile::V1_21_11,
-            1 => Profile::V26_2,
-            2 => Profile::V26_3,
-            _ => return Err(bad("unknown profile")),
-        };
+        let semantics = Semantics::from_code(r.u8()?).ok_or_else(|| bad("unknown kernel semantics code"))?;
         let noise_code = r.u8()?;
         let random = match r.u8()? {
             0 => RandomKind::Xoroshiro,
@@ -156,7 +143,7 @@ impl NoisePointsJob {
         }
         let xyz = (0..values).map(|_| r.f64()).collect::<Result<Vec<_>, _>>()?;
         Ok(NoisePointsJob {
-            profile,
+            semantics,
             random,
             seed,
             fork,
@@ -177,7 +164,7 @@ impl NoisePointsJob {
             RandomKind::Xoroshiro => 0u8,
             RandomKind::Legacy => 1,
         };
-        out.extend_from_slice(&[profile_code(self.profile), noise_code, random_code, 0]);
+        out.extend_from_slice(&[self.semantics.code, noise_code, random_code, 0]);
         out.extend_from_slice(&((self.xyz.len() / 3) as u32).to_le_bytes());
         out.extend_from_slice(&self.seed.to_le_bytes());
         let fork = self.fork.as_deref().unwrap_or("");
@@ -234,12 +221,12 @@ impl NoisePointsJob {
                 first_octave,
                 amplitudes,
             } => {
-                ProfileNormalNoise::parity(self.profile, &mut random, *first_octave, amplitudes)
+                ProfileNormalNoise::parity(self.semantics, &mut random, *first_octave, amplitudes)
                     .sample_points(&self.xyz, &mut out);
             }
             NoiseSpec::NormalRecipe(params) => {
-                if !self.profile.uses_synth32() {
-                    return Err(bad("normal noise recipes exist only on 26.3"));
+                if !self.semantics.uses_synth32() {
+                    return Err(bad("normal noise recipes need the float synth classes"));
                 }
                 ProfileNormalNoise::from_parameters(params.clone(), &mut random).sample_points(&self.xyz, &mut out);
             }
@@ -255,7 +242,7 @@ impl NoisePointsJob {
                         }
                     })
                     .collect::<Result<Vec<i32>, _>>()?;
-                if self.profile.uses_synth32() {
+                if self.semantics.uses_synth32() {
                     let params = BlendedNoiseParameters {
                         xz_scale: f[0],
                         y_scale: f[1],
@@ -275,7 +262,7 @@ impl NoisePointsJob {
                         f[2],
                         f[3],
                         f[4],
-                        self.profile.floor_mode(),
+                        self.semantics.floor_mode,
                     );
                     for (o, p) in out.iter_mut().zip(blocks.as_chunks::<3>().0) {
                         *o = noise.compute(p[0], p[1], p[2]);

@@ -12,13 +12,18 @@ import org.teavm.jso.JSObject;
  *
  * <p>The DOM listeners, canvas and WebGL 2 context handling, pointer and keyboard
  * lock, canvas resolution, input warm-up, input statistics and the cooperative
- * frame-yield scheduler are copied from {@code org.lwjgl.glfw.BrowserGlfw}, which is
- * left untouched so that the Minecraft 26.2 build stays byte-identical. The JS
+ * frame-yield scheduler are copied from {@code org.lwjgl.glfw.BrowserGlfw} (kept apart so
+ * that the GLFW profiles change only where both shims must, such as the canvas host). The JS
  * global names ({@code __gaiusWebGL}, {@code __gaiusInputStats},
  * {@code __gaiusCursorX/Y}, {@code __gaiusWantPointerLock},
  * {@code __gaiusApplyCanvasResolution}, {@code __gaiusResolvePixelRatio},
  * {@code __gaiusDisplay}, {@code __gaiusFrameTelemetry}, ...) are the same; the
  * event queue is new and is called {@code __gaiusSdlEvents}.
+ *
+ * <p>The game canvas is the one {@code window.__gaiusCanvasHost} names (shared with the GLFW
+ * shim and the WebGPU glue, installed by {@code installDomBridge}): every script reads it through
+ * {@code current()}, so a canvas that {@code replace()} swapped after an abandoned WebGPU attempt
+ * (PLAN-DELTA 3.4 rule 2) is followed and re-hooked.
  *
  * <p>The event engine lives entirely in JavaScript ({@code window.__gaiusSdl}):
  * DOM listeners push neutral records
@@ -54,6 +59,70 @@ final class BrowserSdlDom {
 
     @JSBody(script = """
             const w = window;
+            // The game canvas registry: the same script as BrowserGlfw.installCanvasHost,
+            // installed by whichever shim runs first.
+            if (!(w.__gaiusCanvasHost && w.__gaiusCanvasHost.version >= 1)) {
+              const host = {
+                version: 1,
+                id: 'mc-canvas',
+                replacements: 0,
+                lastReason: '',
+                hooks: []
+              };
+              host.current = function () {
+                return document.getElementById(host.id);
+              };
+              host.ensure = function () {
+                let canvas = host.current();
+                if (!canvas) {
+                  canvas = document.createElement('canvas');
+                  canvas.id = host.id;
+                  canvas.tabIndex = 0;
+                  document.body.appendChild(canvas);
+                }
+                return canvas;
+              };
+              host.replace = function (reason) {
+                const previous = host.current();
+                const canvas = document.createElement('canvas');
+                if (previous) {
+                  const attributes = previous.attributes;
+                  for (let index = 0; index < attributes.length; index++) {
+                    canvas.setAttribute(attributes[index].name, attributes[index].value);
+                  }
+                  canvas.width = previous.width;
+                  canvas.height = previous.height;
+                  const focused = document.activeElement === previous;
+                  previous.replaceWith(canvas);
+                  if (focused && canvas.focus) canvas.focus();
+                } else {
+                  canvas.id = host.id;
+                  canvas.tabIndex = 0;
+                  document.body.appendChild(canvas);
+                }
+                host.replacements++;
+                host.lastReason = String(reason || '');
+                w.__gaiusCanvasRect = null;
+                for (let index = 0; index < host.hooks.length; index++) {
+                  try {
+                    host.hooks[index](canvas, previous, host.lastReason);
+                  } catch (ignored) {
+                    // A failing hook must not keep the canvas from being replaced.
+                  }
+                }
+                try {
+                  w.dispatchEvent(new CustomEvent('gaius:canvas-replaced',
+                    {detail: {canvas: canvas, previous: previous, reason: host.lastReason}}));
+                } catch (ignored) {
+                  // Listeners are optional.
+                }
+                return canvas;
+              };
+              host.onReplace = function (hook) {
+                if (typeof hook === 'function') host.hooks.push(hook);
+              };
+              w.__gaiusCanvasHost = host;
+            }
             if (w.__gaiusSdl && w.__gaiusSdl.installed) return;
             const clock = () => (typeof performance !== 'undefined' && performance.now)
               ? performance.now() : Date.now();
@@ -363,7 +432,7 @@ final class BrowserSdlDom {
               || (e.shiftKey && e.code === 'Insert');
 
             // ---- canvas, pointer lock, keyboard lock (copied from BrowserGlfw)
-            const canvas = () => document.getElementById('mc-canvas');
+            const canvas = () => w.__gaiusCanvasHost.current();
             const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
             const rememberPointerLockError = error => {
               const message = String(error && (error.message || error.name) || error);
@@ -574,6 +643,7 @@ final class BrowserSdlDom {
               c.addEventListener('mouseleave', () => pushWindow(525, 0, 0));
             };
             sdl.hookCanvas(canvas());
+            w.__gaiusCanvasHost.onReplace(c => sdl.hookCanvas(c));
             sdl.requestPointerLockIfWanted = requestPointerLockIfWanted;
 
             // ---- DOM input listeners
@@ -924,15 +994,11 @@ final class BrowserSdlDom {
 
     // ---------------------------------------------------------------- canvas and context
 
-    /** Makes sure {@code #mc-canvas} exists without changing its size. */
+    /** Makes sure the game canvas exists without changing its size (installDomBridge runs first). */
     @JSBody(script = """
-            let canvasElement = document.getElementById('mc-canvas');
-            if (!canvasElement) {
-              canvasElement = document.createElement('canvas');
-              canvasElement.id = 'mc-canvas';
-              canvasElement.tabIndex = 0;
-              document.body.appendChild(canvasElement);
-            }
+            const host = window.__gaiusCanvasHost;
+            if (!host) return;
+            const canvasElement = host.ensure();
             const s = window.__gaiusSdl;
             if (s && s.hookCanvas) s.hookCanvas(canvasElement);
             """)
@@ -940,7 +1006,8 @@ final class BrowserSdlDom {
 
     /** The first visible SDL window adopts the canvas (BrowserGlfw.createCanvas parity). */
     @JSBody(params = {"width", "height", "title"}, script = """
-            const canvasElement = document.getElementById('mc-canvas');
+            const host = window.__gaiusCanvasHost;
+            const canvasElement = host ? host.current() : null;
             if (!canvasElement) return;
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
@@ -960,11 +1027,15 @@ final class BrowserSdlDom {
 
     /**
      * Contract C5: creates {@code window.__gaiusWebGL} once (same attributes as
-     * BrowserGlfw.createCanvas) and reports whether it exists.
+     * BrowserGlfw.createCanvas) and reports whether it exists. When the canvas cannot give a
+     * {@code webgl2} context (it holds the context of an abandoned WebGPU attempt), a fresh
+     * element replaces it and is asked once more (PLAN-DELTA 3.4 rule 2).
      */
     @JSBody(script = """
-            if (window.__gaiusWebGL) return true;
-            const canvasElement = document.getElementById('mc-canvas');
+            const host = window.__gaiusCanvasHost;
+            let canvasElement = host ? host.ensure() : null;
+            const existing = window.__gaiusWebGL;
+            if (existing && (!canvasElement || !existing.canvas || existing.canvas === canvasElement)) return true;
             if (!canvasElement || !canvasElement.getContext) return false;
             let preserveDrawingBuffer = false;
             try {
@@ -972,14 +1043,27 @@ final class BrowserSdlDom {
             } catch (ignored) {
               preserveDrawingBuffer = false;
             }
-            window.__gaiusWebGL = canvasElement.getContext('webgl2', {
+            const attributes = {
               alpha: false,
               antialias: false,
               depth: true,
               stencil: true,
               powerPreference: 'high-performance',
               preserveDrawingBuffer: preserveDrawingBuffer
-            });
+            };
+            window.__gaiusWebGL = canvasElement.getContext('webgl2', attributes);
+            if (!window.__gaiusWebGL && host) {
+              try {
+                canvasElement = host.replace('sdl-webgl2-context');
+                window.__gaiusWebGL = canvasElement.getContext('webgl2', attributes);
+              } catch (ignored) {
+                window.__gaiusWebGL = null;
+              }
+            }
+            if (window.__gaiusWebGL) {
+              canvasElement.__gaiusContextKind = 'webgl2';
+              window.__gaiusGpuBackend = 'webgl2';
+            }
             // Lets the quality runtime enable its extensions on the game context before
             // the first frame instead of attaching lazily.
             if (window.__gaiusWebGL && window.GaiusQuality && window.GaiusQuality.runtime) {
@@ -994,7 +1078,9 @@ final class BrowserSdlDom {
     static native boolean createContext();
 
     @JSBody(params = {"width", "height"}, script = """
-            const canvasElement = document.getElementById('mc-canvas'); if (!canvasElement) return;
+            const host = window.__gaiusCanvasHost;
+            const canvasElement = host ? host.current() : null;
+            if (!canvasElement) return;
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
             } else {
@@ -1015,7 +1101,8 @@ final class BrowserSdlDom {
     @JSBody(script = """
             const display = window.__gaiusDisplay;
             if (display && display.cssWidth > 0) return display.cssWidth | 0;
-            const canvasElement = document.getElementById('mc-canvas');
+            const host = window.__gaiusCanvasHost;
+            const canvasElement = host ? host.current() : null;
             return canvasElement ? Math.round(canvasElement.getBoundingClientRect().width) : (innerWidth | 0);
             """)
     static native int canvasCssWidth();
@@ -1023,15 +1110,16 @@ final class BrowserSdlDom {
     @JSBody(script = """
             const display = window.__gaiusDisplay;
             if (display && display.cssHeight > 0) return display.cssHeight | 0;
-            const canvasElement = document.getElementById('mc-canvas');
+            const host = window.__gaiusCanvasHost;
+            const canvasElement = host ? host.current() : null;
             return canvasElement ? Math.round(canvasElement.getBoundingClientRect().height) : (innerHeight | 0);
             """)
     static native int canvasCssHeight();
 
-    @JSBody(script = "const canvasElement = document.getElementById('mc-canvas'); return canvasElement ? canvasElement.width : innerWidth;")
+    @JSBody(script = "const host = window.__gaiusCanvasHost; const canvasElement = host ? host.current() : null; return canvasElement ? canvasElement.width : innerWidth;")
     static native int framebufferWidth();
 
-    @JSBody(script = "const canvasElement = document.getElementById('mc-canvas'); return canvasElement ? canvasElement.height : innerHeight;")
+    @JSBody(script = "const host = window.__gaiusCanvasHost; const canvasElement = host ? host.current() : null; return canvasElement ? canvasElement.height : innerHeight;")
     static native int framebufferHeight();
 
     @JSBody(script = "return screen.width | 0;")
@@ -1158,19 +1246,37 @@ final class BrowserSdlDom {
     private static native boolean swapBuffersJs();
 
     /**
-     * The per-frame yield after a present. In the JSPI WebAssembly GC build (HostLoop.jspi(),
-     * constant-folded) the thread parks until the same frame-yield callback fires, without
-     * TeaVM's coroutines; a present from a JS callback (no thread to suspend) skips the yield,
-     * as the coroutine build does.
+     * The per-frame yield after a present. The WebAssembly GC build (HostLoop.jspi(),
+     * constant-folded) does not yield here: the present only records its swap interval, and the
+     * patched Minecraft.run waits for the next frame at the head of its loop
+     * (HostLoop.awaitAnimationFrame, design D4) with the pacing of scheduleFrameYield
+     * (gaius-jspi.js), so the browser gets its turn between two frames and never inside one.
+     *
+     * <p>A frame presented from a JavaScript callback cannot suspend: the login packet runs
+     * ClientPacketListener.handleLogin -> startWaitingForNewLevel -> Minecraft.setScreenAndShow
+     * -> renderFrame inside the network inbound pump's MessageChannel callback whenever that
+     * callback, not the frame-boundary pump of Minecraft.runTick, decodes it. TeaVM refuses that
+     * suspension ("Suspension point reached from non-threading context") before it schedules
+     * anything, so the frame skips its yield and the next regular frame yields as usual (the same
+     * rule as BrowserGlfw.swapBuffers on the GLFW profiles). Letting the refusal propagate is
+     * fatal here: it leaves the renderpearl surface acquired, every later Minecraft.renderFrame
+     * returns before presenting, so the JavaScript build's main loop never yields again and the
+     * page freezes; the packet pipeline also reports it and the client disconnects. Any other
+     * failure still propagates.</p>
      */
     private static void presentYield(boolean hidden, int interval) {
         if (HostLoop.jspi()) {
-            if (HostLoop.canSuspend()) {
-                HostLoop.awaitHost(resume -> scheduleFrameYield(hidden, interval, resume::run));
-            }
+            HostLoop.framePresented(hidden, interval);
             return;
         }
-        yieldAfterPresent(hidden, interval);
+        try {
+            yieldAfterPresent(hidden, interval);
+        } catch (RuntimeException e) {
+            if (!isNonThreadingSuspension(e)) {
+                throw e;
+            }
+            recordSkippedPresentYield();
+        }
     }
 
     @Async
@@ -1389,9 +1495,84 @@ final class BrowserSdlDom {
      * yield (frame source of performance-contract.json on 26.3).
      */
     static void swapWindow(int swapInterval) {
+        presentCount++;
         boolean hidden = swapBuffersJs();
         presentYield(hidden, swapInterval);
     }
+
+    // Declared after the existing methods so that TeaVM's per-class names of the existing
+    // lambdas and JSBody functions stay as they were in the JavaScript output.
+
+    /** True for TeaVM's refusal to suspend outside a TeaVM thread (see {@link #presentYield}). */
+    static boolean isNonThreadingSuspension(Throwable error) {
+        String message = error.getMessage();
+        return message != null && message.contains("Suspension point reached from non-threading context");
+    }
+
+    /** Counts presents whose yield was skipped because they ran from a JavaScript callback. */
+    @JSBody(script = """
+            globalThis.__gaiusSkippedPresentYields=(Number(globalThis.__gaiusSkippedPresentYields)||0)+1;
+            """)
+    private static native void recordSkippedPresentYield();
+
+    /** Presents of every thread so far; compared at each game-loop boundary. */
+    private static int presentCount;
+    private static int presentCountAtLoopBoundary;
+
+    /**
+     * Game-loop boundary of the JavaScript build: the first SDL_PollEvent of each
+     * SDLEventHandler.pollEvents cycle, i.e. once per Minecraft.run iteration.
+     *
+     * <p>The loop's only yields to the browser are in Minecraft.renderFrame (the present yield and
+     * FramerateLimiter), and vanilla renders nothing while its GpuSurface is acquired. Another
+     * TeaVM thread can hold that acquisition across its own present yield: the singleplayer
+     * ready poll (a HostLoop.startThread thread) runs ConnectScreen.startConnecting ->
+     * Minecraft.disconnect -> setScreenAndShow -> renderFrame. When the main loop resumes first
+     * (from FramerateLimiter's park), every renderFrame returns at once, the loop never yields,
+     * the other thread is never resumed to finish its present, and the page freezes. So when no
+     * frame was presented since the previous boundary, the loop yields one event-loop turn here.
+     * A loop that presents (every normal frame) never reaches the yield. The WebAssembly GC build
+     * waits for the next frame at the head of Minecraft.run instead (HostLoop.awaitAnimationFrame);
+     * class initializers, synchronously compiled methods and JavaScript callbacks skip the yield.</p>
+     */
+    static void loopBoundary() {
+        if (HostLoop.jspi()) {
+            return;
+        }
+        if (presentCount != presentCountAtLoopBoundary) {
+            presentCountAtLoopBoundary = presentCount;
+            return;
+        }
+        if (HostLoop.inNoSuspendFrame()) {
+            return;
+        }
+        try {
+            yieldLoopTurn();
+        } catch (RuntimeException e) {
+            if (!isNonThreadingSuspension(e)) {
+                throw e;
+            }
+            return;
+        }
+        recordLoopBoundaryYield();
+    }
+
+    @Async
+    private static native void yieldLoopTurn();
+
+    private static void yieldLoopTurn(AsyncCallback<Void> callback) {
+        scheduleLoopTurn(() -> callback.complete(null));
+    }
+
+    /** One timer turn (nested timers clamp to 4 ms, so a loop that keeps skipping stays cheap). */
+    @JSBody(params = "resume", script = "setTimeout(resume, 0);")
+    private static native void scheduleLoopTurn(FrameYieldCallback resume);
+
+    /** Counts game-loop iterations that presented nothing and yielded at the boundary instead. */
+    @JSBody(script = """
+            globalThis.__gaiusLoopBoundaryYields=(Number(globalThis.__gaiusLoopBoundaryYields)||0)+1;
+            """)
+    private static native void recordLoopBoundaryYield();
 
     @JSFunctor
     interface FrameYieldCallback extends JSObject {

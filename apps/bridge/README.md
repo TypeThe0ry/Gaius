@@ -147,19 +147,33 @@ security requirements.
 
 By default, the RelayNode replies to exact unencrypted keepalive frames while
 the browser is busy reloading a server resource pack. It selects the packet
-table from the initial Minecraft handshake for 1.21.11 (774), 26.2 (776) or
-26.3 (777),
-then emits the profile-specific payloadless client tick after configuration
-enters PLAY and replays the client's exact tick frame while the browser is
-stalled. The relay tracks the reversible `PLAY -> CONFIGURATION -> PLAY`
-transition: it stops synthetic PLAY ticks as soon as the server sends Start
-Configuration, proxies configuration keepalives, and resumes only after the
-client finishes the new configuration cycle. Unknown or malformed profiles
-remain opaque and never receive a guessed rewrite. Set
-`GAIUS_PROXY_KEEPALIVES=0` to disable this behavior.
-Encrypted online-mode traffic is opaque and remains fully transparent.
+table by the protocol number in the initial Minecraft handshake, then emits
+the profile-specific payloadless client tick after configuration enters PLAY
+and replays the client's exact tick frame while the browser is stalled. The
+relay tracks the reversible `PLAY -> CONFIGURATION -> PLAY` transition: it
+stops synthetic PLAY ticks as soon as the server sends Start Configuration,
+proxies configuration keepalives, and resumes only after the client finishes
+the new configuration cycle. Unknown protocols, unsupported layouts and
+multi-byte packet ids remain opaque and never receive a guessed rewrite.
+Set `GAIUS_PROXY_KEEPALIVES=0` to disable this behavior. Encrypted online-mode
+traffic is opaque and remains fully transparent.
 
-Run the focused protocol test with:
+Run the socket-free protocol unit tests from the repository root:
+
+```sh
+npm run test:protocols --prefix apps/bridge
+```
+
+The historical three-profile baseline lives in
+`test-fixtures/protocol-tables.json`, separately from the report-derived tables.
+The tests compare all 41 ids per profile, exercise real relay helpers without
+opening sockets, check the unknown-protocol fallback, and load a new compatible
+protocol from a directory without changing the relay code. To place retained
+unit-test scratch directories under a chosen output root, set
+`GAIUS_PROTOGEN_TEST_OUT`.
+
+The existing integration smokes remain separate, opt-in checks that start or
+contact servers. They are not required by `test:protocols`:
 
 ```sh
 GAIUS_SMOKE_MINECRAFT_VERSION=1.21.11 npm run smoke
@@ -168,13 +182,217 @@ GAIUS_SMOKE_MINECRAFT_VERSION=26.3 npm run smoke
 npm run smoke:profiles
 ```
 
-The per-profile packet ids in `dist/protocol.js` come from each profile's
-client jar. After
-`GAIUS_VERSION_PROFILE_PATH=versions/<id>.json ./port/scripts/fetch-version.sh`, run
-`node tools/gen-protocol-ids.mjs --profile <id>` from the repository root: it
-runs the data generator bundled in the SHA-1-verified jar and fails on any id
-that differs from `dist/protocol.js` or the singleplayer Worker smoke tables.
-Never copy a table from an older profile by hand.
+## Protocol tables and adding a version
+
+`dist/protocol.js` reads numeric `protocols/<protocolVersion>.json` files once
+at startup. Docker includes that directory. Set
+`GAIUS_BRIDGE_PROTOCOL_DIRECTORY` to an absolute directory containing the
+complete desired table set to use a separately supplied, read-only collection.
+A compatible table can be added there without a source change or image rebuild;
+the relay must be restarted to load it. This is not hot reload and does not
+by itself deploy anything. Invalid JSON, mismatched protocol numbers, missing
+ids, duplicate directional ids or invalid provenance fail startup instead of
+silently enabling unsafe inspection. An unsupported `loginLayoutVersion` or
+an id requiring more than one byte leaves that protocol opaque.
+
+The generator selects profiles from `port/versions/*.json`, verifies the local
+jar against `official.serverSha1`, and runs:
+
+```sh
+java -Xmx3g -DbundlerMainClass=net.minecraft.data.Main -jar /absolute/path/server.jar --reports --output /absolute/scratch/reports-output
+```
+
+This invokes the vanilla data generator, not a Minecraft server. Jars and
+libraries are never downloaded. Profiles run sequentially. The Java executable
+must meet `javaVersion`; select it with `--java <executable-or-jdk-home>` or
+`GAIUS_JAVA_<javaVersion>`, `GAIUS_JAVA`, `GAIUS_JAVA_HOME` or `JAVA_HOME`.
+The bundler extraction directory, raw reports, logs and candidate tables are
+retained under the required `--out` directory **outside the checkout**. Paths
+inside or aliased into `port/work` are rejected, including junctions.
+
+By default the generator checks the selected profile's local `server.jar` in
+`port/work/<id>`, `port/target/<id>/multiplayer-smoke-server`,
+`port/target/<id>/mp/server`, and `port/target/<id>`. To use another existing
+cache, supply `--server-root` with the structure `<root>/<id>/server.jar`, or
+use `--server-jar` for a single profile. From the repository root:
+
+```sh
+node apps/bridge/scripts/gen-protocol-ids.mjs --all --server-root /local/server-cache --out /scratch/relay-protocols
+node apps/bridge/scripts/gen-protocol-ids.mjs --profile <id> --server-jar /local/server.jar --out /scratch/relay-protocols
+node apps/bridge/scripts/gen-protocol-ids.mjs --all --check --skip-missing --out /scratch/relay-protocol-check
+```
+
+`tools/gen-protocol-ids.mjs` forwards to the same generator. Normal generation
+writes the committed tables only after every requested profile succeeds.
+Every invocation validates the full manifest set, including protocol-number
+collisions, even when only one profile is selected.
+`--check` compares exact canonical JSON bytes without writing committed tables;
+it also validates their schema and profile provenance. `--all --check` validates
+the complete numeric filename set.
+The repository guard runs the unit tests and this check. `--skip-missing` is
+check-only: it explicitly reports absent local jars, but still validates the
+committed tables. Wrong jar hashes, invalid manifests, Java failures, missing
+reported packets and table drift are errors, not skips. CI without jars does
+not claim report regeneration coverage; a jar-equipped job can run the same
+command without `--skip-missing` as the strict gate.
+
+The tables contain LOGIN, CONFIGURATION and PLAY packet ids in both directions,
+the audited `loginLayoutVersion`, the actual jar SHA-1 and the SHA-256 of the
+complete canonical `reports/packets.json`. The report does **not** describe
+packet fields. `relayProtocol.loginLayoutVersion` in the profile is an explicit
+reviewed layout declaration, not a layout inferred from an id or version number.
+Layout 1 covers the relay's existing handshake/framing, payloadless phase
+acknowledgements, eight-byte keepalives and LOGIN encryption recognition, plus
+the existing PLAY-login distance prefix used by smoke clients. Other LOGIN,
+resource-pack and PLAY field codecs remain in the opt-in smoke clients; see
+`NOTES.md` for the full dependency inventory.
+
+Adding a profile:
+
+1. Add/update `port/versions/<id>.json` with its protocol number, pinned official
+   server hash, required Java major and `relayProtocol.loginLayoutVersion`.
+   Review the vanilla serializers before declaring layout 1. Never copy ids
+   from a nearby version or invent a layout from `packets.json`.
+2. Make the exact pinned server jar available locally and run generation with
+   `--profile <id>` (or `--all`). Commit the resulting numeric JSON table and
+   profile metadata. No Minecraft version switch or literal belongs in the
+   loader or generator. An unrecognised packet name or unaudited layout fails
+   generation; keep the protocol opaque until a separate codec review enables it.
+3. Run `test:protocols` and `--check` with the jars available. Keep the original
+   baseline immutable; add separate reviewed fixtures for any new layout tests.
+   The older browser/stress acceptance gates are deliberately pinned experiments
+   and need their own audit before being extended to a new profile.
+4. Build a client with the session declaration below. An already deployed
+   phase-2 relay accepts a compatible table without a restart or new deployment.
+   Older clients still require the relay's startup table directory for inspected
+   forwarding; updating that directory and restarting remains a separately
+   approved deployment. No deployment is part of protocol generation.
+
+### Session protocol declarations (phase 2)
+
+The first WebSocket text frame keeps its existing `connect` shape and optionally
+adds `protocolTable`:
+
+```json
+{
+  "type": "connect",
+  "host": "example.invalid",
+  "port": 25565,
+  "protocolTable": {
+    "formatVersion": 1,
+    "sha256": "<64 lowercase hexadecimal digits>",
+    "table": "<the complete protocol-table JSON serialized as a string>"
+  }
+}
+```
+
+`sha256` hashes the exact UTF-8 bytes of the decoded `table` string, not the
+outer control frame and not a reserialized object. Whitespace changes inside
+that string change its hash. Envelope format 1, table schema 1 and audited
+LOGIN layout 1 are the current whitelist. Tables retain the phase-1 report
+provenance and exact LOGIN/CONFIGURATION/PLAY key sets (41 selected packet ids).
+The relay requires ids in 0..127, unique within each state/direction, protocol
+numbers in 0..2147483647, and a nonempty name of at most 128 UTF-16 code units.
+Unexpected envelope/table/provenance keys, invalid types, malformed JSON,
+unsupported layouts and mismatched hashes are rejected.
+
+The complete `connect` frame is bounded to 64 KiB of UTF-8 and its decoded
+table string to 16 KiB. Checks happen before opening any target socket.
+Invalid declarations close with WebSocket code 1007; they do not silently
+downgrade to a guessed packet table. The existing token, origin, destination
+and private-address policies still apply independently. The SHA-256 is an
+integrity identifier, **not publisher authentication**: a caller can supply a
+self-consistent table. Provenance fields are syntactically validated, not
+checked against a jar on the relay, and cannot prove packet-field parity.
+
+An accepted declaration is immutable and scoped to its WebSocket session;
+it never updates the relay's disk tables or global profile registry. When
+the first Minecraft handshake arrives, its protocol number must match the
+declaration before any framed inspection is enabled. A mismatch stays an
+opaque tunnel for the rest of that session, including when a disk table
+would otherwise match. An unannounced unknown protocol also stays opaque.
+The existing encryption-to-opaque transition remains unchanged.
+
+The phase-2 relay advertises `session-protocol-table-v1` and includes an
+optional receipt in the existing `connected` control:
+
+```json
+{"protocolTable":{"formatVersion":1,"sha256":"<accepted table hash>","protocolVersion":0}}
+```
+
+The illustrative `0` is replaced by the accepted numeric protocol. The browser compares the
+receipt's format and hash with its captured declaration and fails the session
+if either differs. A missing receipt is deliberately accepted for old relays;
+this compatibility mode cannot guarantee that a relay used the declaration.
+
+| Browser | Relay | Behavior |
+| --- | --- | --- |
+| Old, no declaration | Phase 2 | Startup table selection, unknown protocols opaque |
+| New, declaration | Phase 1 | Extra control field ignored; startup tables or opaque tunnel |
+| New, declaration | Phase 2 | Validated session table overrides startup ids for that session |
+
+`BrowserWebSocketChannel` snapshots the page's declaration at the first relay
+connect and reuses it across candidate retries. Direct-plugin and LAN controls
+do not send a declaration. An absent page declaration preserves the old control.
+
+`port/scripts/build-relay-protocol.mjs` selects the profile through
+`port/versions/*.json`, verifies its table identity, audited layout and pinned
+jar hashes, and writes immutable `relay-protocol.js` into the chosen build dist:
+
+```sh
+node port/scripts/build-relay-protocol.mjs --profile <id> --out /scratch/client-dist
+```
+
+`build-wasmgc.sh` stages this script after the runtime files. The dual-runtime
+page inlines it before boot, so `file://` needs no table fetch. Portable HTML
+with `--wasm-dist` also embeds the script and records its hash in
+`runtimeModules`; repeated packaging replaces rather than duplicates the
+declaration. JavaScript-only packaging/build scripts and frozen JS artifacts
+are unchanged and retain legacy behavior. A browser source rebuild is required
+to activate the new handshake code; staging the declaration cannot retrofit
+an older compiled client.
+
+A new profile needs no further phase-2 relay deployment only when its packet
+fields still satisfy the audited layout and all selected ids fit the whitelist.
+A genuinely new layout requires a relay codec review/change, or no declaration
+so vanilla traffic remains opaque. This mechanism does not certify arbitrary
+future versions, encryption interception or vanilla parity from packet ids.
+
+Offline verification (no listeners, sockets, Chrome or full client build):
+
+```sh
+npm --prefix apps/bridge run test:protocols
+python port/scripts/test-build-portable-html.py
+```
+
+The tests cover malformed/oversized declarations, layout and hash rejection,
+UTF-8 bounds, existing profiles, an unknown-to-startup compatible protocol,
+session isolation, actual handshake/keepalive helpers, mocked connect rejection
+before target opening, and the real browser JSBody handlers with old/new
+receipts. Node mocks/source tests are not deployed-relay or gameplay acceptance.
+
+### Current source coverage
+
+`776.json` (26.2) and `777.json` (26.3) come from the pinned official server
+jars. The local 1.21.11 server jar was unavailable, so `774.json` comes from
+the pinned official `client-original.jar` running the same
+`net.minecraft.data.Main --reports` entrypoint with locally cached libraries.
+Its source is explicitly `vanilla-client-reports` with `clientSha1` and
+`expectedServerSha1`; it is **not** a claim that a server jar was verified.
+The explicit, single-profile equivalent route is:
+
+```sh
+node apps/bridge/scripts/gen-protocol-ids.mjs --profile 1.21.11 --client-work port/work/1.21.11 --out /scratch/relay-protocols
+node apps/bridge/scripts/gen-protocol-ids.mjs --profile 1.21.11 --client-work port/work/1.21.11 --check --out /scratch/relay-protocol-check
+```
+
+There is no automatic client fallback. The 26.2 client and server providers
+were also checked locally: their complete canonical packet-report hashes and
+all 41 selected ids agree. This does not prove the missing 1.21.11 server result.
+Once its pinned server jar is available, regenerate `774.json` through the
+normal server route, review the id/layout parity and commit the server-backed
+provenance. A server `--check` against the current client-backed file will
+correctly flag its different provenance.
 
 Run the standalone full browser-transport path against an unmodified local
 vanilla server and the local RelayNode with:

@@ -378,6 +378,7 @@
   }
 
   function enabled() {
+    if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled("mesher")) return false;
     if (disabledReason) return false;
     const reason = settingDisabled();
     if (reason) {
@@ -416,12 +417,18 @@
 
     // Preloads the table into whichever worker takes the job (optional warm-up).
     preload(submit, opts) {
+      if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled("mesher")) {
+        return Promise.reject(Object.assign(new Error("NEEDS_VANILLA: mesh mirror is disabled"), {code: "needs-vanilla"}));
+      }
       const jobId = this.nextJobId++ >>> 0;
       return submit("load_model_table", loadModelTable(this.table, jobId), opts || {})
         .then((buffer) => readModelTableLoaded(buffer, jobId));
     }
 
     async mesh(submit, input, opts) {
+      if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled("mesher")) {
+        throw Object.assign(new Error("NEEDS_VANILLA: mesh mirror is disabled"), {code: "needs-vanilla"});
+      }
       if (!enabled()) throw Object.assign(new Error("mesh kernel is disabled"), {code: "kernel-disabled"});
       const job = Object.assign({}, input, {tableEpoch: this.epoch});
       try {

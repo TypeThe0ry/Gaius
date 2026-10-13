@@ -4,8 +4,9 @@
 use gaius_kernel_abi::{
     kind, release_descriptor, run_kernel, JobHeader, ResultHeader, RunDescriptor, Status, RESULT_HEADER_LEN,
 };
+use gaius_noise::semantics::profiles;
 use gaius_noise::synth32::{NormalNoiseParameters, Normalization};
-use gaius_noise::{Profile, RandomKind};
+use gaius_noise::{RandomKind, Semantics};
 use gaius_noise_wasm::job::{run_noise_points, NoisePointsJob, NoiseSpec};
 use serde_json::Value;
 use std::path::Path;
@@ -59,7 +60,7 @@ fn fixture_lines(profile: &str, file: &str) -> Vec<Value> {
 
 /// Builds the kernel job for a normal or blended noise fixture line, if the
 /// line is one the kernel covers (point sampling).
-fn job_for(profile: Profile, line: &Value) -> Option<NoisePointsJob> {
+fn job_for(semantics: Semantics, line: &Value) -> Option<NoisePointsJob> {
     let p = &line["params"];
     let method = p["method"].as_str().unwrap_or("value3");
     if method == "volume" || p.get("ctor").and_then(Value::as_str) == Some("legacy_nether") {
@@ -70,7 +71,7 @@ fn job_for(profile: Profile, line: &Value) -> Option<NoisePointsJob> {
             first_octave: p["parity_first_octave"].as_i64().unwrap() as i32,
             amplitudes: hex_list(&p["parity_amplitudes"]),
         },
-        "normal_noise" if profile.uses_synth32() => NoiseSpec::NormalRecipe(NormalNoiseParameters {
+        "normal_noise" if semantics.uses_synth32() => NoiseSpec::NormalRecipe(NormalNoiseParameters {
             base_amplitude: hex(&p["base_amplitude"]),
             base_octave: p["base_octave"].as_i64().unwrap() as i32,
             octave_count: p["octave_count"].as_i64().unwrap() as i32,
@@ -109,7 +110,7 @@ fn job_for(profile: Profile, line: &Value) -> Option<NoisePointsJob> {
         })
         .collect();
     Some(NoisePointsJob {
-        profile,
+        semantics,
         random: if p["random"] == "legacy" {
             RandomKind::Legacy
         } else {
@@ -122,13 +123,29 @@ fn job_for(profile: Profile, line: &Value) -> Option<NoisePointsJob> {
     })
 }
 
+/// Some declared semantics with the float synth classes (recipes exist only there).
+fn float_semantics() -> Semantics {
+    *Semantics::all()
+        .iter()
+        .find(|s| s.uses_synth32())
+        .expect("a profile with float synth classes")
+}
+
+/// Some declared semantics with the double synth classes.
+fn double_semantics() -> Semantics {
+    *Semantics::all()
+        .iter()
+        .find(|s| !s.uses_synth32())
+        .expect("a profile with double synth classes")
+}
+
 #[test]
 fn kernel_reproduces_golden_noise() {
     let mut checked = 0;
-    for profile in Profile::ALL {
+    for (profile, semantics) in profiles() {
         for file in ["normal_noise.jsonl", "blended_noise.jsonl"] {
-            for line in fixture_lines(profile.name(), file) {
-                let Some(job) = job_for(profile, &line) else { continue };
+            for line in fixture_lines(profile, file) {
+                let Some(job) = job_for(semantics, &line) else { continue };
                 let expected: Vec<u64> = line["outputs"]
                     .as_array()
                     .unwrap()
@@ -136,7 +153,7 @@ fn kernel_reproduces_golden_noise() {
                     .map(|v| hex(v).to_bits())
                     .collect();
                 let actual: Vec<u64> = run_ok(&job).iter().map(|v| v.to_bits()).collect();
-                assert_eq!(actual, expected, "{} {} {}", profile.name(), file, line["params"]);
+                assert_eq!(actual, expected, "{} {} {}", profile, file, line["params"]);
                 checked += 1;
             }
         }
@@ -147,7 +164,7 @@ fn kernel_reproduces_golden_noise() {
 #[test]
 fn encode_decode_round_trip() {
     let job = NoisePointsJob {
-        profile: Profile::V26_3,
+        semantics: float_semantics(),
         random: RandomKind::Legacy,
         seed: -5,
         fork: Some("minecraft:ridge".into()),
@@ -166,7 +183,7 @@ fn encode_decode_round_trip() {
 #[test]
 fn rejects_invalid_payloads() {
     let mut job = NoisePointsJob {
-        profile: Profile::V26_2,
+        semantics: double_semantics(),
         random: RandomKind::Xoroshiro,
         seed: 1,
         fork: None,

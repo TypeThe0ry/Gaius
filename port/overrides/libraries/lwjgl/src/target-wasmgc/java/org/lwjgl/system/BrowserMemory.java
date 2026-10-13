@@ -1,5 +1,6 @@
 package org.lwjgl.system;
 
+import dev.gaius.browser.JsArrays;
 import dev.gaius.browser.wasm.LinearMemory;
 import java.lang.ref.WeakReference;
 import java.nio.Buffer;
@@ -13,11 +14,10 @@ import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 import java.nio.ShortBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
 import org.joml.Matrix4fc;
 import org.teavm.interop.Address;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.typedarrays.Float64Array;
 import org.teavm.runtime.heap.Heap;
 
 /**
@@ -47,9 +47,24 @@ public final class BrowserMemory {
     private static final int HEAP_COPY_SLOTS = 64;
     private static final boolean IS_LITTLE_ENDIAN = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
     /** Live allocation sizes by (aligned) address. */
-    private static final Map<Integer, Integer> SIZES = new HashMap<>();
+    private static final IntMap SIZES = new IntMap();
     /** Allocator base of an allocation whose returned address was moved for 8-byte alignment. */
-    private static final Map<Integer, Integer> BASES = new HashMap<>();
+    private static final IntMap BASES = new IntMap();
+    private static final IntMap CAPACITIES = new IntMap();
+    private static final IntMap RESERVATIONS = new IntMap();
+    private static final IntMap OWNERS = new IntMap();
+    private static final int POOL_MAX_SHIFT = 16;
+    private static final int POOL_SLOTS = 8;
+    private static final long POOL_MAX_BYTES = configuredPoolBytes();
+    private static final int[][] FREE_LISTS = new int[POOL_MAX_SHIFT + 1][POOL_SLOTS];
+    private static final int[] FREE_COUNTS = new int[POOL_MAX_SHIFT + 1];
+    private static final long[] OWNER_LIVE = new long[5];
+    private static final long[] OWNER_PEAK = new long[5];
+    private static long reservedBytes;
+    private static long peakReservedBytes;
+    private static long pooledBytes;
+    private static long reuseHits;
+    private static long inPlaceReallocations;
     private static final ThreadLocal<byte[]> BYTE_ARRAYS = ThreadLocal.withInitial(() -> new byte[TEMP_BYTES_SIZE]);
     private static final ThreadLocal<char[]> CHAR_ARRAYS = ThreadLocal.withInitial(() -> new char[8192]);
     private static final Class<?>[] BUFFER_CLASSES = new Class<?>[7];
@@ -71,12 +86,42 @@ public final class BrowserMemory {
     private static long temporaryAllocationFailureCount;
     private static int addressLookupMisses;
     private static boolean telemetryBridgeAvailable = true;
+    /**
+     * Allocations and frees publish at most this often; failures publish at once. The clock is
+     * read once per TELEMETRY_CHECK_OPERATIONS calls (System.currentTimeMillis crosses to JS
+     * and comes back as a BigInt).
+     */
+    private static final long TELEMETRY_INTERVAL_MILLIS = 250L;
+    private static final int TELEMETRY_CHECK_OPERATIONS = 64;
+    private static long lastTelemetryMillis = Long.MIN_VALUE / 2L;
+    private static int telemetryOperations;
+    private static final int SIZE_BUCKETS = 8;
+    private static final long[] SIZE_LIVE = new long[SIZE_BUCKETS];
+    private static final long[] SIZE_COUNTS = new long[SIZE_BUCKETS];
+    private static final double[] TELEMETRY = new double[49];
     private static final long PRESSURE_STEP_BYTES = Math.max(1L, MAX_LIVE_BYTES / 32L);
     private static final long PRESSURE_FLOOR_BYTES = MAX_LIVE_BYTES / 2L;
     private static final long PRESSURE_MIN_INTERVAL_MS = 1000L;
     private static long nextPressureBytes = PRESSURE_FLOOR_BYTES;
     private static long lastPressureReportMillis = Long.MIN_VALUE / 2L;
     private static boolean pressureBridgeAvailable = true;
+
+    private static int sizeBucket(int bytes) {
+        if (bytes <= 64 * 1024) return 0;
+        if (bytes <= 256 * 1024) return 1;
+        if (bytes <= 1024 * 1024) return 2;
+        if (bytes <= 4 * 1024 * 1024) return 3;
+        if (bytes <= 16 * 1024 * 1024) return 4;
+        if (bytes <= 64 * 1024 * 1024) return 5;
+        if (bytes <= 256 * 1024 * 1024) return 6;
+        return 7;
+    }
+
+    private static void sizeLive(int bytes, long delta, long countDelta) {
+        int bucket = sizeBucket(bytes);
+        SIZE_LIVE[bucket] += delta;
+        SIZE_COUNTS[bucket] += countDelta;
+    }
 
     private BrowserMemory() {
     }
@@ -180,13 +225,77 @@ public final class BrowserMemory {
     }
 
     public static long allocate(long byteCount) {
+        return allocateOwned(byteCount, 0);
+    }
+
+    /** Records the vanilla section builder sizing inputs and applies the low tier cap. */
+    public static int sectionBuilderCount(int requested, int perPackBytes) {
+        long maxMemory = Runtime.getRuntime().maxMemory();
+        int processors = Runtime.getRuntime().availableProcessors();
+        int budgetCount = (int) Math.max(1L, (long) (maxMemory * 0.3d) / Math.max(1, perPackBytes));
+        // WasmGC uses cooperative scheduling: only one section compiler executes at a time.
+        // Keep vanilla's maxMemory budget as an upper bound, but do not preallocate one pack
+        // per host processor as the browser's Runtime.availableProcessors() reports.
+        int cooperativeWorkers = sectionPackOverride();
+        int count = Math.max(1, Math.min(cooperativeWorkers, Math.min(requested, budgetCount)));
+        publishSectionBuilderTelemetry(count, requested, perPackBytes, maxMemory, processors);
+        return count;
+    }
+
+    @JSBody(script = """
+            try {
+              const raw = new URLSearchParams(globalThis.location?.search || '').get('gaiusSectionPacks');
+              const value = Number(raw);
+              return Number.isFinite(value) && value >= 1 ? Math.min(64, Math.floor(value)) : 1;
+            } catch (ignored) { return 1; }
+            """)
+    private static native int sectionPackOverride();
+
+    @JSBody(params = {"count", "requested", "perPack", "maxMemory", "processors"}, script = """
+            if (globalThis.__gaiusMemoryTelemetryEnabled !== true) return;
+            const root = globalThis.__gaiusMemoryTelemetry || (globalThis.__gaiusMemoryTelemetry = {});
+            root.sectionBuffers = {count, requested, perPackBytes: perPack, maxMemory, availableProcessors: processors,
+              totalBytes: count * perPack};
+            """)
+    private static native void publishSectionBuilderTelemetry(int count, int requested, int perPack,
+            long maxMemory, int processors);
+
+    public static void claimOwner(long address, int owner) {
+        if (owner < 0 || owner >= OWNER_LIVE.length) throw new IllegalArgumentException("Unknown memory owner");
+        int key = (int) address;
+        int previous = OWNERS.get(key);
+        if (previous == IntMap.MISSING || previous == owner || previous == 2) return;
+        int size = SIZES.get(key);
+        OWNER_LIVE[previous] -= size;
+        OWNERS.put(key, owner);
+        OWNER_LIVE[owner] += size;
+        OWNER_PEAK[owner] = Math.max(OWNER_PEAK[owner], OWNER_LIVE[owner]);
+        publishTelemetry();
+    }
+
+    private static long allocateOwned(long byteCount, int owner) {
         if (byteCount < 0 || byteCount > Integer.MAX_VALUE - 16) {
             throw allocationFailure("Unsupported browser allocation size: " + byteCount);
         }
         ensureLiveByteCapacity(byteCount);
         int size = (int) byteCount;
-        Address base = Heap.alloc(Math.max(8, size + 4));
-        int baseAddress = base.toInt();
+        int shift = poolShift(size);
+        int capacity = shift < 0 ? size : 1 << shift;
+        int baseAddress;
+        if (shift >= 0 && FREE_COUNTS[shift] > 0) {
+            baseAddress = FREE_LISTS[shift][--FREE_COUNTS[shift]];
+            pooledBytes -= capacity;
+            reuseHits++;
+        } else {
+            if (shift < 0 || reservedBytes + capacity > MAX_LIVE_BYTES) {
+                trimPool();
+            }
+            baseAddress = Heap.alloc(Math.max(8, capacity + 4)).toInt();
+            if (baseAddress != 0) {
+                reservedBytes += capacity;
+                peakReservedBytes = Math.max(peakReservedBytes, reservedBytes);
+            }
+        }
         if (baseAddress == 0) {
             throw allocationFailure("TeaVM heap exhausted: requested=" + byteCount
                     + " live=" + liveBytes);
@@ -197,6 +306,12 @@ public final class BrowserMemory {
             BASES.put(address, baseAddress);
         }
         SIZES.put(address, size);
+        CAPACITIES.put(address, capacity);
+        RESERVATIONS.put(address, capacity);
+        OWNERS.put(address, owner);
+        sizeLive(size, size, 1L);
+        OWNER_LIVE[owner] += size;
+        OWNER_PEAK[owner] = Math.max(OWNER_PEAK[owner], OWNER_LIVE[owner]);
         allocationCount++;
         liveBytes += size;
         if (liveBytes > peakLiveBytes) {
@@ -208,23 +323,33 @@ public final class BrowserMemory {
         if (liveBytes >= nextPressureBytes) {
             reportPressure((double) liveBytes / MAX_LIVE_BYTES, false);
         }
+        publishTelemetry();
         return Integer.toUnsignedLong(address);
     }
 
     /** Alignments up to 8 are free; larger ones over-allocate. */
     public static long alignedAllocate(long alignment, long byteCount) {
         if (alignment <= 8) {
-            return allocate(byteCount);
+            return allocateOwned(byteCount, 2);
         }
         if (alignment > 65536 || Long.bitCount(alignment) != 1) {
             throw new IllegalArgumentException("Unsupported alignment: " + alignment);
         }
-        long raw = allocate(byteCount + alignment);
+        long raw = allocateOwned(byteCount + alignment, 2);
         int size = SIZES.remove((int) raw);
+        int capacity = CAPACITIES.remove((int) raw);
+        int reservation = RESERVATIONS.remove((int) raw);
+        int owner = OWNERS.remove((int) raw);
         int base = BASES.containsKey((int) raw) ? BASES.remove((int) raw) : (int) raw;
         int aligned = (int) ((raw + alignment - 1) & -alignment);
         SIZES.put(aligned, (int) byteCount);
+        CAPACITIES.put(aligned, capacity - (aligned - (int) raw));
+        RESERVATIONS.put(aligned, reservation);
+        OWNERS.put(aligned, owner);
         liveBytes -= size - byteCount;
+        OWNER_LIVE[owner] -= size - byteCount;
+        sizeLive(size, -size, -1L);
+        sizeLive((int) byteCount, byteCount, 1L);
         if (aligned != base) {
             BASES.put(aligned, base);
         }
@@ -288,12 +413,69 @@ public final class BrowserMemory {
         if (address == 0L) {
             return allocate(byteCount);
         }
-        Integer oldSize = SIZES.get((int) address);
-        if (oldSize == null) {
+        int oldSize = SIZES.get((int) address);
+        if (oldSize == IntMap.MISSING) {
             throw new IllegalArgumentException("Not an allocation base: 0x" + Long.toHexString(address));
         }
         reallocationCount++;
-        long replacement = allocate(byteCount);
+        if (byteCount < 0 || byteCount > Integer.MAX_VALUE - 16) {
+            throw allocationFailure("Unsupported browser allocation size: " + byteCount);
+        }
+        int capacity = CAPACITIES.get((int) address);
+        if (POOL_MAX_BYTES > 0 && byteCount <= capacity
+                && (capacity <= 1 << POOL_MAX_SHIFT || byteCount >= capacity / 2)) {
+            ensureLiveByteCapacity(Math.max(0, byteCount - oldSize));
+            SIZES.put((int) address, (int) byteCount);
+            liveBytes += byteCount - oldSize;
+            peakLiveBytes = Math.max(peakLiveBytes, liveBytes);
+            int owner = OWNERS.get((int) address);
+            OWNER_LIVE[owner] += byteCount - oldSize;
+            sizeLive(oldSize, -oldSize, -1L);
+            sizeLive((int) byteCount, byteCount, 1L);
+            OWNER_PEAK[owner] = Math.max(OWNER_PEAK[owner], OWNER_LIVE[owner]);
+            inPlaceReallocations++;
+            publishTelemetry();
+            return address;
+        }
+        int owner = OWNERS.get((int) address);
+        if (POOL_MAX_BYTES > 0 && owner != 2 && byteCount > 1 << POOL_MAX_SHIFT) {
+            ensureLiveByteCapacity(Math.max(0, byteCount - oldSize));
+            trimPool();
+            int oldBase = BASES.get((int) address);
+            if (oldBase == IntMap.MISSING) oldBase = (int) address;
+            int reservation = RESERVATIONS.get((int) address);
+            int newBase = Heap.realloc(Address.fromInt(oldBase), (int) byteCount + 4).toInt();
+            if (newBase == 0) throw allocationFailure("TeaVM heap exhausted during realloc: " + byteCount);
+            int replacement = (newBase + 7) & ~7;
+            int copiedData = newBase + (int) address - oldBase;
+            if (replacement != copiedData) {
+                Address.moveMemoryBlock(Address.fromInt(copiedData), Address.fromInt(replacement),
+                        (int) Math.min(oldSize, byteCount));
+            }
+            SIZES.remove((int) address);
+            CAPACITIES.remove((int) address);
+            RESERVATIONS.remove((int) address);
+            OWNERS.remove((int) address);
+            BASES.remove((int) address);
+            SIZES.put(replacement, (int) byteCount);
+            CAPACITIES.put(replacement, (int) byteCount);
+            RESERVATIONS.put(replacement, (int) byteCount);
+            OWNERS.put(replacement, owner);
+            if (replacement != newBase) BASES.put(replacement, newBase);
+            if (newBase == oldBase) inPlaceReallocations++;
+            peakReservedBytes = Math.max(peakReservedBytes,
+                    reservedBytes + (newBase == oldBase ? byteCount - reservation : byteCount));
+            reservedBytes += byteCount - reservation;
+            liveBytes += byteCount - oldSize;
+            peakLiveBytes = Math.max(peakLiveBytes, liveBytes);
+            OWNER_LIVE[owner] += byteCount - oldSize;
+            sizeLive(oldSize, -oldSize, -1L);
+            sizeLive((int) byteCount, byteCount, 1L);
+            OWNER_PEAK[owner] = Math.max(OWNER_PEAK[owner], OWNER_LIVE[owner]);
+            publishTelemetry();
+            return replacement;
+        }
+        long replacement = allocateOwned(byteCount, OWNERS.get((int) address));
         Address.moveMemoryBlock(Address.fromInt((int) address), Address.fromInt((int) replacement),
                 (int) Math.min(oldSize, byteCount));
         free(address);
@@ -305,12 +487,26 @@ public final class BrowserMemory {
             return;
         }
         int key = (int) address;
-        Integer size = SIZES.remove(key);
-        if (size == null) {
+        int size = SIZES.remove(key);
+        if (size == IntMap.MISSING) {
             throw new IllegalArgumentException("Not an allocation base: 0x" + Long.toHexString(address));
         }
-        Integer base = BASES.remove(key);
-        Heap.release(Address.fromInt(base != null ? base : key));
+        int base = BASES.remove(key);
+        int capacity = CAPACITIES.remove(key);
+        int reservation = RESERVATIONS.remove(key);
+        int owner = OWNERS.remove(key);
+        OWNER_LIVE[owner] -= size;
+        sizeLive(size, -size, -1L);
+        int shift = poolShift(capacity);
+        int baseAddress = base != IntMap.MISSING ? base : key;
+        if (shift >= 0 && capacity == reservation && capacity == 1 << shift && FREE_COUNTS[shift] < POOL_SLOTS
+                && pooledBytes + capacity <= POOL_MAX_BYTES) {
+            FREE_LISTS[shift][FREE_COUNTS[shift]++] = baseAddress;
+            pooledBytes += capacity;
+        } else {
+            Heap.release(Address.fromInt(baseAddress));
+            reservedBytes -= reservation;
+        }
         freeCount++;
         liveBytes -= size;
         publishTelemetry();
@@ -945,7 +1141,7 @@ public final class BrowserMemory {
         }
         addressLookupMisses++;
         int capacity = bytes.capacity();
-        long address = allocate(capacity);
+        long address = allocateOwned(capacity, 1);
         Address target = at(address);
         for (int index = 0; index < capacity; index++) {
             target.add(index).putByte(bytes.get(index));
@@ -960,42 +1156,72 @@ public final class BrowserMemory {
         return address;
     }
 
+    /** Publishes the counters when the last publish is at least the interval old. */
     private static void publishTelemetry() {
         if (!telemetryBridgeAvailable) {
             return;
         }
+        if (++telemetryOperations < TELEMETRY_CHECK_OPERATIONS) {
+            return;
+        }
+        telemetryOperations = 0;
+        long now = System.currentTimeMillis();
+        if (now - lastTelemetryMillis < TELEMETRY_INTERVAL_MILLIS) {
+            return;
+        }
+        lastTelemetryMillis = now;
+        publishTelemetryNow();
+    }
+
+    private static void publishTelemetryNow() {
+        if (!telemetryBridgeAvailable) {
+            return;
+        }
+        double[] t = TELEMETRY;
+        t[0] = SIZES.size();
+        t[1] = liveBytes;
+        t[2] = 0;
+        t[3] = peakLiveRegions;
+        t[4] = peakLiveBytes;
+        t[5] = 0;
+        t[6] = allocationCount;
+        t[7] = freeCount;
+        t[8] = registrationCount;
+        t[9] = reallocationCount;
+        t[10] = 0;
+        t[11] = addressLookupMisses;
+        t[12] = MAX_LIVE_BYTES;
+        t[13] = allocationFailureCount;
+        t[14] = MAX_TEMPORARY_BYTES;
+        t[15] = peakTemporaryBytes;
+        t[16] = temporaryAllocationFailureCount;
+        t[17] = reservedBytes;
+        t[18] = peakReservedBytes;
+        t[19] = pooledBytes;
+        t[20] = reuseHits;
+        t[21] = inPlaceReallocations;
+        t[22] = POOL_MAX_BYTES;
+        for (int owner = 0; owner < OWNER_LIVE.length; owner++) {
+            t[23 + owner * 2] = OWNER_LIVE[owner];
+            t[24 + owner * 2] = OWNER_PEAK[owner];
+        }
+        for (int bucket = 0; bucket < SIZE_BUCKETS; bucket++) {
+            t[33 + bucket * 2] = SIZE_LIVE[bucket];
+            t[34 + bucket * 2] = SIZE_COUNTS[bucket];
+        }
         try {
-            publishTelemetryBrowser(
-                    SIZES.size(),
-                    liveBytes,
-                    0,
-                    peakLiveRegions,
-                    peakLiveBytes,
-                    0,
-                    allocationCount,
-                    freeCount,
-                    registrationCount,
-                    reallocationCount,
-                    0L,
-                    addressLookupMisses,
-                    MAX_LIVE_BYTES,
-                    allocationFailureCount,
-                    MAX_TEMPORARY_BYTES,
-                    peakTemporaryBytes,
-                    temporaryAllocationFailureCount);
+            publishTelemetryBrowser(JsArrays.float64(t));
         } catch (Throwable ignored) {
             telemetryBridgeAvailable = false;
         }
     }
 
-    @JSBody(params = {
-            "liveRegions", "liveBytes", "associatedBuffers",
-            "peakLiveRegions", "peakLiveBytes", "peakAssociatedBuffers",
-            "allocations", "frees", "registrations", "reallocations",
-            "collectedAssociations", "addressLookupMisses",
-            "maxLiveBytes", "allocationFailures", "maxTemporaryBytes",
-            "peakTemporaryBytes", "temporaryAllocationFailures"
-    }, script = """
+    /**
+     * Writes {@code __gaiusMemoryTelemetry.browserMemory} (the shape of the JavaScript build's)
+     * from one packed snapshot: one typed array instead of separate scalar arguments that
+     * would cross as BigInts.
+     */
+    @JSBody(params = "v", script = """
             let root = globalThis.__gaiusMemoryTelemetry;
             if (!root || typeof root !== 'object' || Array.isArray(root)) {
               root = {};
@@ -1007,42 +1233,84 @@ public final class BrowserMemory {
               root.browserMemory = memory;
             }
             memory.backend = 'linear-memory';
-            memory.liveRegions = liveRegions | 0;
-            memory.liveBytes = Number(liveBytes);
-            memory.associatedBuffers = associatedBuffers | 0;
-            memory.peakLiveRegions = peakLiveRegions | 0;
-            memory.peakLiveBytes = Number(peakLiveBytes);
-            memory.peakAssociatedBuffers = peakAssociatedBuffers | 0;
-            memory.allocations = Number(allocations);
-            memory.frees = Number(frees);
-            memory.registrations = Number(registrations);
-            memory.reallocations = Number(reallocations);
-            memory.collectedAssociations = Number(collectedAssociations);
-            memory.addressLookupMisses = addressLookupMisses | 0;
-            memory.maxLiveBytes = Number(maxLiveBytes);
-            memory.allocationFailures = Number(allocationFailures);
-            memory.maxTemporaryBytes = maxTemporaryBytes | 0;
-            memory.peakTemporaryBytes = peakTemporaryBytes | 0;
-            memory.temporaryAllocationFailures = Number(temporaryAllocationFailures);
+            memory.liveRegions = v[0] | 0;
+            memory.liveBytes = v[1];
+            memory.associatedBuffers = v[2] | 0;
+            memory.peakLiveRegions = v[3] | 0;
+            memory.peakLiveBytes = v[4];
+            memory.peakAssociatedBuffers = v[5] | 0;
+            memory.allocations = v[6];
+            memory.frees = v[7];
+            memory.registrations = v[8];
+            memory.reallocations = v[9];
+            memory.collectedAssociations = v[10];
+            memory.addressLookupMisses = v[11] | 0;
+            memory.maxLiveBytes = v[12];
+            memory.allocationFailures = v[13];
+            memory.maxTemporaryBytes = v[14] | 0;
+            memory.peakTemporaryBytes = v[15] | 0;
+            memory.temporaryAllocationFailures = v[16];
+            memory.reservedBytes = v[17];
+            memory.peakReservedBytes = v[18];
+            memory.pooledBytes = v[19];
+            memory.reuseHits = v[20];
+            memory.inPlaceReallocations = v[21];
+            memory.poolLimitBytes = v[22];
+            const owners = memory.owners || (memory.owners = {});
+            for (let index = 0; index < 5; index++) {
+              const name = ['native', 'heap-buffer-copy', 'aligned', 'decoded-image', 'mapped-staging'][index];
+              const entry = owners[name] || (owners[name] = {});
+              entry.liveBytes = v[23 + index * 2];
+              entry.peakBytes = v[24 + index * 2];
+            }
+            const sizes = memory.sizeBuckets || (memory.sizeBuckets = []);
+            for (let index = 0; index < 8; index++) {
+              const entry = sizes[index] || (sizes[index] = {});
+              entry.liveBytes = v[33 + index * 2];
+              entry.count = v[34 + index * 2];
+            }
             """)
-    private static native void publishTelemetryBrowser(
-            int liveRegions,
-            long liveBytes,
-            int associatedBuffers,
-            int peakLiveRegions,
-            long peakLiveBytes,
-            int peakAssociatedBuffers,
-            long allocations,
-            long frees,
-            long registrations,
-            long reallocations,
-            long collectedAssociations,
-            int addressLookupMisses,
-            long maxLiveBytes,
-            long allocationFailures,
-            int maxTemporaryBytes,
-            int peakTemporaryBytes,
-            long temporaryAllocationFailures);
+    private static native void publishTelemetryBrowser(Float64Array values);
+
+    private static int poolShift(int size) {
+        if (POOL_MAX_BYTES == 0 || size > 1 << POOL_MAX_SHIFT) {
+            return -1;
+        }
+        return Math.max(4, 32 - Integer.numberOfLeadingZeros(Math.max(1, size) - 1));
+    }
+
+    public static void trimPool() {
+        for (int shift = 4; shift <= POOL_MAX_SHIFT; shift++) {
+            while (FREE_COUNTS[shift] > 0) {
+                Heap.release(Address.fromInt(FREE_LISTS[shift][--FREE_COUNTS[shift]]));
+                reservedBytes -= 1L << shift;
+            }
+        }
+        pooledBytes = 0;
+    }
+
+    @JSBody(script = """
+            try {
+              const params = new URLSearchParams(globalThis.location?.search || '');
+              if (params.get('gaiusMemoryReuse') === '0') return 0;
+              const low = typeof globalThis.__gaiusIsLowMemoryTier === 'function'
+                    ? globalThis.__gaiusIsLowMemoryTier()
+                    : params.get('gaiusMemoryTier') === 'low'
+                      || !!(globalThis.__gaiusMemoryTier && globalThis.__gaiusMemoryTier.lowMemory);
+              if (low) return 512 * 1024;
+              return 2 * 1024 * 1024;
+            } catch (ignored) { return 2 * 1024 * 1024; }
+            """)
+    private static native int runtimePoolBytes();
+
+    private static long configuredPoolBytes() {
+        try {
+            String value = System.getProperty("gaius.browser.memory.poolBytes");
+            return value == null ? runtimePoolBytes() : Math.max(0, Math.min(2 * 1024 * 1024, Long.parseLong(value)));
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
 
     private static long configuredMaxLiveBytes() {
         String configured = System.getProperty("gaius.browser.memory.maxBytes");
@@ -1077,7 +1345,7 @@ public final class BrowserMemory {
 
     private static OutOfMemoryError allocationFailure(String message) {
         allocationFailureCount++;
-        publishTelemetry();
+        publishTelemetryNow();
         reportPressure(1.0, true);
         return new OutOfMemoryError(message);
     }
@@ -1136,5 +1404,100 @@ public final class BrowserMemory {
     private static byte normalIntValue(float value) {
         float clamped = value < -1.0f ? -1.0f : Math.min(value, 1.0f);
         return (byte) (((int) (clamped * 127.0f)) & 0xff);
+    }
+
+    /**
+     * An int to int map for the allocation tables, keyed by nonzero linear-memory addresses:
+     * open addressing with linear probing and backward-shift deletion, so allocate and free
+     * neither box nor allocate (a HashMap of Integer cost 50 ns per call with few live
+     * allocations and 400 ns with 40000, port/tests/micro). Values are never negative.
+     */
+    private static final class IntMap {
+        static final int MISSING = -1;
+        private int[] keys = new int[64];
+        private int[] values = new int[64];
+        private int mask = 63;
+        private int size;
+
+        int size() {
+            return size;
+        }
+
+        private int slot(int key) {
+            int hash = (key >>> 3) * 0x9E3779B1;
+            return (hash ^ (hash >>> 16)) & mask;
+        }
+
+        int get(int key) {
+            for (int index = slot(key);; index = (index + 1) & mask) {
+                int current = keys[index];
+                if (current == key) {
+                    return values[index];
+                }
+                if (current == 0) {
+                    return MISSING;
+                }
+            }
+        }
+
+        boolean containsKey(int key) {
+            return key != 0 && get(key) != MISSING;
+        }
+
+        void put(int key, int value) {
+            if (key == 0) {
+                throw new IllegalArgumentException("Address 0 is not an allocation");
+            }
+            if ((size + 1) * 4 > (mask + 1) * 3) {
+                grow();
+            }
+            int index = slot(key);
+            while (keys[index] != 0 && keys[index] != key) {
+                index = (index + 1) & mask;
+            }
+            if (keys[index] == 0) {
+                keys[index] = key;
+                size++;
+            }
+            values[index] = value;
+        }
+
+        int remove(int key) {
+            int index = slot(key);
+            while (keys[index] != key) {
+                if (keys[index] == 0) {
+                    return MISSING;
+                }
+                index = (index + 1) & mask;
+            }
+            int value = values[index];
+            size--;
+            // Backward shift: move later entries of the probe run into the hole.
+            int hole = index;
+            for (int next = (hole + 1) & mask; keys[next] != 0; next = (next + 1) & mask) {
+                int home = slot(keys[next]);
+                if (((next - home) & mask) >= ((next - hole) & mask)) {
+                    keys[hole] = keys[next];
+                    values[hole] = values[next];
+                    hole = next;
+                }
+            }
+            keys[hole] = 0;
+            return value;
+        }
+
+        private void grow() {
+            int[] oldKeys = keys;
+            int[] oldValues = values;
+            keys = new int[oldKeys.length * 2];
+            values = new int[oldKeys.length * 2];
+            mask = keys.length - 1;
+            size = 0;
+            for (int index = 0; index < oldKeys.length; index++) {
+                if (oldKeys[index] != 0) {
+                    put(oldKeys[index], oldValues[index]);
+                }
+            }
+        }
     }
 }

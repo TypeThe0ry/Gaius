@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Gaius runtime micro benchmarks</title>
+</head>
+<body>
+<pre id="out">loading</pre>
+<script src="gaius-wasm-gc-runtime.js"></script>
+<script src="gaius-jspi.js"></script>
+<script>
+// The page of port/tests/micro (run-chrome.mjs): the production loader and gaius-jspi.js wired
+// as gaius-wasm-boot.js wires the client, with the linear memory published for BrowserMemory.
+// ?only=pingpong,heap,browsermemory selects groups (globalThis.__gaiusMicroParams).
+(function () {
+  "use strict";
+  var out = document.getElementById("out");
+  var errors = globalThis.__gaiusMicroErrors = [];
+  var only = new URLSearchParams(location.search).get("only");
+  globalThis.__gaiusMicroParams = only ? {only: only} : {};
+  var jspi = null;
+  var teavm = null;
+  globalThis.TeaVM.wasmGC.load("classes.wasm", {
+    memory: {
+      onResize: function () {
+        if (globalThis.__gaiusLinear) globalThis.__gaiusLinear.refresh();
+      }
+    },
+    installImports: function (imports) {
+      globalThis.__gaiusWasmMemory = imports.env ? imports.env.memory : null;
+      var scheduler = globalThis.GaiusJspi.createScheduler();
+      globalThis.__gaiusJspiScheduler = scheduler;
+      jspi = globalThis.GaiusJspi.installJspi(imports, scheduler,
+        function () { return teavm.instance.exports; },
+        function (error) { console.log("THREAD ERROR " + String(error && error.message || error)); });
+      globalThis.GaiusJspi.routeEventQueue(imports, scheduler);
+    }
+  }).then(function (loaded) {
+    teavm = loaded;
+    out.textContent = "running";
+    return jspi.startMain([]);
+  }).then(function () {
+    var s = globalThis.__gaiusMicro;
+    out.textContent = s ? JSON.stringify(s.results, null, 1) : "main returned";
+  }, function (error) {
+    errors.push(String(error && error.stack || error));
+    out.textContent = "failed: " + errors[0];
+  });
+})();
+</script>
+</body>
+</html>

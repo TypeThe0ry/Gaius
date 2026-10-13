@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -15,6 +17,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from verification_profiles import LEGACY_ID, RENDERPEARL_ID
+
 
 SCRIPT = Path(__file__).with_name("build-portable-html.py")
 SPEC = importlib.util.spec_from_file_location("build_portable_html", SCRIPT)
@@ -23,7 +27,85 @@ PORTABLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PORTABLE)
 
 
+def load_script(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+POSTPROCESS = load_script("postprocess_index_html", SCRIPT.with_name("postprocess-index-html.py"))
+MAKE_WASM_PAGE = load_script(
+    "make_wasm_page", SCRIPT.parent.parent / "web" / "runtime" / "wasmgc" / "make-wasm-page.py"
+)
+
+
 class BuildPortableHTMLTest(unittest.TestCase):
+    def test_frozen_components_are_checked_against_their_own_identity(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("build_identity.check_frozen(root, role, artifact, sidecar)", source)
+        self.assertIn('"protocolVersion", "worldVersion", "storage"', source)
+        self.assertIn("frozen: bool = False", source)
+        self.assertIn("expected_common=expected", source)
+
+    def test_frozen_flag_is_required_for_legacy_fallbacks(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('frozen_js = "--frozen-js" in arguments', source)
+        self.assertIn("frozen_js=frozen_js", source.replace(" ", ""))
+        self.assertIn("frozen=frozen_js", source)
+
+    def test_toolchain_identity_remains_strict(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        call = source[source.index("shader_toolchain = load_shader_toolchain("):]
+        self.assertIn("load_shader_toolchain(", call)
+        self.assertNotIn("frozen=frozen_js", call.split("\n", 3)[0:3].__str__())
+
+    def test_strict_identity_path_rejects_toolchain_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "gaius-shaderc.wasm"
+            artifact.write_bytes(b"shaderc")
+            sidecar = artifact.with_name(artifact.name + ".build.json")
+            sidecar.write_text("{}", encoding="utf-8")
+            with mock.patch.object(
+                PORTABLE.build_identity,
+                "verify_sidecar",
+                side_effect=RuntimeError("identity mismatch"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                    PORTABLE.verified_component_identity(root, artifact, "shader-toolchain", {}, frozen=False)
+
+    def test_missing_compiler_workspace_is_only_allowed_for_frozen_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "classes.js"
+            artifact.write_bytes(b"classes")
+            with self.assertRaises((RuntimeError, FileNotFoundError)):
+                PORTABLE.verified_compiler_profile(
+                    Path(directory), artifact, "client", Path(directory) / "missing-pom.xml", [], frozen=False
+                )
+            record = PORTABLE.verified_compiler_profile(
+                Path(directory), artifact, "client", Path(directory) / "missing-pom.xml", [], frozen=True
+            )
+            self.assertTrue(record["frozen"])
+
+    def test_wasm_only_payload_lookup_does_not_reuse_previous_candidate(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("candidate = None\n            if not logical", source)
+
+    def test_wasm_only_uses_the_launcher_path(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("build(dist, output, wasm_dist=wasm_dist, wasm_server_dist=wasm_server_dist,", source)
+        self.assertNotIn("__gaiusWasmClientBase64", source)
+
+    def test_wasm_portable_declares_utf8_before_payloads_and_omits_js_server(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('portable = "<!doctype html><meta charset=\\"utf-8\\">"', source)
+        payload_section = source[source.index("FILE_PAYLOAD_FILES = ("):source.index(")\nWASM_MAGIC", source.index("FILE_PAYLOAD_FILES = ("))]
+        self.assertNotIn('"singleplayer-server.js"', payload_section)
+        self.assertLess(source.index('<!doctype html><meta charset=\\"utf-8\\">'),
+                        source.index("prefix + inert + index"))
+
     def test_launcher_keeps_embedded_portable_worker_urls(self) -> None:
         template = (SCRIPT.parent.parent / "web" / "launcher" / "index.template.html").read_text(
             encoding="utf-8"
@@ -117,6 +199,15 @@ setTimeout(() => {
         digest = hashlib.sha256(raw).hexdigest()
         self.assertEqual(json.loads(result.stdout), [digest, digest])
 
+    def test_portable_inline_decoder_uses_all_source_bytes(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("((d&15)<<4)|(e>>3)", source)
+        self.assertIn("((e&7)<<5)|(f>>2)", source)
+        self.assertIn("((f&3)<<6)|(h>>1)", source)
+        self.assertNotIn("((c&15)<<4)|(e>>3)", source)
+        self.assertNotIn("((c&7)<<5)|(f>>2)", source)
+        self.assertNotIn("((c&3)<<6)|(h>>1)", source)
+
     def test_runtime_bootstrap_inlines_boot_modules(self) -> None:
         root = SCRIPT.resolve().parents[2]
         inline, hashes = PORTABLE.runtime_bootstrap(root)
@@ -139,6 +230,246 @@ setTimeout(() => {
         early = template.index('<script data-gaius-profile-early="v1">')
         self.assertLess(early, template.index(PORTABLE.BOOT_TAG))
         self.assertLess(template.index(PORTABLE.BOOT_TAG), template.index("</head>"))
+
+    def test_portable_wasm_inlines_the_session_protocol_before_boot(self) -> None:
+        root = SCRIPT.resolve().parents[2]
+        source = ("Object.defineProperty(globalThis,'__gaiusRelayProtocolDeclaration',"
+                  "{value:Object.freeze({formatVersion:1}),writable:false});\n")
+        with tempfile.TemporaryDirectory() as directory:
+            dist = Path(directory)
+            (dist / PORTABLE.WASM_CLIENT_MODULE).write_bytes(b"\0asm\1\0\0\0")
+            for name in PORTABLE.WASM_CLIENT_SCRIPTS:
+                (dist / name).write_text("void 0;\n", encoding="utf-8")
+            (dist / "relay-protocol.js").write_text(source, encoding="utf-8")
+            wasm_client = PORTABLE.load_wasm_client(dist)
+            inline, hashes = PORTABLE.runtime_bootstrap(root, wasm_client=wasm_client)
+            self.assertEqual(inline.count("data-gaius-relay-protocol"), 1)
+            self.assertIn(source, inline)
+            self.assertLess(inline.index(source), inline.rindex("__gaiusBoot ="))
+            self.assertEqual(hashes["wasm/relay-protocol.js"],
+                             hashlib.sha256(source.encode("utf-8")).hexdigest())
+            clean = PORTABLE.RELAY_PROTOCOL_BLOCK.sub("", inline)
+            self.assertNotIn(source, clean)
+            self.assertEqual((clean + inline).count("data-gaius-relay-protocol"), 1)
+            (dist / "relay-protocol.js").write_text("</script>\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "cannot be inlined"):
+                PORTABLE.load_wasm_client(dist)
+        legacy, legacy_hashes = PORTABLE.runtime_bootstrap(root)
+        self.assertNotIn("data-gaius-relay-protocol", legacy)
+        self.assertNotIn("wasm/relay-protocol.js", legacy_hashes)
+
+    def test_wasm_primary_payload_aliases_match_boot_logical_names(self) -> None:
+        payload = PORTABLE.PortablePayload()
+        payload.add(PORTABLE.WASM_CLIENT_ASSET, b"client-gzip", gzipped=True)
+        payload.add(PORTABLE.WASM_SERVER_ASSET, b"server-gzip", gzipped=True)
+        self.assertEqual(set(payload.index()["assets"]), {"wasmclient", "wasmserver"})
+        bootstrap = PORTABLE.apply_portable_wasm_client(
+            (PORTABLE.PORTABLE_CLASSES_DECODE + PORTABLE.PORTABLE_CLASSES_URL)
+            .replace("__GAIUS_WASM_SERVER_ASSET__", PORTABLE.WASM_SERVER_ASSET)
+        )
+        self.assertIn('decodeAsset("wasmclient", {gunzip: true})', bootstrap)
+        self.assertIn('portablePayloadBytes["classes.wasm"]', bootstrap)
+        self.assertIn('decodeAsset("wasmserver", {gunzip: false})', bootstrap)
+        self.assertIn('portablePayloadBytes["singleplayer-server.wasm"]', bootstrap)
+        self.assertNotIn('siblingUrl("classes.wasm")', bootstrap)
+
+    def test_wasm_server_dist_is_embedded_in_wasm_primary_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = root / "client"
+            server = root / "server"
+            client.mkdir()
+            server.mkdir()
+            (client / PORTABLE.WASM_CLIENT_MODULE).write_bytes(b"\0asm\1\0\0\0client")
+            (server / PORTABLE.WASM_SERVER_MODULE).write_bytes(b"\0asm\1\0\0\0server")
+            for name in PORTABLE.WASM_CLIENT_SCRIPTS:
+                (client / name).write_text("void 0;\n", encoding="utf-8")
+            (server / "gaius-wasm-worker.js").write_text("void 0;\n", encoding="utf-8")
+            loaded = PORTABLE.load_wasm_client(client, server)
+            self.assertIsNotNone(loaded["server"])
+            self.assertEqual(loaded["server"]["manifest"]["rawBytes"], 14)
+
+    def test_file_payloads_round_trip_without_fetch(self) -> None:
+        """<file>.payload.js decodes back to the file the way gaius-boot.js reads it."""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            dist = Path(directory)
+            module = b"\0asm\1\0\0\0" + os.urandom(40_000)
+            hotpath = b"\0asm\1\0\0\0hotpath"
+            (dist / "classes.wasm").write_bytes(module)
+            (dist / "gaius-hotpath.wasm").write_bytes(hotpath)
+            # A .gz sibling that inflates to the file is reused as it is.
+            sibling = gzip.compress(hotpath, compresslevel=1, mtime=0)
+            (dist / "gaius-hotpath.wasm.gz").write_bytes(sibling)
+            pack = gzip.compress(b"GAIUSVP1" + os.urandom(1000), mtime=0)
+            (dist / "vanilla-assets.pack.gz").write_bytes(pack)
+            index = PORTABLE.write_file_payloads(dist)
+            self.assertEqual(sorted(index), ["classes.wasm", "gaius-hotpath.wasm", "vanilla-assets.pack.gz"])
+            self.assertEqual(index["classes.wasm"]["script"], "classes.wasm.payload.js")
+            self.assertTrue(index["classes.wasm"]["gzip"])
+            self.assertFalse(index["vanilla-assets.pack.gz"]["gzip"], "a .gz file is carried as it is")
+            self.assertEqual(index["classes.wasm"]["sha256"], hashlib.sha256(module).hexdigest())
+            self.assertEqual(index["classes.wasm"]["bytes"], len(module))
+            for name, entry in index.items():
+                text = (dist / entry["script"]).read_text(encoding="ascii")
+                self.assertNotIn("\r", text)
+                # A getter over the comment of a function (no string literal of the text).
+                self.assertTrue(text.startswith("(function(s,k,a){"), name)
+                self.assertIn("a.push(\"", text, name)
+                self.assertIn("return a.join", text, name)
+                self.assertNotIn("<!--", text.lower(), name)
+                self.assertNotIn("<script", text.lower(), name)
+                self.assertNotIn("</script", text.lower(), name)
+            script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const crypto = require("crypto");
+const [directory, names] = [process.argv[2], JSON.parse(process.argv[3])];
+const context = vm.createContext({});
+for (const [name, entry] of Object.entries(names)) {
+  vm.runInContext(fs.readFileSync(directory + "/" + entry.script, "utf8"), context);
+}
+(async () => {
+  const out = {};
+  for (const [name, entry] of Object.entries(names)) {
+    const bytes = Buffer.from(context.__gaiusFilePayloadData[name], "base64");
+    out[name + ":payload"] = crypto.createHash("sha256").update(bytes).digest("hex");
+    const body = entry.gzip
+      ? Buffer.from(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer())
+      : bytes;
+    out[name] = crypto.createHash("sha256").update(body).digest("hex");
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+            script_path = dist / "payload-check.js"
+            script_path.write_text(script, encoding="utf-8")
+            result = subprocess.run([node, str(script_path), str(dist), json.dumps(index)], text=True,
+                                    capture_output=True, check=True, timeout=60)
+            hashes = json.loads(result.stdout)
+            self.assertEqual(hashes["classes.wasm"], hashlib.sha256(module).hexdigest())
+            self.assertEqual(hashes["gaius-hotpath.wasm"], hashlib.sha256(hotpath).hexdigest())
+            self.assertEqual(hashes["gaius-hotpath.wasm:payload"], hashlib.sha256(sibling).hexdigest())
+            self.assertEqual(hashes["vanilla-assets.pack.gz"], hashlib.sha256(pack).hexdigest())
+
+    def test_runtime_configuration_precedes_the_boot_script(self) -> None:
+        script = POSTPROCESS.runtime_config_script(
+            {"wasm": {"client": "classes.wasm"}}, "wasm",
+            {"classes.wasm": {"script": "classes.wasm.payload.js", "bytes": 1, "gzip": True}},
+        )
+        page = "<head>\n" + PORTABLE.BOOT_TAG + "</head>\n"
+        configured = POSTPROCESS.apply_runtime_config(page, script)
+        self.assertEqual(POSTPROCESS.apply_runtime_config(configured, script), configured, "replaced, not repeated")
+        self.assertLess(configured.index("window.__gaiusRuntimes = "), configured.index(PORTABLE.BOOT_TAG))
+        self.assertIn('window.__gaiusRuntimeDefault = "wasm";', configured)
+        self.assertNotIn("</script", POSTPROCESS.runtime_config_script({"wasm": {"client": "</script>"}})[:-12])
+        with self.assertRaises(ValueError):
+            POSTPROCESS.runtime_config_script(None, "fastest")
+        without_boot = POSTPROCESS.apply_runtime_config("<head></head>", script)
+        self.assertIn('data-gaius-runtimes="v1"', without_boot)
+        self.assertLess(without_boot.index('data-gaius-runtimes="v1"'), without_boot.index("</head>"))
+
+    def test_early_profile_block_contains_every_renderer_capability(self) -> None:
+        profile = POSTPROCESS.load_profile_for_version(RENDERPEARL_ID)
+        page = POSTPROCESS.patch_early_profile_id("<head>\n</head>\n", profile)
+        for name in ("__gaiusProfileId", "__gaiusRenderSeam", "__gaiusPatchSet",
+                     "__gaiusTerrainSectionUniformBlock"):
+            self.assertIn(f"window.{name} = ", page)
+
+    def test_legacy_profile_disables_modern_terrain_batch_path(self) -> None:
+        profile = POSTPROCESS.load_profile_for_version(LEGACY_ID)
+        source = (SCRIPT.parent.parent / "overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java").read_text()
+        overlay = (SCRIPT.parent / "build-overlays.sh").read_text()
+        self.assertEqual(profile["patchSet"], "legacy-12111")
+        self.assertIn("GaiusProfileCapabilities.PATCH_SET", source)
+        self.assertIn("const modernProfile=String(patchSet || '').trim()!=='legacy-12111';", source)
+        self.assertIn("state.terrainBatchEnabled=modernProfile && !wasmNeedsVanillaTerrain", source)
+        self.assertIn("jq -r '.terrainSectionUniformBlock // false'", overlay)
+
+    def test_dual_portable_defaults_to_wasm(self) -> None:
+        runtime, _hashes = PORTABLE.runtime_bootstrap(
+            SCRIPT.parents[2], wasm_client={"scripts": {}, "server": None, "relayProtocol": None}
+        )
+        self.assertIn("window.__gaiusRuntimeDefault = 'wasm';", runtime)
+
+    def test_make_wasm_page_stages_a_dual_runtime_dist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            js_dist = Path(directory) / "js"
+            wasm_dist = Path(directory) / "wasm"
+            js_dist.mkdir()
+            wasm_dist.mkdir()
+            profile = POSTPROCESS.load_profile_for_version(RENDERPEARL_ID)
+            source_page = POSTPROCESS.patch_early_profile_id(
+                "<head>\n" + PORTABLE.BOOT_TAG + "</head>\n", profile)
+            (js_dist / "index.html").write_text(source_page, encoding="utf-8")
+            for name in ("classes.js", "Gaius.html", "Gaius.manifest.json", "singleplayer-server-worker.js",
+                         "gaius-boot.js"):
+                (js_dist / name).write_text(name, encoding="utf-8")
+            (js_dist / "vanilla-assets.pack.gz").write_bytes(gzip.compress(b"GAIUSVP1", mtime=0))
+            (wasm_dist / "classes.wasm").write_bytes(b"\0asm\1\0\0\0client")
+            (wasm_dist / "singleplayer-server.wasm").write_bytes(b"\0asm\1\0\0\0server")
+            (wasm_dist / "classes.wasm.gz.js").write_text("stale", encoding="utf-8")
+            relay_script = "Object.defineProperty(globalThis, '__gaiusRelayProtocolDeclaration', {value: null});\n"
+            (wasm_dist / "relay-protocol.js").write_text(relay_script, encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = MAKE_WASM_PAGE.main([str(js_dist), str(wasm_dist), "--gzip-payload"])
+            self.assertEqual(status, 0)
+            for name in ("classes.js", "singleplayer-server-worker.js", "gaius-boot.js", "gaius-wasm-boot.js",
+                         "gaius-jspi.js", "gaius-wasm-worker.js", "classes.wasm.payload.js",
+                         "vanilla-assets.pack.gz.payload.js", "index.html", "index-wasm.html"):
+                self.assertTrue((wasm_dist / name).is_file(), name)
+            for name in ("Gaius.html", "Gaius.manifest.json", "classes.wasm.gz.js"):
+                self.assertFalse((wasm_dist / name).exists(), name)
+            # The page runtime and the Worker bootstrap come from this tree, not from the
+            # JavaScript dist (which may be older); so do the wasm loaders.
+            web = SCRIPT.parent.parent / "web"
+            self.assertEqual((wasm_dist / "gaius-boot.js").read_bytes(), (web / "boot" / "gaius-boot.js").read_bytes())
+            self.assertEqual((wasm_dist / "singleplayer-server-worker.js").read_bytes(),
+                             (web / "singleplayer" / "server-worker-bootstrap.js").read_bytes())
+            wasmgc = SCRIPT.parent.parent / "web" / "runtime" / "wasmgc"
+            self.assertEqual((wasm_dist / "gaius-wasm-worker.js").read_bytes(), (wasmgc / "gaius-wasm-worker.js").read_bytes())
+            page = (wasm_dist / "index.html").read_text(encoding="utf-8")
+            self.assertIn('data-gaius-profile-early="v1"', page)
+            for name in ("__gaiusProfileId", "__gaiusRenderSeam", "__gaiusPatchSet",
+                         "__gaiusTerrainSectionUniformBlock"):
+                self.assertIn(f"window.{name} = ", page)
+            self.assertIn(relay_script, page)
+            self.assertEqual(page.count("data-gaius-relay-protocol"), 1)
+            self.assertLess(page.index(relay_script), page.index(PORTABLE.BOOT_TAG))
+            self.assertIn('window.__gaiusRuntimes = {"wasm":{"client":"classes.wasm","server":"singleplayer-server.wasm"}};', page)
+            self.assertIn('window.__gaiusRuntimeDefault = "wasm";', page)
+            self.assertIn('"classes.wasm":{"bytes":14,"gzip":true', page)
+            self.assertEqual(page, (wasm_dist / "index-wasm.html").read_text(encoding="utf-8"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                MAKE_WASM_PAGE.main([str(js_dist), str(wasm_dist), "--default", "js"])
+            page = (wasm_dist / "index.html").read_text(encoding="utf-8")
+            self.assertIn('window.__gaiusRuntimeDefault = "js";', page)
+            self.assertNotIn("__gaiusFilePayloads", page)
+            self.assertEqual(page.count("data-gaius-relay-protocol"), 1)
+            self.assertEqual((js_dist / "index.html").read_text(encoding="utf-8"), source_page)
+            self.assertNotIn("__gaiusWebGpuShaderToolchain", page)
+            # A shader toolchain staged for the WebGPU GLSL front-end (26.2, 1.21.11) is named for
+            # gaius-boot.js, which loads it for ?gpu=webgpu only.
+            for name in POSTPROCESS.SHADER_TOOLCHAIN_FILES:
+                (wasm_dist / name).write_text(name, encoding="utf-8")
+            token = POSTPROCESS.content_token(*(wasm_dist / name for name in POSTPROCESS.SHADER_TOOLCHAIN_FILES))
+            with contextlib.redirect_stdout(io.StringIO()):
+                MAKE_WASM_PAGE.main([str(js_dist), str(wasm_dist)])
+            page = (wasm_dist / "index.html").read_text(encoding="utf-8")
+            self.assertIn('window.__gaiusWebGpuShaderToolchain = {"loader":"gaius-shader-toolchain.js?v='
+                          + token + '","version":"' + token + '"};', page)
+            self.assertNotIn(POSTPROCESS.SHADER_TOOLCHAIN_MARKER, page)
+            # A page that loads the toolchain for every backend (renderpearl) keeps doing so.
+            shader_page = (
+                "<head>\n  <script " + POSTPROCESS.SHADER_TOOLCHAIN_MARKER + (' data-profile="' + RENDERPEARL_ID + '" ') +
+                'src="gaius-shader-toolchain.js?v=1"></script>\n' + PORTABLE.BOOT_TAG + "</head>\n")
+            (js_dist / "index.html").write_text(
+                POSTPROCESS.patch_early_profile_id(shader_page, profile), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                MAKE_WASM_PAGE.main([str(js_dist), str(wasm_dist)])
+            self.assertNotIn("__gaiusWebGpuShaderToolchain", (wasm_dist / "index.html").read_text(encoding="utf-8"))
 
     def test_atomic_write_replaces_complete_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

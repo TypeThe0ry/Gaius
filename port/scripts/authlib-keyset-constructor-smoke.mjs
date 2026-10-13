@@ -27,6 +27,7 @@ import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, w
 import {homedir, tmpdir} from "node:os";
 import {delimiter, join, isAbsolute, resolve, relative} from "node:path";
 import {fileURLToPath} from "node:url";
+import {sourceFile} from "../tools/sourcesets/sourcesets.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const args = process.argv.slice(2);
@@ -689,10 +690,13 @@ function runProfile(profile, work) {
   {encoding: "utf8", timeout: 120_000});
   const evidence = inspectClassEvidence(patched, major);
 
-  // BrowserAuthlibGson of the profile's source set: port/src/versions/<id> overrides main.
-  const versioned = join(root, "port/src/versions", profile, "java/dev/gaius/browser/BrowserAuthlibGson.java");
-  const gsonSource = existsSync(versioned)
-    ? versioned : join(root, "port/src/main/java/dev/gaius/browser/BrowserAuthlibGson.java");
+  // BrowserAuthlibGson as the profile compiles it: its port/mc/shared source sets over
+  // port/src/main, with the source set relocations applied (authlib 10 moved the payloads).
+  const gson = sourceFile(profile, "src", "dev/gaius/browser/BrowserAuthlibGson.java", {root});
+  assert.ok(gson, `${profile} compiles no dev/gaius/browser/BrowserAuthlibGson.java`);
+  const gsonSource = join(profileWork, "gson-src", "dev/gaius/browser/BrowserAuthlibGson.java");
+  mkdirSync(join(profileWork, "gson-src", "dev/gaius/browser"), {recursive: true});
+  writeFileSync(gsonSource, gson.text);
   const driverSource = join(profileWork, "AuthlibBrowserSmokeDriver.java");
   writeFileSync(driverSource, JVM_DRIVER);
   const classpath = [patched, authlibJar, ...dependencies].join(delimiter);

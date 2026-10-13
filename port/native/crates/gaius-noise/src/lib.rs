@@ -12,6 +12,9 @@
 //! - [`synth32`]: 26.3 (`GradientNoise` family and `NoiseStack`, float
 //!   results, plus the volume fill used by chunk generation).
 //!
+//! Callers pick between them through [`Semantics`], which every version
+//! profile declares in `port/versions/<id>.json` (`kernelSemantics`).
+//!
 //! Every sampler keeps a scalar reference path; [`batch`] layers the
 //! many-positions-per-call entry points on top of it.
 #![forbid(unsafe_code)]
@@ -19,10 +22,10 @@
 pub mod batch;
 pub mod java;
 pub mod mth;
-pub mod profile;
 pub mod random;
+pub mod semantics;
 pub mod synth32;
 pub mod synth64;
 
-pub use profile::Profile;
 pub use random::{PositionalRandomFactory, RandomKind, RandomSource};
+pub use semantics::{DensityGraph, Semantics, Synth};

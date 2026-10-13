@@ -1,13 +1,22 @@
 package dev.gaius.browser;
 
 import com.mojang.blaze3d.platform.NativeImage;
+import dev.gaius.browser.ops.VersionOps;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
-/** Shares immutable bitmap font pixels only within one resource-manager generation. */
+/**
+ * Shares immutable bitmap font pixels only within one resource-manager generation.
+ *
+ * <p>MinecraftClientPatcher's patchBitmapFontImageSharing redirects the vanilla bitmap sheet read to
+ * the entry point that matches the vanilla call shape: the format-aware {@code read(Format,
+ * InputStream, Object, Object)} for generations that decode with {@code NativeImage.read(Format,
+ * InputStream)}, and {@code read(InputStream, Object, Object)} for generations whose decoder
+ * takes no format. Decoding itself goes through {@link VersionOps#readImage}.
+ */
 public final class BrowserFontBitmapCache {
     private static final Map<Object, Map<Object, Entry>> GENERATIONS = new IdentityHashMap<>();
     private static final Map<NativeImage, Entry> IMAGES = new IdentityHashMap<>();
@@ -23,7 +32,7 @@ public final class BrowserFontBitmapCache {
             return entry.image;
         }
         // A failed decode must not leave a generation or a partially acquired entry behind.
-        NativeImage image = NativeImage.read(format, stream);
+        NativeImage image = VersionOps.INSTANCE.readImage(format, stream);
         if (images == null) {
             images = new HashMap<>();
             GENERATIONS.put(resources, images);
@@ -32,6 +41,12 @@ public final class BrowserFontBitmapCache {
         images.put(location, entry);
         IMAGES.put(image, entry);
         return image;
+    }
+
+    /** The entry point for vanilla bitmap sheet reads that pass no format (RGBA sheets). */
+    public static synchronized NativeImage read(InputStream stream, Object resources,
+            Object location) throws IOException {
+        return read(NativeImage.Format.RGBA, stream, resources, location);
     }
 
     /** 26.2 holders also own lazily allocated GPU staging data; share that owner as well. */

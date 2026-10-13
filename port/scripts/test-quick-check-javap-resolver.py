@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().with_name("quick-check.py")
+SCRIPT = Path(__file__).resolve().parent / "legacy" / "quick-check.py"
 SPEC = importlib.util.spec_from_file_location("gaius_quick_check_javap", SCRIPT)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"cannot import {SCRIPT}")

@@ -37,6 +37,7 @@
 // --toolchain defaults to port/target/shader-toolchain/out (build-wasm-shader-toolchain.sh).
 // Exit status: 0 pass, 1 failure, 2 usage or environment error.
 
+import {RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import {execFileSync, spawn} from "node:child_process";
 import {createRequire} from "node:module";
 import {copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync,
@@ -69,7 +70,7 @@ for (let index = 2; index < process.argv.length; index++) {
   else if (argument.startsWith("--") && index + 1 < process.argv.length) options[argument.slice(2)] = process.argv[++index];
   else usage(`unknown or incomplete argument ${argument}`);
 }
-const profile = options.profile || "26.3";
+const profile = options.profile || RENDERPEARL_PROFILE.id;
 const stages = new Set(options.stages.split(",").map((stage) => stage.trim()).filter(Boolean));
 const out = fromRoot(options.out || join("port/target/shader-corpus", profile));
 const toolchainDir = fromRoot(options.toolchain || "port/target/shader-toolchain/out");

@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
+import {memberText, patcherSource as stepSource} from "./patcher-sources.mjs";
 
 async function source(relative) {
   return readFile(new URL(relative, import.meta.url), "utf8");
@@ -34,7 +35,8 @@ const [
   source("../src/main/java/dev/gaius/browser/BrowserTargeting.java"),
   source("../src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java"),
   source("../web/singleplayer/server-worker-bootstrap.js"),
-  source("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
+  // MinecraftClientPatcher with its domain classes (port/tools/patchkit/README.md, "Domains").
+  stepSource("MinecraftClientPatcher"),
   source("./chrome-chunk-benchmark.mjs"),
   source("./performance-metrics.mjs"),
   source("./performance-contract.json"),
@@ -223,10 +225,7 @@ while (shouldContinueDrain(fastTasks, elapsedNanos, true)) {
 }
 assert.equal(fastTasks, 16, "fast desktop profile did not drain its bounded warmup budget");
 
-const extractorPatch = patcher.slice(
-  patcher.indexOf("patchCurrentLevelExtractorBrowserSectionCompileThrottle"),
-  patcher.indexOf("private static AbstractInsnNode findPreviousNew"),
-);
+const extractorPatch = memberText(patcher, "patchCurrentLevelExtractorBrowserSectionCompileThrottle");
 for (const contract of ["retryNextFrame", "canScheduleSection", '"(I)Z"']) {
   assert.ok(extractorPatch.includes(contract), "missing dirty retry contract: " + contract);
 }

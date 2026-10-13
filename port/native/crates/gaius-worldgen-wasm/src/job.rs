@@ -35,17 +35,20 @@
 //! u32 junction_count; junction: i32 source_x, source_ground_y, source_z
 //! ```
 //!
-//! and with flags bit 2 the biomes the neighbouring chunks store around the chunk (what
+//! and with flags bit 2 the stored biomes in and around the chunk (what
 //! vanilla's surface rules read through the `WorldGenRegion`):
 //!
 //! ```text
-//! u32 ring_len (20 * level_height / 4), u32 ring[ring_len]   global biome ids; for each quart
-//!     column of the 6 x 6 grid around the chunk outside its own 4 x 4 (x outer, z inner, from
+//! u32 ring_len (36 * level_height / 4), u32 ring[ring_len]   global biome ids; for each quart
+//!     column of the complete 6 x 6 grid (x outer, z inner, from
 //!     chunk_x * 4 - 1 / chunk_z * 4 - 1), every quart y from the level bottom
 //! ```
+//! The old 20-column border remains readable. Missing center biomes that require ambiguous
+//! climate searches decline; a complete stored grid never reconstructs those biomes.
 //!
 //! A ring that names a biome outside the generator's biome table fails the job with a
 //! `BadPayload` message starting with `worldgen-fallback:`: only that chunk takes the Java path.
+//! Multi-noise BIOMES jobs also decline because vanilla retains search history across chunks.
 //!
 //! `surface` (kind `0x0404`): reference, `i32 chunk_x, chunk_z, u32 flags` (bit 2 ring biomes
 //! follow), the beardifier, the ring biomes, then a chunk in the result layout below (from
@@ -501,7 +504,17 @@ pub fn biomes(payload: &[u8]) -> Result<Vec<u8>, KernelError> {
     let chunk_x = c.i32()?;
     let chunk_z = c.i32()?;
     with_generator(&r, |g| {
+        if g.biome_context_requires_vanilla() {
+            return Err(bad(format!(
+                "{FALLBACK_PREFIX}multi-noise biomes require vanilla thread-local search history"
+            )));
+        }
         let ids = g.run_biomes(chunk_x, chunk_z);
+        if g.biome_fallback_required() {
+            return Err(bad(format!(
+                "{FALLBACK_PREFIX}climate tie needs the vanilla thread's previous biome"
+            )));
+        }
         let mut out = Vec::with_capacity(8 + ids.len() * 4);
         out.extend_from_slice(&(g.section_count() as u32).to_le_bytes());
         out.extend_from_slice(&g.settings.level_min_y.to_le_bytes());
@@ -531,6 +544,11 @@ pub fn terrain(payload: &[u8]) -> Result<Vec<u8>, KernelError> {
             ring_biomes: ring_locals(g, ring.as_deref())?,
         };
         let result = g.run_terrain(&request);
+        if g.biome_fallback_required() {
+            return Err(bad(format!(
+                "{FALLBACK_PREFIX}surface biome needs the vanilla thread's previous biome"
+            )));
+        }
         let out_flags = (result.biomes.is_some() as u32) | ((request.surface as u32) << 1);
         Ok(encode_chunk(g, &result.chunk, out_flags, result.biomes.as_deref()))
     })
@@ -553,6 +571,11 @@ pub fn surface(payload: &[u8]) -> Result<Vec<u8>, KernelError> {
             return Err(bad("surface chunk position does not match the job"));
         }
         g.run_surface_with(&mut chunk, beard, ring.as_deref());
+        if g.biome_fallback_required() {
+            return Err(bad(format!(
+                "{FALLBACK_PREFIX}surface biome needs the vanilla thread's previous biome"
+            )));
+        }
         Ok(encode_chunk(g, &chunk, 2, None))
     })
 }

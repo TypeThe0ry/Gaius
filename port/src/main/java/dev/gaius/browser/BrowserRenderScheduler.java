@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.typedarrays.Float64Array;
 
 /**
  * Defers expensive renderer work so one client frame cannot drain the whole compile queue.
@@ -49,6 +50,9 @@ public final class BrowserRenderScheduler {
     private static final Budget NORMAL_BUDGET = new Budget(
             8, 16, 3_000_000L, 16, 3_000_000L, 2L * 1024L * 1024L, 2, 4,
             2L * 1024L * 1024L, 1_000_000L);
+    private static final Budget FRAME_TAIL_BUDGET = new Budget(
+            4, 64, 1_000_000L, 4, 1_000_000L, 512L * 1024L, 1, 2,
+            1024L * 1024L, 500_000L);
     /** Longest pump slice before yielding one event-loop turn. */
     private static final long SLICE_NANOS = 2_000_000L;
     /** A paused pump resumes after this long even when no frame is rendered. */
@@ -60,8 +64,109 @@ public final class BrowserRenderScheduler {
     private static final long MAX_UPLOAD_RETRY_NANOS = 5_000_000_000L;
     private static final long UPLOAD_RETRY_SWEEP_INTERVAL_NANOS = 1_000_000_000L;
     private static final long UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS = 5_000_000_000L;
+    /** Field indices of the packed telemetry snapshot (see publishTelemetryJs). */
+    private static final int T_PENDING_TASKS = 0;
+    private static final int T_QUEUE_CAPACITY = 1;
+    private static final int T_TASK_RUNNING = 2;
+    private static final int T_PEAK_PENDING_TASKS = 3;
+    private static final int T_COMPILE_BACKLOG = 4;
+    private static final int T_PEAK_COMPILE_BACKLOG = 5;
+    private static final int T_UPLOAD_BACKLOG = 6;
+    private static final int T_PEAK_UPLOAD_BACKLOG = 7;
+    private static final int T_ENQUEUED_TASKS = 8;
+    private static final int T_COMPLETED_TASKS = 9;
+    private static final int T_BACKPRESSURE_EVENTS = 10;
+    private static final int T_OVER_BUDGET_TASKS = 11;
+    private static final int T_LAST_TASK_MILLIS = 12;
+    private static final int T_LONGEST_TASK_MILLIS = 13;
+    private static final int T_TOTAL_TASK_MILLIS = 14;
+    private static final int T_UPLOAD_PASSES = 15;
+    private static final int T_LAST_UPLOAD_PASS_MILLIS = 16;
+    private static final int T_LONGEST_UPLOAD_PASS_MILLIS = 17;
+    private static final int T_TOTAL_UPLOAD_PASS_MILLIS = 18;
+    private static final int T_UPLOAD_ALLOCATIONS_QUEUED = 19;
+    private static final int T_UPLOAD_ALLOCATIONS_DRAINED = 20;
+    private static final int T_HIGH_WATER_ACTIVE = 21;
+    private static final int T_CURRENT_HIGH_WATER_MILLIS = 22;
+    private static final int T_TOTAL_HIGH_WATER_MILLIS = 23;
+    private static final int T_LONGEST_HIGH_WATER_MILLIS = 24;
+    private static final int T_RENDER_FRAMES = 25;
+    private static final int T_LAST_TASK_DRAIN_COUNT = 26;
+    private static final int T_PEAK_TASK_DRAIN_COUNT = 27;
+    private static final int T_LAST_TASK_BUDGET_EXHAUSTED = 28;
+    private static final int T_TASK_BUDGET_EXHAUSTIONS = 29;
+    private static final int T_CURRENT_UPLOAD_DRAIN_COUNT = 30;
+    private static final int T_LAST_UPLOAD_DRAIN_COUNT = 31;
+    private static final int T_PEAK_UPLOAD_DRAIN_COUNT = 32;
+    private static final int T_MAX_UPLOAD_ALLOCATIONS_PER_FRAME = 33;
+    private static final int T_UPLOAD_WORK_BUDGET_MILLIS = 34;
+    private static final int T_UPLOAD_BUDGET_EXHAUSTED = 35;
+    private static final int T_UPLOAD_BUDGET_EXHAUSTIONS = 36;
+    private static final int T_UPLOAD_ENTRY_BUDGET_EXHAUSTIONS = 37;
+    private static final int T_UPLOAD_TIME_BUDGET_EXHAUSTIONS = 38;
+    private static final int T_DISPATCHER_RUNNER_REQUESTS = 39;
+    private static final int T_DISPATCHER_RUNNER_ENQUEUED = 40;
+    private static final int T_DISPATCHER_RUNNER_COALESCED = 41;
+    private static final int T_DISPATCHER_RUNNER_DISPOSALS = 42;
+    private static final int T_DISPATCHER_UPLOAD_DEFERRALS = 43;
+    private static final int T_ACTIVE_DISPATCHERS = 44;
+    private static final int T_UPLOAD_ALLOCATIONS_DISCARDED = 45;
+    private static final int T_COMPILE_RUNS_DURING_UPLOAD_THIS_FRAME = 46;
+    private static final int T_COMPILE_RUNS_DURING_UPLOAD = 47;
+    private static final int T_UPLOAD_FAIR_SHARE_DEFERRALS = 48;
+    private static final int T_ACTIVE_UPLOAD_BUFFERS = 49;
+    private static final int T_EMERGENCY_UPLOAD_REQUESTS = 50;
+    private static final int T_EMERGENCY_UPLOAD_DRAINS = 51;
+    private static final int T_EMERGENCY_UPLOAD_DEFERRALS = 52;
+    private static final int T_UPLOAD_RETRY_YIELDS = 53;
+    private static final int T_UPLOAD_RETRY_NO_PROGRESS_RESUMES = 54;
+    private static final int T_UPLOAD_RETRY_CANCELLATIONS = 55;
+    private static final int T_UPLOAD_RETRY_EXPIRED_STATES = 56;
+    private static final int T_ACTIVE_UPLOAD_RETRY_TASKS = 57;
+    private static final int T_MAX_UPLOAD_RETRY_YIELDS = 58;
+    private static final int T_MAX_UPLOAD_RETRY_MILLIS = 59;
+    private static final int T_UPLOAD_PROGRESS_EPOCH = 60;
+    private static final int T_CURRENT_UBER_NODE_CLEANUP_SCANS = 61;
+    private static final int T_LAST_UBER_NODE_CLEANUP_SCANS = 62;
+    private static final int T_PEAK_UBER_NODE_CLEANUP_SCANS = 63;
+    private static final int T_MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME = 64;
+    private static final int T_UBER_NODE_CLEANUP_BUDGET_MILLIS = 65;
+    private static final int T_UBER_NODE_CLEANUP_PASSES = 66;
+    private static final int T_UBER_NODE_CLEANUP_NODES_SCANNED = 67;
+    private static final int T_UBER_NODE_CLEANUP_NODES_RELEASED = 68;
+    private static final int T_UBER_NODE_CLEANUP_DEFERRALS = 69;
+    private static final int T_ACTIVE_UBER_NODE_CLEANUP_CURSORS = 70;
+    private static final int T_FRAME_TASKS = 71;
+    private static final int T_FRAME_WORK_MILLIS = 72;
+    private static final int T_PUMP_WAITING_FOR_FRAME = 73;
+    private static final int T_FRAME_WATCHDOG_RESUMES = 74;
+    private static final int T_PUMP_SLICES = 75;
+    private static final int T_UPLOAD_BYTES_THIS_FRAME = 76;
+    private static final int T_UPLOAD_BYTES_PER_FRAME = 77;
+    private static final int T_UPLOAD_BYTE_BUDGET_EXHAUSTIONS = 78;
+    private static final int T_LAST_INSTALL_BYTES = 79;
+    private static final int T_INSTALL_BYTES_PER_FRAME = 80;
+    private static final int T_MESH_REQUESTS_IN_FLIGHT = 81;
+    private static final int T_MESH_RESULTS_READY = 82;
+    private static final int T_FAILED_TASKS = 83;
+    private static final int T_COUNT = 84;
+    private static final double[] TELEMETRY = new double[T_COUNT];
+    /**
+     * Without a diagnostic opt-in ({@link #telemetryEveryCallRequested}) the snapshot is written
+     * at most once per this interval: readers poll it (acceptance, the singleplayer CDP probe)
+     * and a fresher copy every frame only cost frame time.
+     */
+    private static final long TELEMETRY_INTERVAL_NANOS = 100_000_000L;
+    private static long telemetryPublishedAtNanos;
+    private static boolean telemetryPublishedOnce;
+    /** The opt-in as last read; re-read at most once per interval, when a snapshot is due. */
+    private static boolean telemetryEveryCall;
+    /** A skipped snapshot is written when its interval ends, so the last state is not lost. */
+    private static boolean telemetryFlushArmed;
     private static boolean fastProfileInitialized;
     private static boolean fastProfile;
+    private static boolean frameTailProfileInitialized;
+    private static boolean frameTailProfile;
     private static int frameTasks;
     private static long frameWorkNanos;
     private static boolean waitingForFrame;
@@ -165,6 +270,11 @@ public final class BrowserRenderScheduler {
     }
 
     private static Budget budget() {
+        if (!frameTailProfileInitialized) {
+            frameTailProfile = JsArrays.LINEAR_MEMORY && frameTailRequested();
+            frameTailProfileInitialized = true;
+        }
+        if (frameTailProfile) return FRAME_TAIL_BUDGET;
         return fastProfile() ? FAST_BUDGET : NORMAL_BUDGET;
     }
 
@@ -1005,142 +1115,130 @@ public final class BrowserRenderScheduler {
         }
     }
 
+    /**
+     * Writes the snapshot when one is due: on every call while a diagnostic run asks for it
+     * (the chunk benchmark's per-frame histograms), otherwise at most once per
+     * {@link #TELEMETRY_INTERVAL_NANOS}; a skipped call arms one write at the end of the
+     * interval, so the snapshot never lags the state by more than the interval. The counters
+     * themselves are kept on every call.
+     */
     private static void publishTelemetry() {
         updateHighWaterState();
+        long now = System.nanoTime();
+        boolean intervalDue = !telemetryPublishedOnce
+                || now - telemetryPublishedAtNanos >= TELEMETRY_INTERVAL_NANOS;
+        if (intervalDue) {
+            telemetryEveryCall = telemetryEveryCallRequested();
+            telemetryPublishedAtNanos = now;
+            telemetryPublishedOnce = true;
+        } else if (!telemetryEveryCall) {
+            armTelemetryFlush(now);
+            return;
+        }
         long activeHighWaterNanos = highWaterActive
                 ? Math.max(0L, System.nanoTime() - highWaterStartedAt)
                 : 0L;
-        // TeaVM's WebAssembly GC backend limits JSBody natives to 32 parameters; the
-        // WebAssembly GC build does not publish the chunk pipeline counters yet
-        // (constant-folded).
-        if (!HostLoop.isWasmGc()) {
-            publishTelemetryJs(
-                    pendingTasks(),
-                    effectiveQueueHighWater(),
-                    runningTask,
-                    peakQueuedTasks,
-                    compileBacklog,
-                    peakCompileBacklog,
-                    uploadBacklog,
-                    peakUploadBacklog,
-                    enqueuedTasks,
-                    completedTasks,
-                    backpressureEvents,
-                    overBudgetTasks,
-                    nanosToMillis(lastTaskNanos),
-                    nanosToMillis(longestTaskNanos),
-                    nanosToMillis(totalTaskNanos),
-                    uploadPasses,
-                    nanosToMillis(lastUploadPassNanos),
-                    nanosToMillis(longestUploadPassNanos),
-                    nanosToMillis(totalUploadPassNanos),
-                    uploadAllocationsQueued,
-                    uploadAllocationsDrained,
-                    highWaterActive,
-                    nanosToMillis(activeHighWaterNanos),
-                    nanosToMillis(totalHighWaterNanos + activeHighWaterNanos),
-                    nanosToMillis(Math.max(longestHighWaterNanos, activeHighWaterNanos)),
-                    renderFrames,
-                    lastTaskDrainCount,
-                    peakTaskDrainCount,
-                    lastTaskBudgetExhausted,
-                    taskBudgetExhaustions,
-                    currentUploadDrainCount,
-                    lastUploadDrainCount,
-                    peakUploadDrainCount,
-                    effectiveMaxUploadAllocationsPerFrame(),
-                    nanosToMillis(effectiveUploadWorkBudgetNanos()),
-                    uploadBudgetExhaustedThisFrame,
-                    uploadBudgetExhaustions,
-                    uploadEntryBudgetExhaustions,
-                    uploadTimeBudgetExhaustions,
-                    dispatcherRunnerRequests,
-                    dispatcherRunnerEnqueued,
-                    dispatcherRunnerCoalesced,
-                    dispatcherRunnerDisposals,
-                    dispatcherUploadDeferrals,
-                    DISPATCHER_STATES.size(),
-                    uploadAllocationsDiscarded,
-                    compileRunsDuringUploadThisFrame,
-                    compileRunsDuringUpload,
-                    uploadFairShareDeferrals,
-                    UPLOAD_FRAME_DRAIN_COUNTS.size(),
-                    emergencyUploadRequests,
-                    emergencyUploadDrains,
-                    emergencyUploadDeferrals,
-                    uploadRetryYields,
-                    uploadRetryNoProgressResumes,
-                    uploadRetryCancellations,
-                    uploadRetryExpiredStates,
-                    UPLOAD_RETRY_STATES.size(),
-                    MAX_UPLOAD_RETRY_YIELDS,
-                    nanosToMillis(MAX_UPLOAD_RETRY_NANOS),
-                    uploadProgressEpoch,
-                    currentUberNodeCleanupScans,
-                    lastUberNodeCleanupScans,
-                    peakUberNodeCleanupScans,
-                    MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME,
-                    nanosToMillis(UBER_NODE_CLEANUP_BUDGET_NANOS),
-                    uberNodeCleanupPasses,
-                    uberNodeCleanupNodesScanned,
-                    uberNodeCleanupNodesReleased,
-                    uberNodeCleanupDeferrals,
-                    UBER_NODE_CLEANUP_CURSORS.size());
-        }
         Budget budget = budget();
-        publishFrameBudgetJs(
-                frameTasks,
-                nanosToMillis(frameWorkNanos),
-                waitingForFrame,
-                (double) frameWatchdogResumes,
-                (double) pumpSlices,
-                (double) currentUploadBytes,
-                (double) budget.uploadBytesPerFrame(),
-                (double) uploadByteBudgetExhaustions,
-                (double) lastInstallBytes,
-                (double) budget.installBytesPerFrame(),
-                BrowserMeshInstallQueue.inFlight(),
-                BrowserMeshInstallQueue.readyCount(),
-                (double) failedTasks);
+        double[] t = TELEMETRY;
+        t[T_PENDING_TASKS] = pendingTasks();
+        t[T_QUEUE_CAPACITY] = effectiveQueueHighWater();
+        t[T_TASK_RUNNING] = runningTask ? 1 : 0;
+        t[T_PEAK_PENDING_TASKS] = peakQueuedTasks;
+        t[T_COMPILE_BACKLOG] = compileBacklog;
+        t[T_PEAK_COMPILE_BACKLOG] = peakCompileBacklog;
+        t[T_UPLOAD_BACKLOG] = uploadBacklog;
+        t[T_PEAK_UPLOAD_BACKLOG] = peakUploadBacklog;
+        t[T_ENQUEUED_TASKS] = enqueuedTasks;
+        t[T_COMPLETED_TASKS] = completedTasks;
+        t[T_BACKPRESSURE_EVENTS] = backpressureEvents;
+        t[T_OVER_BUDGET_TASKS] = overBudgetTasks;
+        t[T_LAST_TASK_MILLIS] = nanosToMillis(lastTaskNanos);
+        t[T_LONGEST_TASK_MILLIS] = nanosToMillis(longestTaskNanos);
+        t[T_TOTAL_TASK_MILLIS] = nanosToMillis(totalTaskNanos);
+        t[T_UPLOAD_PASSES] = uploadPasses;
+        t[T_LAST_UPLOAD_PASS_MILLIS] = nanosToMillis(lastUploadPassNanos);
+        t[T_LONGEST_UPLOAD_PASS_MILLIS] = nanosToMillis(longestUploadPassNanos);
+        t[T_TOTAL_UPLOAD_PASS_MILLIS] = nanosToMillis(totalUploadPassNanos);
+        t[T_UPLOAD_ALLOCATIONS_QUEUED] = uploadAllocationsQueued;
+        t[T_UPLOAD_ALLOCATIONS_DRAINED] = uploadAllocationsDrained;
+        t[T_HIGH_WATER_ACTIVE] = highWaterActive ? 1 : 0;
+        t[T_CURRENT_HIGH_WATER_MILLIS] = nanosToMillis(activeHighWaterNanos);
+        t[T_TOTAL_HIGH_WATER_MILLIS] = nanosToMillis(totalHighWaterNanos + activeHighWaterNanos);
+        t[T_LONGEST_HIGH_WATER_MILLIS] = nanosToMillis(Math.max(longestHighWaterNanos, activeHighWaterNanos));
+        t[T_RENDER_FRAMES] = renderFrames;
+        t[T_LAST_TASK_DRAIN_COUNT] = lastTaskDrainCount;
+        t[T_PEAK_TASK_DRAIN_COUNT] = peakTaskDrainCount;
+        t[T_LAST_TASK_BUDGET_EXHAUSTED] = lastTaskBudgetExhausted ? 1 : 0;
+        t[T_TASK_BUDGET_EXHAUSTIONS] = taskBudgetExhaustions;
+        t[T_CURRENT_UPLOAD_DRAIN_COUNT] = currentUploadDrainCount;
+        t[T_LAST_UPLOAD_DRAIN_COUNT] = lastUploadDrainCount;
+        t[T_PEAK_UPLOAD_DRAIN_COUNT] = peakUploadDrainCount;
+        t[T_MAX_UPLOAD_ALLOCATIONS_PER_FRAME] = effectiveMaxUploadAllocationsPerFrame();
+        t[T_UPLOAD_WORK_BUDGET_MILLIS] = nanosToMillis(effectiveUploadWorkBudgetNanos());
+        t[T_UPLOAD_BUDGET_EXHAUSTED] = uploadBudgetExhaustedThisFrame ? 1 : 0;
+        t[T_UPLOAD_BUDGET_EXHAUSTIONS] = uploadBudgetExhaustions;
+        t[T_UPLOAD_ENTRY_BUDGET_EXHAUSTIONS] = uploadEntryBudgetExhaustions;
+        t[T_UPLOAD_TIME_BUDGET_EXHAUSTIONS] = uploadTimeBudgetExhaustions;
+        t[T_DISPATCHER_RUNNER_REQUESTS] = dispatcherRunnerRequests;
+        t[T_DISPATCHER_RUNNER_ENQUEUED] = dispatcherRunnerEnqueued;
+        t[T_DISPATCHER_RUNNER_COALESCED] = dispatcherRunnerCoalesced;
+        t[T_DISPATCHER_RUNNER_DISPOSALS] = dispatcherRunnerDisposals;
+        t[T_DISPATCHER_UPLOAD_DEFERRALS] = dispatcherUploadDeferrals;
+        t[T_ACTIVE_DISPATCHERS] = DISPATCHER_STATES.size();
+        t[T_UPLOAD_ALLOCATIONS_DISCARDED] = uploadAllocationsDiscarded;
+        t[T_COMPILE_RUNS_DURING_UPLOAD_THIS_FRAME] = compileRunsDuringUploadThisFrame;
+        t[T_COMPILE_RUNS_DURING_UPLOAD] = compileRunsDuringUpload;
+        t[T_UPLOAD_FAIR_SHARE_DEFERRALS] = uploadFairShareDeferrals;
+        t[T_ACTIVE_UPLOAD_BUFFERS] = UPLOAD_FRAME_DRAIN_COUNTS.size();
+        t[T_EMERGENCY_UPLOAD_REQUESTS] = emergencyUploadRequests;
+        t[T_EMERGENCY_UPLOAD_DRAINS] = emergencyUploadDrains;
+        t[T_EMERGENCY_UPLOAD_DEFERRALS] = emergencyUploadDeferrals;
+        t[T_UPLOAD_RETRY_YIELDS] = uploadRetryYields;
+        t[T_UPLOAD_RETRY_NO_PROGRESS_RESUMES] = uploadRetryNoProgressResumes;
+        t[T_UPLOAD_RETRY_CANCELLATIONS] = uploadRetryCancellations;
+        t[T_UPLOAD_RETRY_EXPIRED_STATES] = uploadRetryExpiredStates;
+        t[T_ACTIVE_UPLOAD_RETRY_TASKS] = UPLOAD_RETRY_STATES.size();
+        t[T_MAX_UPLOAD_RETRY_YIELDS] = MAX_UPLOAD_RETRY_YIELDS;
+        t[T_MAX_UPLOAD_RETRY_MILLIS] = nanosToMillis(MAX_UPLOAD_RETRY_NANOS);
+        t[T_UPLOAD_PROGRESS_EPOCH] = uploadProgressEpoch;
+        t[T_CURRENT_UBER_NODE_CLEANUP_SCANS] = currentUberNodeCleanupScans;
+        t[T_LAST_UBER_NODE_CLEANUP_SCANS] = lastUberNodeCleanupScans;
+        t[T_PEAK_UBER_NODE_CLEANUP_SCANS] = peakUberNodeCleanupScans;
+        t[T_MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME] = MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME;
+        t[T_UBER_NODE_CLEANUP_BUDGET_MILLIS] = nanosToMillis(UBER_NODE_CLEANUP_BUDGET_NANOS);
+        t[T_UBER_NODE_CLEANUP_PASSES] = uberNodeCleanupPasses;
+        t[T_UBER_NODE_CLEANUP_NODES_SCANNED] = uberNodeCleanupNodesScanned;
+        t[T_UBER_NODE_CLEANUP_NODES_RELEASED] = uberNodeCleanupNodesReleased;
+        t[T_UBER_NODE_CLEANUP_DEFERRALS] = uberNodeCleanupDeferrals;
+        t[T_ACTIVE_UBER_NODE_CLEANUP_CURSORS] = UBER_NODE_CLEANUP_CURSORS.size();
+        t[T_FRAME_TASKS] = frameTasks;
+        t[T_FRAME_WORK_MILLIS] = nanosToMillis(frameWorkNanos);
+        t[T_PUMP_WAITING_FOR_FRAME] = waitingForFrame ? 1 : 0;
+        t[T_FRAME_WATCHDOG_RESUMES] = frameWatchdogResumes;
+        t[T_PUMP_SLICES] = pumpSlices;
+        t[T_UPLOAD_BYTES_THIS_FRAME] = currentUploadBytes;
+        t[T_UPLOAD_BYTES_PER_FRAME] = budget.uploadBytesPerFrame();
+        t[T_UPLOAD_BYTE_BUDGET_EXHAUSTIONS] = uploadByteBudgetExhaustions;
+        t[T_LAST_INSTALL_BYTES] = lastInstallBytes;
+        t[T_INSTALL_BYTES_PER_FRAME] = budget.installBytesPerFrame();
+        t[T_MESH_REQUESTS_IN_FLIGHT] = BrowserMeshInstallQueue.inFlight();
+        t[T_MESH_RESULTS_READY] = BrowserMeshInstallQueue.readyCount();
+        t[T_FAILED_TASKS] = failedTasks;
+        publishTelemetryJs(JsArrays.float64(t));
     }
 
-    @JSBody(params = {
-            "frameTasks", "frameWorkMillis", "waitingForFrame", "frameWatchdogResumes",
-            "pumpSlices", "uploadBytesThisFrame", "uploadBytesPerFrame",
-            "uploadByteBudgetExhaustions", "lastInstallBytes", "installBytesPerFrame",
-            "meshRequestsInFlight", "meshResultsReady", "failedTasks"
-    }, script = """
-            const state=globalThis.__gaiusChunkPipelineTelemetry ||
-              (globalThis.__gaiusChunkPipelineTelemetry={});
-            state.frameTasks=Number(frameTasks)||0;
-            state.frameWorkMillis=Number(frameWorkMillis)||0;
-            state.pumpWaitingForFrame=!!waitingForFrame;
-            state.frameWatchdogResumes=Number(frameWatchdogResumes)||0;
-            state.pumpSlices=Number(pumpSlices)||0;
-            state.uploadBytesThisFrame=Number(uploadBytesThisFrame)||0;
-            state.uploadBytesPerFrame=Number(uploadBytesPerFrame)||0;
-            state.uploadByteBudgetExhaustions=Number(uploadByteBudgetExhaustions)||0;
-            state.lastInstallBytes=Number(lastInstallBytes)||0;
-            state.installBytesPerFrame=Number(installBytesPerFrame)||0;
-            state.meshRequestsInFlight=Number(meshRequestsInFlight)||0;
-            state.meshResultsReady=Number(meshResultsReady)||0;
-            state.failedTasks=Number(failedTasks)||0;
-            state.pumpDriver='completion';
-            """)
-    private static native void publishFrameBudgetJs(
-            int frameTasks,
-            double frameWorkMillis,
-            boolean waitingForFrame,
-            double frameWatchdogResumes,
-            double pumpSlices,
-            double uploadBytesThisFrame,
-            double uploadBytesPerFrame,
-            double uploadByteBudgetExhaustions,
-            double lastInstallBytes,
-            double installBytesPerFrame,
-            int meshRequestsInFlight,
-            int meshResultsReady,
-            double failedTasks);
+    private static void armTelemetryFlush(long now) {
+        if (telemetryFlushArmed) {
+            return;
+        }
+        telemetryFlushArmed = true;
+        long remainingNanos = TELEMETRY_INTERVAL_NANOS - (now - telemetryPublishedAtNanos);
+        int delayMillis = (int) Math.max(1L, remainingNanos / 1_000_000L + 1L);
+        HostLoop.schedule(() -> {
+            telemetryFlushArmed = false;
+            publishTelemetry();
+        }, delayMillis);
+    }
 
     private static void updateHighWaterState() {
         boolean atHighWater = pendingTasks() >= effectiveQueueHighWater();
@@ -1164,6 +1262,19 @@ public final class BrowserRenderScheduler {
         return nanos / 1_000_000.0;
     }
 
+    /**
+     * The per-call snapshot opt-in: a benchmark run ({@code __gaiusBenchmarkEnabled}, which also
+     * enables the frame and targeting telemetry), enabled frame telemetry, or
+     * {@code __gaiusChunkPipelineTelemetryEveryFrame} for a manual diagnosis.
+     */
+    @JSBody(script = """
+            const frame = globalThis.__gaiusFrameTelemetry;
+            return globalThis.__gaiusBenchmarkEnabled === true
+              || globalThis.__gaiusChunkPipelineTelemetryEveryFrame === true
+              || !!(frame && frame.enabled === true);
+            """)
+    private static native boolean telemetryEveryCallRequested();
+
     @JSBody(script = """
             const query = String(globalThis.location && globalThis.location.search || '');
             if (query.includes('gaiusRenderFast=1')) return true;
@@ -1172,36 +1283,19 @@ public final class BrowserRenderScheduler {
             """)
     private static native boolean detectFastProfile();
 
-    @JSBody(params = {
-            "pendingTasks", "queueCapacity", "taskRunning", "peakPendingTasks",
-            "compileBacklog", "peakCompileBacklog", "uploadBacklog", "peakUploadBacklog",
-            "enqueuedTasks", "completedTasks", "backpressureEvents", "overBudgetTasks",
-            "lastTaskMillis", "longestTaskMillis", "totalTaskMillis", "uploadPasses",
-            "lastUploadPassMillis", "longestUploadPassMillis", "totalUploadPassMillis",
-            "uploadAllocationsQueued", "uploadAllocationsDrained", "highWaterActive",
-            "currentHighWaterMillis", "totalHighWaterMillis", "longestHighWaterMillis",
-            "renderFrames", "lastTaskDrainCount", "peakTaskDrainCount",
-            "lastTaskBudgetExhausted", "taskBudgetExhaustions",
-            "currentUploadDrainCount", "lastUploadDrainCount", "peakUploadDrainCount",
-            "maxUploadAllocationsPerFrame", "uploadWorkBudgetMillis",
-            "uploadBudgetExhausted", "uploadBudgetExhaustions",
-            "uploadEntryBudgetExhaustions", "uploadTimeBudgetExhaustions",
-            "dispatcherRunnerRequests", "dispatcherRunnerEnqueued",
-            "dispatcherRunnerCoalesced", "dispatcherRunnerDisposals",
-            "dispatcherUploadDeferrals", "activeDispatchers", "uploadAllocationsDiscarded",
-            "compileRunsDuringUploadThisFrame", "compileRunsDuringUpload",
-            "uploadFairShareDeferrals", "activeUploadBuffers",
-            "emergencyUploadRequests", "emergencyUploadDrains", "emergencyUploadDeferrals",
-            "uploadRetryYields", "uploadRetryNoProgressResumes", "uploadRetryCancellations",
-            "uploadRetryExpiredStates",
-            "activeUploadRetryTasks", "maxUploadRetryYields", "maxUploadRetryMillis",
-            "uploadProgressEpoch", "currentUberNodeCleanupScans",
-            "lastUberNodeCleanupScans", "peakUberNodeCleanupScans",
-            "maxUberNodeCleanupScansPerFrame", "uberNodeCleanupBudgetMillis",
-            "uberNodeCleanupPasses", "uberNodeCleanupNodesScanned",
-            "uberNodeCleanupNodesReleased", "uberNodeCleanupDeferrals",
-            "activeUberNodeCleanupCursors"
-    }, script = """
+    @JSBody(script = """
+            const params=new URLSearchParams(globalThis.location ? location.search : '');
+            return /^(1|true|on)$/i.test(params.get('gaiusGlFrameBudget') || '');
+            """)
+    private static native boolean frameTailRequested();
+
+    /**
+     * Writes {@code globalThis.__gaiusChunkPipelineTelemetry} from one packed snapshot: index
+     * {@code T_X} holds field {@code x} (booleans as 0/1). One typed array instead of 84
+     * arguments keeps the call under TeaVM's WebAssembly GC limit of 32 JSBody parameters, so
+     * both targets publish the same object.
+     */
+    @JSBody(params = "v", script = """
             const state=globalThis.__gaiusChunkPipelineTelemetry ||
               (globalThis.__gaiusChunkPipelineTelemetry={});
             const recordDuration=function(kind,count,duration) {
@@ -1220,157 +1314,98 @@ public final class BrowserRenderScheduler {
               }
               state[countKey]=current;
             };
-            recordDuration('task',completedTasks,lastTaskMillis);
-            recordDuration('uploadPass',uploadPasses,lastUploadPassMillis);
-            state.pendingTasks=Number(pendingTasks)||0;
-            state.queueCapacity=Number(queueCapacity)||0;
-            state.taskRunning=!!taskRunning;
-            state.peakPendingTasks=Number(peakPendingTasks)||0;
-            state.compileBacklog=Number(compileBacklog)||0;
-            state.peakCompileBacklog=Number(peakCompileBacklog)||0;
-            state.uploadBacklog=Number(uploadBacklog)||0;
-            state.peakUploadBacklog=Number(peakUploadBacklog)||0;
-            state.enqueuedTasks=Number(enqueuedTasks)||0;
-            state.completedTasks=Number(completedTasks)||0;
-            state.backpressureEvents=Number(backpressureEvents)||0;
-            state.overBudgetTasks=Number(overBudgetTasks)||0;
-            state.lastTaskMillis=Number(lastTaskMillis)||0;
-            state.longestTaskMillis=Number(longestTaskMillis)||0;
-            state.totalTaskMillis=Number(totalTaskMillis)||0;
-            state.uploadPasses=Number(uploadPasses)||0;
-            state.lastUploadPassMillis=Number(lastUploadPassMillis)||0;
-            state.longestUploadPassMillis=Number(longestUploadPassMillis)||0;
-            state.totalUploadPassMillis=Number(totalUploadPassMillis)||0;
-            state.uploadAllocationsQueued=Number(uploadAllocationsQueued)||0;
-            state.uploadAllocationsDrained=Number(uploadAllocationsDrained)||0;
-            state.highWaterActive=!!highWaterActive;
-            state.currentHighWaterMillis=Number(currentHighWaterMillis)||0;
-            state.totalHighWaterMillis=Number(totalHighWaterMillis)||0;
-            state.longestHighWaterMillis=Number(longestHighWaterMillis)||0;
-            state.renderFrames=Number(renderFrames)||0;
-            state.lastTaskDrainCount=Number(lastTaskDrainCount)||0;
-            state.peakTaskDrainCount=Number(peakTaskDrainCount)||0;
-            state.lastTaskBudgetExhausted=!!lastTaskBudgetExhausted;
-            state.taskBudgetExhaustions=Number(taskBudgetExhaustions)||0;
-            state.currentUploadDrainCount=Number(currentUploadDrainCount)||0;
-            state.lastUploadDrainCount=Number(lastUploadDrainCount)||0;
-            state.peakUploadDrainCount=Number(peakUploadDrainCount)||0;
-            state.maxUploadAllocationsPerFrame=Number(maxUploadAllocationsPerFrame)||0;
-            state.uploadWorkBudgetMillis=Number(uploadWorkBudgetMillis)||0;
-            state.uploadBudgetExhausted=!!uploadBudgetExhausted;
-            state.uploadBudgetExhaustions=Number(uploadBudgetExhaustions)||0;
-            state.uploadEntryBudgetExhaustions=Number(uploadEntryBudgetExhaustions)||0;
-            state.uploadTimeBudgetExhaustions=Number(uploadTimeBudgetExhaustions)||0;
-            state.dispatcherRunnerRequests=Number(dispatcherRunnerRequests)||0;
-            state.dispatcherRunnerEnqueued=Number(dispatcherRunnerEnqueued)||0;
-            state.dispatcherRunnerCoalesced=Number(dispatcherRunnerCoalesced)||0;
-            state.dispatcherRunnerDisposals=Number(dispatcherRunnerDisposals)||0;
-            state.dispatcherUploadDeferrals=Number(dispatcherUploadDeferrals)||0;
-            state.activeDispatchers=Number(activeDispatchers)||0;
-            state.uploadAllocationsDiscarded=Number(uploadAllocationsDiscarded)||0;
-            state.compileRunsDuringUploadThisFrame=
-              Number(compileRunsDuringUploadThisFrame)||0;
-            state.compileRunsDuringUpload=Number(compileRunsDuringUpload)||0;
-            state.uploadFairShareDeferrals=Number(uploadFairShareDeferrals)||0;
-            state.activeUploadBuffers=Number(activeUploadBuffers)||0;
-            state.emergencyUploadRequests=Number(emergencyUploadRequests)||0;
-            state.emergencyUploadDrains=Number(emergencyUploadDrains)||0;
-            state.emergencyUploadDeferrals=Number(emergencyUploadDeferrals)||0;
-            state.uploadRetryYields=Number(uploadRetryYields)||0;
-            state.uploadRetryNoProgressResumes=Number(uploadRetryNoProgressResumes)||0;
-            state.uploadRetryCancellations=Number(uploadRetryCancellations)||0;
-            state.uploadRetryExpiredStates=Number(uploadRetryExpiredStates)||0;
-            state.activeUploadRetryTasks=Number(activeUploadRetryTasks)||0;
-            state.maxUploadRetryYields=Number(maxUploadRetryYields)||0;
-            state.maxUploadRetryMillis=Number(maxUploadRetryMillis)||0;
-            state.uploadProgressEpoch=Number(uploadProgressEpoch)||0;
-            state.currentUberNodeCleanupScans=Number(currentUberNodeCleanupScans)||0;
-            state.lastUberNodeCleanupScans=Number(lastUberNodeCleanupScans)||0;
-            state.peakUberNodeCleanupScans=Number(peakUberNodeCleanupScans)||0;
-            state.maxUberNodeCleanupScansPerFrame=
-              Number(maxUberNodeCleanupScansPerFrame)||0;
-            state.uberNodeCleanupBudgetMillis=Number(uberNodeCleanupBudgetMillis)||0;
-            state.uberNodeCleanupPasses=Number(uberNodeCleanupPasses)||0;
-            state.uberNodeCleanupNodesScanned=Number(uberNodeCleanupNodesScanned)||0;
-            state.uberNodeCleanupNodesReleased=Number(uberNodeCleanupNodesReleased)||0;
-            state.uberNodeCleanupDeferrals=Number(uberNodeCleanupDeferrals)||0;
-            state.activeUberNodeCleanupCursors=Number(activeUberNodeCleanupCursors)||0;
+            recordDuration('task',v[9],v[12]);
+            recordDuration('uploadPass',v[15],v[16]);
+            state.pendingTasks=v[0]||0;
+            state.queueCapacity=v[1]||0;
+            state.taskRunning=!!v[2];
+            state.peakPendingTasks=v[3]||0;
+            state.compileBacklog=v[4]||0;
+            state.peakCompileBacklog=v[5]||0;
+            state.uploadBacklog=v[6]||0;
+            state.peakUploadBacklog=v[7]||0;
+            state.enqueuedTasks=v[8]||0;
+            state.completedTasks=v[9]||0;
+            state.backpressureEvents=v[10]||0;
+            state.overBudgetTasks=v[11]||0;
+            state.lastTaskMillis=v[12]||0;
+            state.longestTaskMillis=v[13]||0;
+            state.totalTaskMillis=v[14]||0;
+            state.uploadPasses=v[15]||0;
+            state.lastUploadPassMillis=v[16]||0;
+            state.longestUploadPassMillis=v[17]||0;
+            state.totalUploadPassMillis=v[18]||0;
+            state.uploadAllocationsQueued=v[19]||0;
+            state.uploadAllocationsDrained=v[20]||0;
+            state.highWaterActive=!!v[21];
+            state.currentHighWaterMillis=v[22]||0;
+            state.totalHighWaterMillis=v[23]||0;
+            state.longestHighWaterMillis=v[24]||0;
+            state.renderFrames=v[25]||0;
+            state.lastTaskDrainCount=v[26]||0;
+            state.peakTaskDrainCount=v[27]||0;
+            state.lastTaskBudgetExhausted=!!v[28];
+            state.taskBudgetExhaustions=v[29]||0;
+            state.currentUploadDrainCount=v[30]||0;
+            state.lastUploadDrainCount=v[31]||0;
+            state.peakUploadDrainCount=v[32]||0;
+            state.maxUploadAllocationsPerFrame=v[33]||0;
+            state.uploadWorkBudgetMillis=v[34]||0;
+            state.uploadBudgetExhausted=!!v[35];
+            state.uploadBudgetExhaustions=v[36]||0;
+            state.uploadEntryBudgetExhaustions=v[37]||0;
+            state.uploadTimeBudgetExhaustions=v[38]||0;
+            state.dispatcherRunnerRequests=v[39]||0;
+            state.dispatcherRunnerEnqueued=v[40]||0;
+            state.dispatcherRunnerCoalesced=v[41]||0;
+            state.dispatcherRunnerDisposals=v[42]||0;
+            state.dispatcherUploadDeferrals=v[43]||0;
+            state.activeDispatchers=v[44]||0;
+            state.uploadAllocationsDiscarded=v[45]||0;
+            state.compileRunsDuringUploadThisFrame=v[46]||0;
+            state.compileRunsDuringUpload=v[47]||0;
+            state.uploadFairShareDeferrals=v[48]||0;
+            state.activeUploadBuffers=v[49]||0;
+            state.emergencyUploadRequests=v[50]||0;
+            state.emergencyUploadDrains=v[51]||0;
+            state.emergencyUploadDeferrals=v[52]||0;
+            state.uploadRetryYields=v[53]||0;
+            state.uploadRetryNoProgressResumes=v[54]||0;
+            state.uploadRetryCancellations=v[55]||0;
+            state.uploadRetryExpiredStates=v[56]||0;
+            state.activeUploadRetryTasks=v[57]||0;
+            state.maxUploadRetryYields=v[58]||0;
+            state.maxUploadRetryMillis=v[59]||0;
+            state.uploadProgressEpoch=v[60]||0;
+            state.currentUberNodeCleanupScans=v[61]||0;
+            state.lastUberNodeCleanupScans=v[62]||0;
+            state.peakUberNodeCleanupScans=v[63]||0;
+            state.maxUberNodeCleanupScansPerFrame=v[64]||0;
+            state.uberNodeCleanupBudgetMillis=v[65]||0;
+            state.uberNodeCleanupPasses=v[66]||0;
+            state.uberNodeCleanupNodesScanned=v[67]||0;
+            state.uberNodeCleanupNodesReleased=v[68]||0;
+            state.uberNodeCleanupDeferrals=v[69]||0;
+            state.activeUberNodeCleanupCursors=v[70]||0;
             state.droppedTasks=0;
             state.updatedAt=(typeof performance!=='undefined' && performance.now)
               ? performance.now() : Date.now();
+            state.frameTasks=v[71]||0;
+            state.frameWorkMillis=v[72]||0;
+            state.pumpWaitingForFrame=!!v[73];
+            state.frameWatchdogResumes=v[74]||0;
+            state.pumpSlices=v[75]||0;
+            state.uploadBytesThisFrame=v[76]||0;
+            state.uploadBytesPerFrame=v[77]||0;
+            state.uploadByteBudgetExhaustions=v[78]||0;
+            state.lastInstallBytes=v[79]||0;
+            state.installBytesPerFrame=v[80]||0;
+            state.meshRequestsInFlight=v[81]||0;
+            state.meshResultsReady=v[82]||0;
+            state.failedTasks=v[83]||0;
+            state.pumpDriver='completion';
             """)
-    private static native void publishTelemetryJs(
-            int pendingTasks,
-            int queueCapacity,
-            boolean taskRunning,
-            int peakPendingTasks,
-            int compileBacklog,
-            int peakCompileBacklog,
-            int uploadBacklog,
-            int peakUploadBacklog,
-            long enqueuedTasks,
-            long completedTasks,
-            long backpressureEvents,
-            long overBudgetTasks,
-            double lastTaskMillis,
-            double longestTaskMillis,
-            double totalTaskMillis,
-            long uploadPasses,
-            double lastUploadPassMillis,
-            double longestUploadPassMillis,
-            double totalUploadPassMillis,
-            long uploadAllocationsQueued,
-            long uploadAllocationsDrained,
-            boolean highWaterActive,
-            double currentHighWaterMillis,
-            double totalHighWaterMillis,
-            double longestHighWaterMillis,
-            long renderFrames,
-            int lastTaskDrainCount,
-            int peakTaskDrainCount,
-            boolean lastTaskBudgetExhausted,
-            long taskBudgetExhaustions,
-            int currentUploadDrainCount,
-            int lastUploadDrainCount,
-            int peakUploadDrainCount,
-            int maxUploadAllocationsPerFrame,
-            double uploadWorkBudgetMillis,
-            boolean uploadBudgetExhausted,
-            long uploadBudgetExhaustions,
-            long uploadEntryBudgetExhaustions,
-            long uploadTimeBudgetExhaustions,
-            long dispatcherRunnerRequests,
-            long dispatcherRunnerEnqueued,
-            long dispatcherRunnerCoalesced,
-            long dispatcherRunnerDisposals,
-            long dispatcherUploadDeferrals,
-            int activeDispatchers,
-            long uploadAllocationsDiscarded,
-            int compileRunsDuringUploadThisFrame,
-            long compileRunsDuringUpload,
-            long uploadFairShareDeferrals,
-            int activeUploadBuffers,
-            long emergencyUploadRequests,
-            long emergencyUploadDrains,
-            long emergencyUploadDeferrals,
-            long uploadRetryYields,
-            long uploadRetryNoProgressResumes,
-            long uploadRetryCancellations,
-            long uploadRetryExpiredStates,
-            int activeUploadRetryTasks,
-            int maxUploadRetryYields,
-            double maxUploadRetryMillis,
-            long uploadProgressEpoch,
-            int currentUberNodeCleanupScans,
-            int lastUberNodeCleanupScans,
-            int peakUberNodeCleanupScans,
-            int maxUberNodeCleanupScansPerFrame,
-            double uberNodeCleanupBudgetMillis,
-            long uberNodeCleanupPasses,
-            long uberNodeCleanupNodesScanned,
-            long uberNodeCleanupNodesReleased,
-            long uberNodeCleanupDeferrals,
-            int activeUberNodeCleanupCursors);
+    private static native void publishTelemetryJs(Float64Array values);
 
     private static final class UploadRetryState {
         final long startedAtNanos;

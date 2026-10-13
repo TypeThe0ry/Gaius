@@ -447,6 +447,7 @@
   // and so does globalThis.GAIUS_LIGHT_KERNEL === false. A Worker has neither the page URL nor
   // localStorage, so the page passes its decision to installHost there.
   function lightKernelEnabled(scope) {
+    if (!scope.GaiusKernelMirror || !scope.GaiusKernelMirror.enabled("light")) return false;
     if (scope.GAIUS_LIGHT_KERNEL === false) return false;
     try {
       const search = scope.location && scope.location.search;
@@ -480,10 +481,11 @@
       submitted: 0,
       failed: 0,
       get enabled() {
-        if (!switchedOn) return false;
+        if (!switchedOn || !global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled("light")) return false;
         return typeof runner.available === "function" ? runner.available("light") !== false : true;
       },
       submit(buffer, priority, done, fail) {
+        if (!host.enabled) { fail("needs-vanilla:NEEDS_VANILLA: light mirror is disabled"); return; }
         host.submitted++;
         // Chunk coordinates from the payload header, for the scheduler's distance ordering.
         const view = new DataView(buffer);

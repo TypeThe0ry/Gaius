@@ -1,3 +1,4 @@
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {existsSync} from 'node:fs';
@@ -34,7 +35,7 @@ const option = (name, fallback) => {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const profile = option('--profile', '26.3');
+const profile = option('--profile', RENDERPEARL_PROFILE.id);
 const overlayDirectory = resolve(option('--overlay-dir',
   process.env.GAIUS_OVERLAY_DIRECTORY || join(root, 'port', 'work', 'overlays', profile)));
 const optimization = option('--optimization', 'SIMPLE');
@@ -69,7 +70,7 @@ const lwjglJar = libraryPath('org.lwjgl:lwjgl', 'unsafe');
 const listing = execFileSync(tool('jar'), ['--list', '--file', lwjglJar], {encoding: 'utf8', maxBuffer: 64 << 20});
 assert.ok(listing.includes('org/lwjgl/system/BrowserMemoryBackend.class'),
   `${lwjglJar} has no BrowserMemoryBackend: this smoke covers the LWJGL 3.4.2+ MemoryBackend shape`
-  + ' (26.3); LWJGL 3.4.1 (26.2) is covered by browser-memory-lifecycle-smoke.sh');
+  + ' (' + RENDERPEARL_PROFILE.id + '); LWJGL 3.4.1 (' + CANONICAL_PROFILE.id + ') is covered by browser-memory-lifecycle-smoke.sh');
 const sdlJar = libraryPath('org.lwjgl:lwjgl-sdl');
 const jomlJar = libraryPath('org.joml:joml');
 
@@ -178,8 +179,8 @@ public final class LwjglMemoryBackendSmoke {
             check(UTF8_TEXT.equals(memUTF8(memAddress(sequence))), "MemoryStack.UTF8(CharSequence) round trip");
             check(sequence.remaining() == utf8.remaining(), "CharSequence and String UTF-8 lengths differ");
 
-            ByteBuffer ascii = stack.ASCII("gaius-26.3", true);
-            check("gaius-26.3".equals(memASCII(memAddress(ascii))), "memASCII(stack ASCII)");
+            ByteBuffer ascii = stack.ASCII("gaius-${RENDERPEARL_PROFILE.id}", true);
+            check("gaius-${RENDERPEARL_PROFILE.id}".equals(memASCII(memAddress(ascii))), "memASCII(stack ASCII)");
             ByteBuffer utf16 = stack.UTF16(UTF16_TEXT, true);
             check(utf16.remaining() == (UTF16_TEXT.length() + 1) * 2, "UTF16 length " + utf16.remaining());
             check(UTF16_TEXT.equals(memUTF16(memAddress(utf16))), "memUTF16(stack UTF16)");

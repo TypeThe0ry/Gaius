@@ -3,17 +3,28 @@ package dev.gaius.tools;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.security.CodeSource;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipFile;
 import org.objectweb.asm.ClassReader;
@@ -23,18 +34,42 @@ import org.objectweb.asm.tree.MethodNode;
 
 /**
  * Records the outcome of every browser patch call so that no patch can be skipped silently
- * (gate G4 of the 26.3 migration plan).
+ * (gate G4 of the 26.3 migration plan), and gives each patch a kind, build targets and profiles
+ * (patchkit step 1, maint/D14 3.2(e)).
  *
- * <p>Each patch call ends in exactly one of three states:
+ * <h2>Registration</h2>
+ * A patcher {@code main} calls {@link #configureProfile} and {@link #configureOutput} and then
+ * registers every patch as {@code PatchRegistry.run("<Class>.<method>", "<spec>", () -> ...)}.
+ * The spec is the patch's metadata, whitespace-separated: a {@link Kind} first, then optionally
+ * the TeaVM targets it applies to ({@code js}, {@code wasmgc}; both when none is named) and the
+ * profiles it applies to: {@code *} (the default), a profile id ({@code 26.3}), a bound
+ * ({@code >=26.2}, {@code <=26.2}) or a comma-separated union of these. Bounds compare the
+ * leading dotted numbers of a profile id, so {@code >=26.3} also covers {@code 26.4-snapshot-2}.
+ * Examples: {@code "REQUIRED"}, {@code "PERF js"}, {@code "REQUIRED wasmgc"},
+ * {@code "FEATURE >=26.2"}, {@code "REQUIRED 1.21.11"}.
+ *
+ * <h2>Outcomes</h2>
+ * Each registered patch ends in exactly one {@link Outcome}:
  * <ul>
- *   <li><b>applied</b> &mdash; {@link #run} ran the body, or a patcher called {@link #applied};</li>
- *   <li><b>dropped</b> &mdash; {@link #dropped} proved that the patch's original target is absent
- *       from the jar being patched. A {@link #run} body that registers drops (under the run's
- *       own id or under sub-ids of its parts) counts as dropped, not also as applied;</li>
- *   <li><b>bring-up skipped</b> &mdash; only in bring-up mode, for ids listed in the profile's
- *       bring-up list;</li>
+ *   <li><b>APPLIED</b> &mdash; the body ran, or a patcher called {@link #applied};</li>
+ *   <li><b>NOT_APPLICABLE</b> &mdash; the build target is not one of the patch's targets
+ *       ({@code PATCH_TARGET_SKIPPED <id> target=<t>}), the profile is not one of its profiles
+ *       ({@code PATCH_NOT_APPLICABLE <id> profile=<p>}), or {@link #dropped} proved that its
+ *       original target is absent from the jar ({@code PATCH_DROPPED <id>}). A body that
+ *       registers drops (under the run's own id or under sub-ids of its parts) counts as dropped,
+ *       not also as applied;</li>
+ *   <li><b>DISABLED</b> &mdash; the body of a patch that is not {@link Kind#REQUIRED} failed: the
+ *       files it wrote under the output root are restored, {@code PATCH_DISABLED <id> kind=<k>
+ *       error=<message>} is printed and the build goes on with the vanilla code;</li>
+ *   <li><b>FAILED</b> &mdash; the body of a REQUIRED patch failed: {@code PATCH_FAILED} is
+ *       printed and the failure propagates, which fails the build (in check mode the patch is
+ *       restored and recorded instead, so every outcome of a chain can be listed);</li>
+ *   <li><b>BRINGUP_SKIPPED</b> &mdash; only in bring-up mode, for ids listed in the profile's
+ *       bring-up list ({@code BRINGUP_SKIP <id>}).</li>
  * </ul>
- * or it throws, which fails the build.
+ * {@code PATCH_SUMMARY applied=N dropped=N bringupSkipped=N} ends each patcher; the counters
+ * {@code targetSkipped}, {@code notApplicable}, {@code disabled} and {@code failed} follow only
+ * when they are not zero, so the summary of a build without them keeps its old form.
  *
  * <h2>Inputs (set by the caller)</h2>
  * <ul>
@@ -49,12 +84,29 @@ import org.objectweb.asm.tree.MethodNode;
  *     </ol>
  *     A {@code configureProfile} value that disagrees with {@code gaius.profile} or
  *     {@code GAIUS_PROFILE} throws. {@code GAIUS_MINECRAFT_VERSION} is only a fallback.</li>
+ *   <li><b>Build target</b>: {@link BuildTarget} ({@code gaius.teavm.target} or
+ *       {@code GAIUS_TEAVM_TARGET}, js by default).</li>
+ *   <li><b>Output root</b>: {@link #configureOutput(Path)}, the directory the patcher writes its
+ *       classes to. Only with it can a failed patch be restored (and so disabled), and only with
+ *       it does the run log name the files each patch wrote.</li>
  *   <li><b>Bring-up flag</b>: system property {@code gaius.bringup} or environment variable
  *       {@code GAIUS_BRINGUP}; {@code 1}/{@code true}/{@code yes} enable it.</li>
  *   <li><b>Bring-up list</b>: system property {@code gaius.bringup.list} or environment variable
  *       {@code GAIUS_BRINGUP_LIST}. Without either, {@code port/tools/bringup/<profile>.txt} is
  *       looked up in the working directory and its parents, then in the directories above the
  *       location this class was loaded from.</li>
+ *   <li><b>Check mode</b>: {@code gaius.patch.check} / {@code GAIUS_PATCH_CHECK}. A failing
+ *       REQUIRED patch is restored and recorded as FAILED, and the patcher goes on, so that
+ *       {@code port/tools/patchkit/patchkit.mjs check} lists every outcome of a chain.</li>
+ *   <li><b>Strict mode</b>: {@code gaius.patch.strict} / {@code GAIUS_PATCH_STRICT}. Every
+ *       failure fails the build, whatever the kind (nothing is disabled).</li>
+ *   <li><b>Run log</b>: {@code gaius.patch.runlog} / {@code GAIUS_PATCH_RUN_LOG}, a file to which
+ *       one JSON object per outcome is appended (id, kind, targets, profiles, outcome, reason,
+ *       the files the patch wrote, the targets a drop proved absent, the error). The patch
+ *       manifests of {@code port/mc/profiles/<profile>/} are generated from it.</li>
+ *   <li><b>Injected failures</b>: {@code gaius.patch.fail} / {@code GAIUS_PATCH_FAIL}, a
+ *       comma-separated list of patch ids whose body is replaced by a failure. Only for tests of
+ *       the DISABLED path and of the dependencies between patches.</li>
  * </ul>
  *
  * <p>Bring-up mode is active only when the flag is set <em>and</em> the profile is neither
@@ -75,10 +127,13 @@ import org.objectweb.asm.tree.MethodNode;
  * empty reason throw.
  *
  * <h2>Log lines</h2>
- * {@code BRINGUP_SKIP <id>}, {@code PATCH_DROPPED <id>} and
- * {@code PATCH_SUMMARY applied=N dropped=N bringupSkipped=N} go to stdout. Warnings
- * ({@code BRINGUP_UNUSED <id>}, {@code BRINGUP_IGNORED ...}) and the pending list printed when a
- * patch fails outside bring-up mode ({@code BRINGUP_PENDING <line>}) go to stderr.
+ * {@code BRINGUP_SKIP <id>}, {@code PATCH_DROPPED <id>}, {@code PATCH_TARGET_SKIPPED},
+ * {@code PATCH_NOT_APPLICABLE}, {@code PATCH_DISABLED}, {@code PATCH_FAILED} and
+ * {@code PATCH_SUMMARY} go to stdout ({@code PATCH_APPLIED <id>} too with
+ * {@code gaius.patch.verbose} / {@code GAIUS_PATCH_VERBOSE}). Warnings
+ * ({@code BRINGUP_UNUSED <id>}, {@code BRINGUP_IGNORED ...}, {@code PATCH_UNDECLARED <id>}) and
+ * the pending list printed when a patch fails outside bring-up mode
+ * ({@code BRINGUP_PENDING <line>}) go to stderr.
  */
 public final class PatchRegistry {
     /** A patch body; the same shape as the {@code patchX(jar, output)} methods. */
@@ -91,6 +146,167 @@ public final class PatchRegistry {
     public record BringupEntry(String patchId, String owner, String reason, int line) {
     }
 
+    /** What a failure of the patch means for the build (maint/D14 3.2(e)). */
+    public enum Kind {
+        /** The browser client is broken without it: a failure fails the build. */
+        REQUIRED,
+        /** A browser feature or default; the vanilla code stays correct without it. */
+        FEATURE,
+        /** Speed or memory only; the vanilla code stays correct, only slower. */
+        PERF,
+        /** Diagnostics only. */
+        TELEMETRY
+    }
+
+    /** How one registered patch ended (maint/D14 3.2(e)). */
+    public enum Outcome {
+        APPLIED,
+        NOT_APPLICABLE,
+        DISABLED,
+        FAILED,
+        BRINGUP_SKIPPED
+    }
+
+    /**
+     * The metadata of one patch: its kind, the TeaVM targets it applies to and the profiles it
+     * applies to (see the class comment for the text form).
+     */
+    public record Spec(Kind kind, List<String> targets, String profiles, boolean notApplicable,
+            boolean wholeClass) {
+        public Spec(Kind kind, List<String> targets, String profiles) {
+            this(kind, targets, profiles, false, false);
+        }
+        /** Every TeaVM target, in the canonical order. */
+        public static final List<String> ALL_TARGETS = List.of(BuildTarget.JS, BuildTarget.WASM_GC);
+
+        public Spec {
+            if (kind == null) {
+                throw new IllegalArgumentException("a patch spec needs a kind");
+            }
+            targets = List.copyOf(targets);
+            if (targets.isEmpty() || !ALL_TARGETS.containsAll(targets)) {
+                throw new IllegalArgumentException("invalid patch targets " + targets);
+            }
+            if (profiles == null || profiles.isBlank()) {
+                throw new IllegalArgumentException("a patch spec needs profiles");
+            }
+        }
+
+        /** Parses {@code <KIND> [js|wasmgc]... [<profiles>]...}. */
+        public static Spec parse(String text) {
+            if (text == null || text.isBlank()) {
+                throw new IllegalArgumentException("empty patch spec");
+            }
+            String[] tokens = text.strip().split("\\s+");
+            Kind kind;
+            try {
+                kind = Kind.valueOf(tokens[0]);
+            } catch (IllegalArgumentException exception) {
+                throw new IllegalArgumentException("patch spec '" + text
+                        + "' must start with REQUIRED, FEATURE, PERF or TELEMETRY");
+            }
+            Set<String> targets = new LinkedHashSet<>();
+            List<String> terms = new ArrayList<>();
+            boolean notApplicable = false;
+            boolean wholeClass = false;
+            for (int index = 1; index < tokens.length; index++) {
+                String token = tokens[index];
+                if (token.equals("OVERRIDE")) {
+                    if (wholeClass) {
+                        throw new IllegalArgumentException("duplicate OVERRIDE in " + text);
+                    }
+                    wholeClass = true;
+                    continue;
+                }
+                if (token.equals("NOT_APPLICABLE")) {
+                    if (notApplicable) {
+                        throw new IllegalArgumentException("duplicate NOT_APPLICABLE in " + text);
+                    }
+                    notApplicable = true;
+                    continue;
+                }
+                if (ALL_TARGETS.contains(token)) {
+                    if (!targets.add(token)) {
+                        throw new IllegalArgumentException("patch spec '" + text
+                                + "' names target " + token + " twice");
+                    }
+                    continue;
+                }
+                for (String term : token.split(",", -1)) {
+                    if (!PROFILE_TERM.matcher(term).matches()) {
+                        throw new IllegalArgumentException("patch spec '" + text
+                                + "': '" + term + "' is neither a target (js, wasmgc) nor a profile"
+                                + " term (*, <id>, >=<id>, <=<id>)");
+                    }
+                    if (terms.contains(term)) {
+                        throw new IllegalArgumentException("patch spec '" + text
+                                + "' names profile term " + term + " twice");
+                    }
+                    terms.add(term);
+                }
+            }
+            if (terms.contains("*") && terms.size() > 1) {
+                throw new IllegalArgumentException("patch spec '" + text
+                        + "': '*' already covers every profile");
+            }
+            List<String> ordered = new ArrayList<>();
+            for (String target : ALL_TARGETS) {
+                if (targets.isEmpty() || targets.contains(target)) {
+                    ordered.add(target);
+                }
+            }
+            return new Spec(kind, ordered, terms.isEmpty() ? "*" : String.join(",", terms),
+                    notApplicable, wholeClass);
+        }
+
+        public boolean hasTarget(String target) {
+            return targets.contains(target);
+        }
+
+        /** Whether the patch applies to {@code profileId} (an unknown profile is covered). */
+        public boolean coversProfile(String profileId) {
+            if (profiles.equals("*") || profileId == null) {
+                return true;
+            }
+            int[] version = leadingVersion(profileId);
+            if (version == null) {
+                return false;
+            }
+            for (String term : profiles.split(",")) {
+                if (term.startsWith(">=")) {
+                    if (compareVersions(version, leadingVersion(term.substring(2))) >= 0) {
+                        return true;
+                    }
+                } else if (term.startsWith("<=")) {
+                    if (compareVersions(version, leadingVersion(term.substring(2))) <= 0) {
+                        return true;
+                    }
+                } else if (compareVersions(version, leadingVersion(term)) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** The canonical text form: the kind, then targets and profiles when they restrict. */
+        public String text() {
+            StringBuilder text = new StringBuilder(kind.name());
+            if (wholeClass) {
+                text.append(" OVERRIDE");
+            }
+            if (notApplicable) {
+                text.append(" NOT_APPLICABLE");
+            }
+            if (!targets.equals(ALL_TARGETS)) {
+                text.append(' ').append(String.join(" ", targets));
+            }
+            if (!profiles.equals("*")) {
+                text.append(' ').append(profiles);
+            }
+            return text.toString();
+        }
+    }
+
     public static final String PROFILE_PROPERTY = "gaius.profile";
     public static final String PROFILE_ENV = "GAIUS_PROFILE";
     public static final String BUILD_PROFILE_ENV = "GAIUS_MINECRAFT_VERSION";
@@ -100,6 +316,14 @@ public final class PatchRegistry {
     public static final String BRINGUP_LIST_ENV = "GAIUS_BRINGUP_LIST";
     public static final String VERBOSE_PROPERTY = "gaius.patch.verbose";
     public static final String VERBOSE_ENV = "GAIUS_PATCH_VERBOSE";
+    public static final String CHECK_PROPERTY = "gaius.patch.check";
+    public static final String CHECK_ENV = "GAIUS_PATCH_CHECK";
+    public static final String STRICT_PROPERTY = "gaius.patch.strict";
+    public static final String STRICT_ENV = "GAIUS_PATCH_STRICT";
+    public static final String RUN_LOG_PROPERTY = "gaius.patch.runlog";
+    public static final String RUN_LOG_ENV = "GAIUS_PATCH_RUN_LOG";
+    public static final String FAIL_PROPERTY = "gaius.patch.fail";
+    public static final String FAIL_ENV = "GAIUS_PATCH_FAIL";
 
     /**
      * A patch id: {@code ^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$}, the rule of every reader of a
@@ -108,6 +332,10 @@ public final class PatchRegistry {
      */
     private static final Pattern PATCH_ID = Pattern.compile("[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*");
     private static final Pattern OWNER = Pattern.compile("P[1-9][a-z]?");
+    private static final Pattern PROFILE_TERM = Pattern.compile("\\*|(?:>=|<=)?[0-9]+(?:\\.[0-9]+)*");
+    private static final Pattern LEADING_VERSION = Pattern.compile("^([0-9]+(?:\\.[0-9]+)*)");
+    /** The metadata of a patch registered without a spec: the old behaviour, REQUIRED everywhere. */
+    private static final Spec UNDECLARED = new Spec(Kind.REQUIRED, Spec.ALL_TARGETS, "*");
 
     private static String configuredProfile;
     private static boolean resolved;
@@ -117,14 +345,21 @@ public final class PatchRegistry {
     private static Map<String, BringupEntry> bringupEntries = Map.of();
     private static final Set<String> queried = new LinkedHashSet<>();
     private static final Set<String> scopes = new LinkedHashSet<>();
+    private static final Map<String, Spec> specs = new HashMap<>();
+    private static final Set<String> undeclaredWarned = new LinkedHashSet<>();
     private static int applied;
     private static int dropped;
     private static int bringupSkipped;
     private static int targetSkipped;
+    private static int notApplicable;
+    private static int disabled;
+    private static int failed;
     private static boolean pendingPrinted;
-    /** Drops registered by the {@link #run} bodies executing on this thread, innermost last. */
-    private static final ThreadLocal<java.util.ArrayDeque<int[]>> RUN_DROPS =
-            ThreadLocal.withInitial(java.util.ArrayDeque::new);
+    private static OutputTracker output;
+    private static PatchTargets targetFingerprints;
+    /** The {@link #run} bodies executing on this thread, innermost last. */
+    private static final ThreadLocal<ArrayDeque<Frame>> FRAMES =
+            ThreadLocal.withInitial(ArrayDeque::new);
 
     private PatchRegistry() {
     }
@@ -155,6 +390,44 @@ public final class PatchRegistry {
             }
         }
         configuredProfile = profileId;
+    }
+
+    /**
+     * Names the directory the patcher writes its classes to. Each registered patch body is then
+     * tracked: a failed body's files are restored to their state before it ran, and the run log
+     * names the files each patch wrote. Files written outside this directory are not tracked.
+     */
+    public static synchronized void configureOutput(Path root) throws IOException {
+        if (root == null) {
+            throw new IllegalArgumentException("output root must not be null");
+        }
+        Path absolute = root.toAbsolutePath().normalize();
+        if (output != null) {
+            if (!output.root.equals(absolute)) {
+                throw new IllegalStateException("PatchRegistry output already configured as "
+                        + output.root + ", refusing " + absolute);
+            }
+            return;
+        }
+        if (!FRAMES.get().isEmpty()) {
+            throw new IllegalStateException("configureOutput inside a patch body");
+        }
+        output = new OutputTracker(absolute);
+        String vanillaJar = System.getProperty("gaius.patch.vanilla");
+        String inputJar = System.getProperty("gaius.patch.input");
+        if (vanillaJar != null && inputJar != null) {
+            targetFingerprints = new PatchTargets(hostPath(vanillaJar), hostPath(inputJar));
+        }
+    }
+
+    /**
+     * The profile id the run names (configureProfile, {@value #PROFILE_PROPERTY},
+     * {@value #PROFILE_ENV}, {@value #BUILD_PROFILE_ENV}) without resolving the registry, or
+     * {@code null}; for a patcher main that has no version argument.
+     */
+    public static synchronized String requestedProfile() {
+        return firstNonBlank(configuredProfile, System.getProperty(PROFILE_PROPERTY),
+                System.getenv(PROFILE_ENV), System.getenv(BUILD_PROFILE_ENV));
     }
 
     /** The resolved profile id, or {@code null} when no source provides one. */
@@ -232,9 +505,20 @@ public final class PatchRegistry {
                     + ": " + String.join(", ", present));
         }
         dropped++;
-        int[] enclosingRun = RUN_DROPS.get().peekLast();
-        if (enclosingRun != null) {
-            enclosingRun[0]++;
+        List<String> absent = List.of(entriesThatMustBeAbsent);
+        Frame enclosing = FRAMES.get().peekLast();
+        if (enclosing == null) {
+            record(patchId, null, false, Outcome.NOT_APPLICABLE, "dropped", null, null, absent,
+                    null, null);
+        } else {
+            enclosing.drops++;
+            if (patchId.equals(enclosing.id)) {
+                enclosing.absent.addAll(absent);
+            } else {
+                enclosing.parts.add(patchId);
+                record(patchId, enclosing.spec, enclosing.undeclared, Outcome.NOT_APPLICABLE,
+                        "dropped", enclosing.id, null, absent, null, null);
+            }
         }
         System.out.println("PATCH_DROPPED " + patchId);
     }
@@ -249,73 +533,285 @@ public final class PatchRegistry {
         if (verbose()) {
             System.out.println("PATCH_APPLIED " + patchId);
         }
+        Frame enclosing = FRAMES.get().peekLast();
+        record(patchId, enclosing == null ? null : enclosing.spec,
+                enclosing != null && enclosing.undeclared, Outcome.APPLIED, null,
+                enclosing == null ? null : enclosing.id, null, null, null, null);
     }
 
     /**
-     * Runs one patch: skips it when {@link #bringupSkip} says so, otherwise runs the body and
-     * records it as applied, unless the body registered its target (or the targets of all its
-     * parts) as {@link #dropped}: then the call ends as dropped only. Failures propagate
-     * unchanged. When a patch fails outside bring-up mode on a profile that has a bring-up
-     * list, the list of unfinished patches is printed to stderr first.
+     * Runs one patch with its metadata ({@code spec}, see the class comment). The patch is not
+     * applicable for a build target or profile outside the spec, and skipped when
+     * {@link #bringupSkip} says so; otherwise the body runs and the patch ends as applied,
+     * unless the body registered its target (or the targets of all its parts) as
+     * {@link #dropped}: then it ends as dropped only. A failing body of a REQUIRED patch fails
+     * the build (when a profile has a bring-up list, its unfinished patches are printed to
+     * stderr first); a failing body of another kind is restored and disabled, see the class
+     * comment.
      */
+    public static void run(String patchId, String spec, IORunnable body) throws IOException {
+        requirePatchId(patchId);
+        runPatch(patchId, specFor(spec), false, false, null, body);
+    }
+
+    public static void runPart(String patchId, String spec, IORunnable body) throws IOException {
+        requirePatchId(patchId);
+        runPatch(patchId, specFor(spec), false, true, null, body);
+    }
+
+    public static void runPart(String patchId, String spec, ClassNode node, IORunnable body)
+            throws IOException {
+        requirePatchId(patchId);
+        runPatch(patchId, specFor(spec), false, true, node, body);
+    }
+
+    /**
+     * {@link #run(String, String, IORunnable)} without metadata: the patch is treated as
+     * REQUIRED for every target and profile, and {@code PATCH_UNDECLARED <id>} is printed to
+     * stderr. Registrations of {@code port/tools} always name a spec.
+     *
+     * @deprecated declare the kind, targets and profiles of the patch
+     */
+    @Deprecated
     public static void run(String patchId, IORunnable body) throws IOException {
+        requirePatchId(patchId);
+        synchronized (PatchRegistry.class) {
+            if (undeclaredWarned.add(patchId)) {
+                System.err.println("PATCH_UNDECLARED " + patchId);
+            }
+        }
+        runPatch(patchId, UNDECLARED, true, false, null, body);
+    }
+
+    private static void runPatch(String patchId, Spec spec, boolean undeclared, boolean part,
+            ClassNode node, IORunnable body)
+            throws IOException {
         if (body == null) {
             throw new IllegalArgumentException(patchId + ": null patch body");
         }
+        String target = BuildTarget.name();
+        if (!spec.hasTarget(target)) {
+            targetSkipped(patchId, spec, undeclared, target);
+            return;
+        }
+        String currentProfile = profile();
+        if (!spec.coversProfile(currentProfile)) {
+            profileNotApplicable(patchId, spec, undeclared, currentProfile);
+            return;
+        }
+        if (spec.notApplicable()) {
+            String reason = VersionProfile.forId(currentProfile).patchNotApplicable(patchId, target);
+            if (reason != null) {
+                synchronized (PatchRegistry.class) {
+                    queried.add(patchId);
+                    scopes.add(scopeOf(patchId));
+                    if (!part) {
+                        applied++;
+                    }
+                    System.out.println("PATCH_NOT_APPLICABLE " + patchId + " profile="
+                            + currentProfile + " summary=" + (part ? "part" : "applied"));
+                    record(patchId, spec, undeclared, Outcome.NOT_APPLICABLE, reason,
+                            null, null, null, null, null);
+                }
+                return;
+            }
+        }
         if (bringupSkip(patchId)) {
+            synchronized (PatchRegistry.class) {
+                record(patchId, spec, undeclared, Outcome.BRINGUP_SKIPPED, "bring-up list", null,
+                        null, null, null, null);
+            }
             return;
         }
-        int[] drops = new int[1];
-        RUN_DROPS.get().addLast(drops);
+        Frame frame = openFrame(patchId, spec, undeclared);
+        frame.part = part;
+        frame.node = node;
+        if (node != null) {
+            frame.originalNode = new ClassNode();
+            node.accept(frame.originalNode);
+        }
+        Throwable failure = null;
         try {
+            if (injectedFailure(patchId)) {
+                throw new IllegalStateException("injected failure (" + FAIL_PROPERTY + ")");
+            }
             body.run();
-        } catch (IOException | RuntimeException | Error failure) {
-            printPendingOnFailure(patchId);
-            throw failure;
-        } finally {
-            RUN_DROPS.get().removeLast();
+        } catch (IOException | RuntimeException | AssertionError caught) {
+            failure = caught;
+        } catch (Error fatal) {
+            synchronized (PatchRegistry.class) {
+                FRAMES.get().remove(frame);
+            }
+            throw fatal;
         }
-        if (drops[0] > 0) {
-            droppedRun(patchId);
+        if (failure != null) {
+            fail(frame, failure);
             return;
         }
-        applied(patchId);
+        try {
+            succeed(frame);
+        } catch (IOException | RuntimeException fingerprintFailure) {
+            fail(frame, fingerprintFailure);
+        }
+    }
+
+    private static synchronized Spec specFor(String text) {
+        Spec spec = specs.get(text);
+        if (spec == null) {
+            spec = Spec.parse(text);
+            specs.put(text, spec);
+        }
+        return spec;
+    }
+
+    private static synchronized Frame openFrame(String patchId, Spec spec, boolean undeclared)
+            throws IOException {
+        ArrayDeque<Frame> frames = FRAMES.get();
+        if (tracked(spec)) {
+            output.refresh(frames);
+        }
+        Frame frame = new Frame(patchId, spec, undeclared);
+        frames.addLast(frame);
+        return frame;
     }
 
     /**
-     * {@link #run} for a patch that only speeds up the JavaScript output: for the wasmgc target
-     * ({@link BuildTarget}) the vanilla code stays and the patch is reported as
-     * {@code PATCH_TARGET_SKIPPED}.
+     * Whether the files of a patch body are tracked: always when it can be restored (not
+     * REQUIRED, or check mode) or when a run log names them; a REQUIRED body of a normal build
+     * is not (its failure fails the build anyway), which keeps the overhead to the patches that
+     * can be disabled. The changes of an untracked body are taken in by the next refresh.
      */
-    public static void runJsOnly(String patchId, IORunnable body) throws IOException {
-        if (BuildTarget.wasmGc()) {
-            targetSkipped(patchId);
-            return;
-        }
-        run(patchId, body);
+    private static boolean tracked(Spec spec) {
+        return output != null && (spec.kind() != Kind.REQUIRED || truthy(CHECK_PROPERTY, CHECK_ENV)
+                || firstNonBlank(System.getProperty(RUN_LOG_PROPERTY), System.getenv(RUN_LOG_ENV))
+                        != null);
     }
 
-    private static synchronized void targetSkipped(String patchId) {
-        requirePatchId(patchId);
+    private static synchronized void succeed(Frame frame) throws IOException {
+        ArrayDeque<Frame> frames = FRAMES.get();
+        boolean tracked = tracked(frame.spec);
+        if (tracked) {
+            output.refresh(frames);
+        }
+        if (targetFingerprints != null && tracked) {
+            frame.methodTargets.addAll(targetFingerprints.changed(output.root, frame.before,
+                    frame.spec.wholeClass()));
+            if (frame.originalNode != null) {
+                frame.methodTargets.addAll(targetFingerprints.changed(frame.originalNode, frame.node));
+            }
+        }
+        frames.remove(frame);
+        queried.add(frame.id);
+        scopes.add(scopeOf(frame.id));
+        Collection<String> classes = tracked ? frame.before.keySet() : null;
+        if (frame.drops > 0) {
+            record(frame.id, frame.spec, frame.undeclared, Outcome.NOT_APPLICABLE, "dropped", null,
+                    classes, frame.absent, frame.parts, null, frame.methodTargets);
+            return;
+        }
+        if (!frame.part) {
+            applied++;
+        }
+        if (verbose()) {
+            System.out.println("PATCH_APPLIED " + frame.id);
+        }
+        record(frame.id, frame.spec, frame.undeclared, Outcome.APPLIED, null, null, classes, null,
+                null, null, frame.methodTargets);
+    }
+
+    private static void fail(Frame frame, Throwable failure) throws IOException {
+        boolean disable = frame.spec.kind() != Kind.REQUIRED && !truthy(STRICT_PROPERTY, STRICT_ENV);
+        boolean check = truthy(CHECK_PROPERTY, CHECK_ENV);
+        String error = oneLine(failure);
+        synchronized (PatchRegistry.class) {
+            ArrayDeque<Frame> frames = FRAMES.get();
+            if ((disable || check) && output != null) {
+                output.refresh(frames);
+                Collection<String> restored = new TreeSet<>(frame.before.keySet());
+                output.restore(frame);
+                if (frame.originalNode != null) {
+                    PatchTargets.restoreNode(frame.originalNode, frame.node);
+                }
+                frames.remove(frame);
+                queried.add(frame.id);
+                scopes.add(scopeOf(frame.id));
+                Outcome outcome = disable ? Outcome.DISABLED : Outcome.FAILED;
+                if (!frame.part) {
+                    if (disable) {
+                        disabled++;
+                    } else {
+                        failed++;
+                    }
+                }
+                System.out.println("PATCH_" + outcome.name() + " " + frame.id + " kind="
+                        + frame.spec.kind().name() + (frame.part ? " summary=part" : "")
+                        + " error=" + error);
+                if (check || verbose()) {
+                    failure.printStackTrace();
+                }
+                record(frame.id, frame.spec, frame.undeclared, outcome, "restored", null, restored,
+                        frame.absent, frame.parts, error);
+                if (frame.part && frame.spec.kind() == Kind.REQUIRED) {
+                    throw new IOException("Required patch part failed: " + frame.id, failure);
+                }
+                return;
+            }
+            boolean tracked = tracked(frame.spec);
+            if (tracked) {
+                output.refresh(frames);
+            }
+            frames.remove(frame);
+            queried.add(frame.id);
+            scopes.add(scopeOf(frame.id));
+            if (!frame.part) {
+                failed++;
+            }
+            System.out.println("PATCH_FAILED " + frame.id + " kind=" + frame.spec.kind().name()
+                    + (frame.part ? " summary=part" : "") + " error=" + error);
+            if (disable) {
+                System.err.println("Patch " + frame.id + " (" + frame.spec.kind().name()
+                        + ") cannot be disabled: its patcher did not call"
+                        + " PatchRegistry.configureOutput, so its files cannot be restored");
+            }
+            record(frame.id, frame.spec, frame.undeclared, Outcome.FAILED, null, null,
+                    tracked ? frame.before.keySet() : null, frame.absent, frame.parts, error);
+        }
+        printPendingOnFailure(frame.id);
+        if (failure instanceof IOException io) {
+            throw io;
+        }
+        if (failure instanceof RuntimeException runtime) {
+            throw runtime;
+        }
+        throw (AssertionError) failure;
+    }
+
+    private static synchronized void targetSkipped(
+            String patchId, Spec spec, boolean undeclared, String target) {
         resolve();
         queried.add(patchId);
         scopes.add(scopeOf(patchId));
         targetSkipped++;
-        System.out.println("PATCH_TARGET_SKIPPED " + patchId + " target=" + BuildTarget.name());
+        System.out.println("PATCH_TARGET_SKIPPED " + patchId + " target=" + target);
+        record(patchId, spec, undeclared, Outcome.NOT_APPLICABLE, "target", null, null, null, null,
+                null);
     }
 
-    /** A {@link #run} whose body registered drops: seen, but not counted as applied. */
-    private static synchronized void droppedRun(String patchId) {
-        requirePatchId(patchId);
-        resolve();
+    private static synchronized void profileNotApplicable(
+            String patchId, Spec spec, boolean undeclared, String currentProfile) {
         queried.add(patchId);
         scopes.add(scopeOf(patchId));
+        notApplicable++;
+        System.out.println("PATCH_NOT_APPLICABLE " + patchId + " profile=" + currentProfile);
+        record(patchId, spec, undeclared, Outcome.NOT_APPLICABLE, "profile", null, null, null, null,
+                null);
     }
 
     /**
-     * Prints {@code PATCH_SUMMARY applied=N dropped=N bringupSkipped=N} to stdout and, in
-     * bring-up mode, warns on stderr about listed ids of the patchers seen in this JVM that were
-     * never reached ({@code BRINGUP_UNUSED <id>}).
+     * Prints {@code PATCH_SUMMARY applied=N dropped=N bringupSkipped=N} (followed by the
+     * counters of the other outcomes that are not zero) to stdout and, in bring-up mode, warns
+     * on stderr about listed ids of the patchers seen in this JVM that were never reached
+     * ({@code BRINGUP_UNUSED <id>}).
      */
     public static synchronized void printSummary() {
         resolve();
@@ -328,7 +824,10 @@ public final class PatchRegistry {
         }
         System.out.println("PATCH_SUMMARY applied=" + applied + " dropped=" + dropped
                 + " bringupSkipped=" + bringupSkipped
-                + (targetSkipped > 0 ? " targetSkipped=" + targetSkipped : ""));
+                + (targetSkipped > 0 ? " targetSkipped=" + targetSkipped : "")
+                + (notApplicable > 0 ? " notApplicable=" + notApplicable : "")
+                + (disabled > 0 ? " disabled=" + disabled : "")
+                + (failed > 0 ? " failed=" + failed : ""));
     }
 
     /** Parses a bring-up list. Exposed for smokes and for build scripts written in Java. */
@@ -374,9 +873,19 @@ public final class PatchRegistry {
         return Collections.unmodifiableMap(entries);
     }
 
-    /** Whether the given profile id may ever use bring-up mode. */
+    /**
+     * Whether the given profile id may ever use bring-up mode: its version profile allows it
+     * ({@code bringupAllowed}). An unknown or missing profile never does.
+     */
     public static boolean bringupEligible(String profileId) {
-        return profileId != null && !"26.2".equals(profileId) && !"1.21.11".equals(profileId);
+        if (profileId == null || profileId.isBlank()) {
+            return false;
+        }
+        try {
+            return VersionProfile.forId(profileId).bringupAllowed();
+        } catch (RuntimeException unknownProfile) {
+            return false;
+        }
     }
 
     private static void resolve() {
@@ -385,13 +894,12 @@ public final class PatchRegistry {
         }
         profile = firstNonBlank(configuredProfile, System.getProperty(PROFILE_PROPERTY),
                 System.getenv(PROFILE_ENV), System.getenv(BUILD_PROFILE_ENV));
-        boolean flag = truthy(System.getProperty(BRINGUP_PROPERTY))
-                || truthy(System.getenv(BRINGUP_ENV));
+        boolean flag = truthy(BRINGUP_PROPERTY, BRINGUP_ENV);
         Path explicitList = pathOrNull(firstNonBlank(
                 System.getProperty(BRINGUP_LIST_PROPERTY), System.getenv(BRINGUP_LIST_ENV)));
         if (flag && !bringupEligible(profile)) {
             System.err.println("BRINGUP_IGNORED profile=" + profile
-                    + " (bring-up mode never applies to 26.2 or 1.21.11 or an unknown profile)");
+                    + " (bring-up mode applies only to a profile whose bringupAllowed is true)");
         }
         bringupActive = flag && bringupEligible(profile);
         Path list = explicitList;
@@ -439,16 +947,191 @@ public final class PatchRegistry {
             list = bringupList;
             entries = bringupEntries;
         }
-        BringupEntry failed = entries.get(failedId);
+        BringupEntry failedEntry = entries.get(failedId);
         System.err.println("Patch " + failedId + " failed for profile " + currentProfile
-                + (failed == null ? " and is not in the bring-up list"
-                        : " (bring-up owner " + failed.owner() + ": " + failed.reason() + ")")
+                + (failedEntry == null ? " and is not in the bring-up list"
+                        : " (bring-up owner " + failedEntry.owner() + ": " + failedEntry.reason()
+                                + ")")
                 + ". Unfinished patches listed in " + list + " (set " + BRINGUP_ENV
                 + "=1 to skip them during bring-up):");
         for (BringupEntry entry : entries.values()) {
             System.err.println("BRINGUP_PENDING " + entry.patchId() + " | " + entry.owner()
                     + " | " + entry.reason());
         }
+    }
+
+    private static boolean injectedFailure(String patchId) {
+        String value = firstNonBlank(System.getProperty(FAIL_PROPERTY), System.getenv(FAIL_ENV));
+        if (value == null) {
+            return false;
+        }
+        for (String id : value.split(",")) {
+            if (id.strip().equals(patchId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Appends one outcome to the run log, when one is configured. */
+    private static void record(String id, Spec spec, boolean undeclared, Outcome outcome,
+            String reason, String parent, Collection<String> classes, Collection<String> absent,
+            Collection<String> parts, String error) {
+        record(id, spec, undeclared, outcome, reason, parent, classes, absent, parts, error, null);
+    }
+
+    private static void record(String id, Spec spec, boolean undeclared, Outcome outcome,
+            String reason, String parent, Collection<String> classes, Collection<String> absent,
+            Collection<String> parts, String error, List<Map<String, Object>> methodTargets) {
+        String path = firstNonBlank(System.getProperty(RUN_LOG_PROPERTY), System.getenv(RUN_LOG_ENV));
+        if (path == null) {
+            return;
+        }
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("patcher", mainClass());
+        fields.put("id", id);
+        fields.put("kind", spec == null ? null : spec.kind().name());
+        fields.put("targets", spec == null ? null : spec.targets());
+        fields.put("profiles", spec == null ? null : spec.profiles());
+        fields.put("notApplicableDeclared", spec != null && spec.notApplicable() ? true : null);
+        fields.put("wholeClass", spec != null && spec.wholeClass() ? true : null);
+        fields.put("methodTargets", methodTargets);
+        fields.put("outcome", outcome.name());
+        fields.put("reason", reason);
+        fields.put("parent", parent);
+        fields.put("classes", classes == null ? null : new TreeSet<>(classes));
+        fields.put("absent", absent == null || absent.isEmpty() ? null : new ArrayList<>(absent));
+        fields.put("parts", parts == null || parts.isEmpty() ? null : new ArrayList<>(parts));
+        fields.put("error", error);
+        fields.put("undeclared", undeclared ? Boolean.TRUE : null);
+        fields.put("profile", profile);
+        fields.put("target", BuildTarget.name());
+        StringBuilder line = new StringBuilder("{");
+        for (Map.Entry<String, Object> field : fields.entrySet()) {
+            if (field.getValue() == null) {
+                continue;
+            }
+            if (line.length() > 1) {
+                line.append(',');
+            }
+            appendJson(line, field.getKey());
+            line.append(':');
+            appendJson(line, field.getValue());
+        }
+        line.append("}\n");
+        try {
+            Files.writeString(hostPath(path), line, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException exception) {
+            throw new IllegalStateException("Cannot append to the patch run log " + path, exception);
+        }
+    }
+
+    private static void appendJson(StringBuilder out, Object value) {
+        if (value instanceof Map<?, ?> items) {
+            out.append('{');
+            boolean first = true;
+            for (var item : items.entrySet()) {
+                if (!first) {
+                    out.append(',');
+                }
+                first = false;
+                appendJson(out, item.getKey());
+                out.append(':');
+                appendJson(out, item.getValue());
+            }
+            out.append('}');
+            return;
+        }
+        if (value instanceof Boolean flag) {
+            out.append(flag.booleanValue());
+            return;
+        }
+        if (value instanceof Collection<?> items) {
+            out.append('[');
+            boolean first = true;
+            for (Object item : items) {
+                if (!first) {
+                    out.append(',');
+                }
+                first = false;
+                appendJson(out, item);
+            }
+            out.append(']');
+            return;
+        }
+        String text = String.valueOf(value);
+        out.append('"');
+        for (int index = 0; index < text.length(); index++) {
+            char ch = text.charAt(index);
+            switch (ch) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        out.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        out.append(ch);
+                    }
+                }
+            }
+        }
+        out.append('"');
+    }
+
+    private static String mainClass() {
+        String command = System.getProperty("sun.java.command");
+        if (command == null || command.isBlank()) {
+            return null;
+        }
+        String main = command.strip().split("\\s+")[0];
+        return main.substring(main.lastIndexOf('.') + 1);
+    }
+
+    /** The failure as one log line: class, message and the causes. */
+    private static String oneLine(Throwable failure) {
+        StringBuilder text = new StringBuilder();
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (text.length() > 0) {
+                text.append(" <- ");
+            }
+            text.append(cause.getClass().getSimpleName());
+            if (cause.getMessage() != null) {
+                text.append(": ").append(cause.getMessage());
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        String line = text.toString().replaceAll("\\s+", " ").strip();
+        return line.length() > 400 ? line.substring(0, 400) + "..." : line;
+    }
+
+    private static int[] leadingVersion(String text) {
+        Matcher matcher = LEADING_VERSION.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        String[] parts = matcher.group(1).split("\\.");
+        int[] version = new int[parts.length];
+        for (int index = 0; index < parts.length; index++) {
+            version[index] = Integer.parseInt(parts[index]);
+        }
+        return version;
+    }
+
+    private static int compareVersions(int[] left, int[] right) {
+        for (int index = 0; index < Math.max(left.length, right.length); index++) {
+            int a = index < left.length ? left[index] : 0;
+            int b = index < right.length ? right[index] : 0;
+            if (a != b) {
+                return Integer.compare(a, b);
+            }
+        }
+        return 0;
     }
 
     private static boolean targetPresent(ZipFile zip, String target) throws IOException {
@@ -530,7 +1213,11 @@ public final class PatchRegistry {
     }
 
     private static boolean verbose() {
-        return truthy(System.getProperty(VERBOSE_PROPERTY)) || truthy(System.getenv(VERBOSE_ENV));
+        return truthy(VERBOSE_PROPERTY, VERBOSE_ENV);
+    }
+
+    private static boolean truthy(String property, String environment) {
+        return truthy(System.getProperty(property)) || truthy(System.getenv(environment));
     }
 
     private static boolean truthy(String value) {
@@ -565,5 +1252,114 @@ public final class PatchRegistry {
             return Path.of(Character.toUpperCase(path.charAt(1)) + ":" + path.substring(2));
         }
         return Path.of(path);
+    }
+
+    /** One {@link #run} body in progress. */
+    private static final class Frame {
+        final String id;
+        final Spec spec;
+        final boolean undeclared;
+        boolean part;
+        ClassNode node;
+        ClassNode originalNode;
+        final List<Map<String, Object>> methodTargets = new ArrayList<>();
+        int drops;
+        final List<String> parts = new ArrayList<>();
+        final List<String> absent = new ArrayList<>();
+        /**
+         * The state of every file of the output root that changed while this frame was open,
+         * before its first change ({@link OutputTracker#ABSENT}: it did not exist).
+         */
+        final Map<String, byte[]> before = new TreeMap<>();
+
+        Frame(String id, Spec spec, boolean undeclared) {
+            this.id = id;
+            this.spec = spec;
+            this.undeclared = undeclared;
+        }
+    }
+
+    /**
+     * The files of a patcher's output root as of the last {@link #refresh}, with their bytes, so
+     * that the changes of a failed patch body can be undone. A change is a new, deleted or
+     * rewritten file (another size or modification time).
+     */
+    private static final class OutputTracker {
+        static final byte[] ABSENT = new byte[0];
+
+        private record State(long size, FileTime modified, byte[] bytes) {
+        }
+
+        final Path root;
+        private final Map<String, State> known = new HashMap<>();
+
+        OutputTracker(Path root) throws IOException {
+            this.root = root;
+            refresh(List.of());
+        }
+
+        /** Takes in every change since the last call, journaling it in each open frame. */
+        void refresh(Collection<Frame> frames) throws IOException {
+            Map<String, BasicFileAttributes> now = list();
+            for (Map.Entry<String, BasicFileAttributes> entry : now.entrySet()) {
+                String path = entry.getKey();
+                BasicFileAttributes attributes = entry.getValue();
+                State old = known.get(path);
+                byte[] bytes = targetFingerprints == null ? null : Files.readAllBytes(root.resolve(path));
+                if (old != null && old.size() == attributes.size()
+                        && old.modified().equals(attributes.lastModifiedTime())
+                        && (bytes == null || java.util.Arrays.equals(bytes, old.bytes()))) {
+                    continue;
+                }
+                for (Frame frame : frames) {
+                    frame.before.putIfAbsent(path, old == null ? ABSENT : old.bytes());
+                }
+                known.put(path, new State(attributes.size(), attributes.lastModifiedTime(),
+                        bytes == null ? Files.readAllBytes(root.resolve(path)) : bytes));
+            }
+            for (String path : new ArrayList<>(known.keySet())) {
+                if (!now.containsKey(path)) {
+                    for (Frame frame : frames) {
+                        frame.before.putIfAbsent(path, known.get(path).bytes());
+                    }
+                    known.remove(path);
+                }
+            }
+        }
+
+        /** Puts every file the frame changed back to its state before the frame. */
+        void restore(Frame frame) throws IOException {
+            for (Map.Entry<String, byte[]> entry : frame.before.entrySet()) {
+                Path file = root.resolve(entry.getKey());
+                if (entry.getValue() == ABSENT) {
+                    Files.deleteIfExists(file);
+                    known.remove(entry.getKey());
+                } else {
+                    Files.createDirectories(file.getParent());
+                    Files.write(file, entry.getValue());
+                    BasicFileAttributes attributes =
+                            Files.readAttributes(file, BasicFileAttributes.class);
+                    known.put(entry.getKey(), new State(attributes.size(),
+                            attributes.lastModifiedTime(), entry.getValue()));
+                }
+            }
+        }
+
+        private Map<String, BasicFileAttributes> list() throws IOException {
+            Map<String, BasicFileAttributes> files = new HashMap<>();
+            if (!Files.isDirectory(root)) {
+                return files;
+            }
+            Files.walkFileTree(root, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
+                    if (attributes.isRegularFile()) {
+                        files.put(root.relativize(file).toString().replace('\\', '/'), attributes);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            return files;
+        }
     }
 }

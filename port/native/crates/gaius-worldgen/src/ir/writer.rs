@@ -75,7 +75,7 @@ impl Ir {
         let mut out = Writer::default();
         out.u32(MAGIC);
         out.u16(VERSION);
-        out.u8(profile_code(self.profile));
+        out.u8(self.semantics.code);
         out.u8(0);
         out.u32(count);
         out.u32((16 + sections.buf.len()) as u32);
@@ -192,6 +192,7 @@ fn encode_node(w: &mut Writer, node: &Node) {
         Op::Marker(Marker::CacheOnce, _) => (29, 0),
         Op::Marker(Marker::CacheAllInCell, _) => (30, 0),
         Op::BlendDensity(_) => (31, 0),
+        Op::ScaledNoise { .. } => (32, 0),
     };
     w.u8(op);
     w.u8(arg);
@@ -248,6 +249,10 @@ fn encode_node(w: &mut Writer, node: &Node) {
             w.u8(*metric as u8);
         }
         Op::Unary(_, a) | Op::Cache(a) | Op::Marker(_, a) | Op::BlendDensity(a) => w.u32(*a),
+        Op::ScaledNoise { noise, scale } => {
+            w.u32(*noise);
+            w.u32(*scale);
+        }
         Op::Binary(_, a, b) | Op::Pow(a, b) | Op::Round(_, a, b) => {
             w.u32(*a);
             w.u32(*b);

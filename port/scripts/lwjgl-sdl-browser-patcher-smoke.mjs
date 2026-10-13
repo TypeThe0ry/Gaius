@@ -9,21 +9,25 @@
 // >= 21 (GAIUS_JAVA_HOME, JAVA_HOME or PATH).
 //
 // 1. Builds the lwjgl-sdl 3.4.3 overlay the way build-overlays.sh does (vanilla jar + the
-//    port/overrides/libraries/lwjgl-sdl classes) and runs LwjglSdlBrowserPatcher on it.
-// 2. javap: SDL.<clinit> no longer calls Library.loadNative; each of the 84 SDL_* entry
-//    points is exactly "load arguments, invokestatic BrowserSdl.<same name and descriptor>,
-//    return"; the count equals the patcher table.
-// 3. The patcher fails closed without the overlay and with an overlay that lacks a target.
+//    port/overrides/libraries/lwjgl-sdl classes) and runs LwjglSdlBrowserPatcher on it, with the
+//    entry table of port/mc/profiles/26.3/usage.lock.
+// 2. javap: SDL.<clinit> no longer calls Library.loadNative; each SDL_* entry point of the usage
+//    lock is exactly "load arguments, invokestatic BrowserSdl.<same name and descriptor>,
+//    return", or, when BrowserSdl lacks it, a FEATURE stub "throw BrowserSdlUnsupported.entry(..)".
+// 3. The patcher fails closed without the overlay and when BrowserSdl lacks an entry point a seam
+//    requires; an overlay with only the required entry points gets FEATURE stubs for the rest.
 // 4. BrowserSdlJvmTest (JVM unit test): SDL_Event field offsets and widths against the
 //    lwjgl-sdl 3.4.3 constants, poll/flush/keyboard-state through the patched classes.
 // 5. Every @JSBody script of the overlay and of dev.gaius.browser.BrowserInput{Dispatch,
 //    Telemetry} parses with TeaVM's own JavaScript parser (TeaVmJsBodyCheck).
-// 6. InputPatches263 on the vanilla 26.3 client: SDL coverage check, eight runNow sites,
-//    MouseHandler.onButton hooks with the 26.3 locals, Blaze3D.openUri, SdlDebug; the
-//    patched classes load and initialize under -Xverify:all.
+// 6. The input group of Minecraft263BrowserPatcher (InputPatches263.*) on the vanilla 26.3
+//    client: SDL coverage check, eight runNow sites, MouseHandler.onButton hooks with the 26.3
+//    locals, Blaze3D.openUri, SdlDebug; the patched classes load and initialize under
+//    -Xverify:all.
 // 7. MinecraftClientPatcher's P2 methods: dropped (targets asserted absent, nothing written)
 //    on 26.3, unchanged output on 26.2.
 
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE, profileIdPattern} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync, spawnSync} from "node:child_process";
 import {existsSync} from "node:fs";
@@ -62,8 +66,8 @@ const javac = jdkTool("javac");
 const jarTool = jdkTool("jar");
 const javap = jdkTool("javap");
 
-const work263 = join(repositoryRoot, "port/work/26.3");
-const work262 = join(repositoryRoot, "port/work/26.2");
+const work263 = join(repositoryRoot, "port/work/" + RENDERPEARL_PROFILE.id + "");
+const work262 = join(repositoryRoot, "port/work/" + CANONICAL_PROFILE.id + "");
 const client263 = join(work263, "client-named.jar");
 const client262 = join(work262, "client-named.jar");
 const lwjglRoot = join(work263, "libraries/org/lwjgl");
@@ -85,11 +89,23 @@ const overlaySources = join(repositoryRoot, "port/overrides/libraries/lwjgl-sdl/
 const overlayTestSources = join(repositoryRoot, "port/overrides/libraries/lwjgl-sdl/src/test/java/org/lwjgl/sdl");
 const hostLoopSource = join(repositoryRoot, "port/overrides/classlib/src/main/java/dev/gaius/browser/HostLoop.java");
 const toolsRoot = join(repositoryRoot, "port/tools/src/main/java");
-const patcherSource = await readFile(join(toolsRoot, "dev/gaius/tools/LwjglSdlBrowserPatcher.java"), "utf8");
-const entries = [...patcherSource.matchAll(/\{"(SDL\w+)",\s*"(SDL_\w+)",\s*"([^"]+)"\}/g)]
-  .map((match) => ({owner: match[1], name: match[2], desc: match[3]}));
-const entryCount = Number(/ENTRY_COUNT = (\d+);/.exec(patcherSource)[1]);
-assert.equal(entries.length, entryCount, "the patcher table and ENTRY_COUNT disagree");
+// The entry table: the SDL_* methods of the lwjgl-sdl section of the usage lock.
+const usageLock = join(repositoryRoot, "port/mc/profiles/" + RENDERPEARL_PROFILE.id + "/usage.lock");
+const entries = [];
+let inSdlSection = false;
+for (const line of (await readFile(usageLock, "utf8")).split(/\r?\n/)) {
+  if (line.startsWith("[")) {
+    inSdlSection = line.startsWith("[library org.lwjgl:lwjgl-sdl:");
+    continue;
+  }
+  const match = inSdlSection && /^M org\/lwjgl\/sdl\/(SDL\w*)\.(SDL_\w+)(\(.*)$/.exec(line.trim());
+  if (match) entries.push({owner: match[1], name: match[2], desc: match[3]});
+}
+const entryCount = entries.length;
+assert.ok(entryCount > 0, `no SDL entry point in ${usageLock}`);
+const seam = JSON.parse(await readFile(join(repositoryRoot, "port/mc/seams/renderpearl-1/seam.json"), "utf8"));
+const requiredEntries = seam.requiredEntries.filter((entry) => entry.startsWith("org/lwjgl/sdl/"));
+assert.ok(requiredEntries.length > 0, "the render seam requires no SDL entry point");
 
 const work = await mkdtemp(join(tmpdir(), "gaius-sdl-"));
 function run(command, args, options = {}) {
@@ -174,8 +190,10 @@ try {
   mustRun(jarTool, ["--update", "--file", patchedJar, "-C", overlayClasses, "."]);
   const patchDir = join(work, "patches");
   const patched = mustRun(java, ["-classpath", toolClasspath.join(delimiter), "dev.gaius.tools.LwjglSdlBrowserPatcher",
-    patchedJar, patchDir]);
-  assert.match(patched.out, new RegExp(`redirected ${entryCount} SDL entry points`));
+    patchedJar, patchDir, usageLock]);
+  const stubbed = new Set([...patched.out.matchAll(/^SDL_FEATURE_STUB (\S+)$/gm)].map((match) => match[1]));
+  assert.match(patched.out, new RegExp(`redirected ${entryCount - stubbed.size} SDL entry points to \\S+ `
+    + `and stubbed ${stubbed.size} \\(FEATURE\\) of the ${entryCount} `));
   mustRun(jarTool, ["--update", "--file", patchedJar, "-C", patchDir, "."]);
 
   // ---------------------------------------------------------------- 2. javap assertions
@@ -184,9 +202,21 @@ try {
   assert.ok(!sdlInit.join("\n").includes("loadNative"), "SDL.<clinit> still loads a native library");
   const dumps = new Map();
   let redirected = 0;
+  const assertStub = (dump, entry) => {
+    const code = methodCode(dump, javapMethodPattern(entry.name, entry.desc));
+    assert.deepEqual(code.map((line) => line.split(/\s+/)[0]), ["ldc", "invokestatic", "athrow"],
+      `${entry.owner}.${entry.name} is not a FEATURE stub`);
+    assert.ok(code[0].endsWith(`// String ${entry.owner}.${entry.name}${entry.desc}`), code[0]);
+    assert.ok(code[1].endsWith("// Method org/lwjgl/sdl/BrowserSdlUnsupported.entry:"
+      + "(Ljava/lang/String;)Ljava/lang/UnsupportedOperationException;"), code[1]);
+  };
   for (const entry of entries) {
     const className = `org.lwjgl.sdl.${entry.owner}`;
     if (!dumps.has(className)) dumps.set(className, javapCode([patchedJar], className));
+    if (stubbed.has(`${entry.owner}.${entry.name}${entry.desc}`)) {
+      assertStub(dumps.get(className), entry);
+      continue;
+    }
     const code = methodCode(dumps.get(className), javapMethodPattern(entry.name, entry.desc));
     const calls = code.filter((line) => /^invoke/.test(line));
     assert.equal(calls.length, 1, `${entry.owner}.${entry.name} makes ${calls.length} calls`);
@@ -197,12 +227,13 @@ try {
     assert.ok(!code.some((line) => /JNI|Functions|getstatic/.test(line)), `${entry.owner}.${entry.name} keeps native code`);
     redirected++;
   }
-  assert.equal(redirected, entryCount);
-  console.log(`lwjgl-sdl-browser-patcher-smoke: ${redirected} SDL entry points delegate to BrowserSdl; SDL.<clinit> loads nothing`);
+  assert.equal(redirected + stubbed.size, entryCount);
+  console.log(`lwjgl-sdl-browser-patcher-smoke: ${redirected} SDL entry points delegate to BrowserSdl, `
+    + `${stubbed.size} are FEATURE stubs; SDL.<clinit> loads nothing`);
 
   // ---------------------------------------------------------------- 3. fail-closed patcher
   let failure = run(java, ["-classpath", toolClasspath.join(delimiter), "dev.gaius.tools.LwjglSdlBrowserPatcher",
-    sdlJar, join(work, "patches-no-overlay")]);
+    sdlJar, join(work, "patches-no-overlay"), usageLock]);
   assert.notEqual(failure.status, 0, "the patcher accepted a jar without the BrowserSdl overlay");
   assert.match(failure.err, /org\/lwjgl\/sdl\/BrowserSdl\.class not found/);
   const stubSource = join(work, "stub/org/lwjgl/sdl/BrowserSdl.java");
@@ -214,10 +245,47 @@ try {
   await copyFile(sdlJar, stubJar);
   mustRun(jarTool, ["--update", "--file", stubJar, "-C", join(work, "stub-classes"), "."]);
   failure = run(java, ["-classpath", toolClasspath.join(delimiter), "dev.gaius.tools.LwjglSdlBrowserPatcher",
-    stubJar, join(work, "patches-stub")]);
-  assert.notEqual(failure.status, 0, "the patcher accepted an overlay without the SDL targets");
-  assert.match(failure.err, /BrowserSdl is missing public static targets: SDLClipboard\.SDL_GetClipboardText/);
-  console.log("lwjgl-sdl-browser-patcher-smoke: the patcher fails closed without complete BrowserSdl targets");
+    stubJar, join(work, "patches-stub"), usageLock]);
+  assert.notEqual(failure.status, 0, "the patcher accepted an overlay without the SDL entry points the seam requires");
+  assert.match(failure.err, new RegExp(String.raw`REQUIRED SDL entry points of the ${profileIdPattern(RENDERPEARL_PROFILE)} seams are not redirected: .*SDLVideo\.SDL_CreateWindow \(org\/lwjgl\/sdl\/BrowserSdl does not implement it\)`));
+  // An overlay with only the required entry points: FEATURE stubs for the rest, which need
+  // BrowserSdlUnsupported.
+  const requiredSource = join(work, "required/org/lwjgl/sdl/BrowserSdl.java");
+  await mkdir(join(work, "required/org/lwjgl/sdl"), {recursive: true});
+  const requiredMethods = entries.filter((entry) => requiredEntries.includes(`org/lwjgl/sdl/${entry.owner}.${entry.name}`));
+  assert.equal(requiredMethods.length, requiredEntries.length, "a required SDL entry point is not in the usage lock");
+  const javaType = (descriptor) => ({J: "long", Z: "boolean", I: "int", V: "void"}[descriptor]
+    || (descriptor === "Ljava/lang/CharSequence;" ? "CharSequence" : null));
+  const requiredStubs = requiredMethods.map((entry) => {
+    const params = [...entry.desc.slice(1, entry.desc.indexOf(")")).matchAll(/L[^;]+;|[ZBCSIJFD]/g)].map((m) => m[0]);
+    const result = entry.desc.slice(entry.desc.indexOf(")") + 1);
+    assert.ok([...params, result].every(javaType), `unexpected descriptor ${entry.desc}`);
+    const value = {long: "0L", boolean: "true", int: "0", void: ""}[javaType(result)];
+    return `  public static ${javaType(result)} ${entry.name}(`
+      + `${params.map((param, index) => `${javaType(param)} a${index}`).join(", ")}) { return ${value}; }`;
+  });
+  await writeFile(requiredSource, `package org.lwjgl.sdl;\npublic final class BrowserSdl {\n${requiredStubs.join("\n")}\n}\n`);
+  await javacArgfile("required", [sdlJar], join(work, "required-classes"), [requiredSource], ["--release", "21"]);
+  const requiredJar = join(work, "required.jar");
+  await copyFile(sdlJar, requiredJar);
+  mustRun(jarTool, ["--update", "--file", requiredJar, "-C", join(work, "required-classes"), "."]);
+  failure = run(java, ["-classpath", toolClasspath.join(delimiter), "dev.gaius.tools.LwjglSdlBrowserPatcher",
+    requiredJar, join(work, "patches-required"), usageLock]);
+  assert.notEqual(failure.status, 0, "the patcher wrote FEATURE stubs without BrowserSdlUnsupported");
+  assert.match(failure.err, /org\/lwjgl\/sdl\/BrowserSdlUnsupported\.class not found/);
+  await javacArgfile("unsupported", [sdlJar, ...teavmApiJars], join(work, "required-classes"),
+    [join(overlaySources, "BrowserSdlUnsupported.java")], ["--release", "21", "-proc:none"]);
+  mustRun(jarTool, ["--update", "--file", requiredJar, "-C", join(work, "required-classes"), "."]);
+  const stubPatches = join(work, "patches-required-ok");
+  const stubRun = mustRun(java, ["-classpath", toolClasspath.join(delimiter), "dev.gaius.tools.LwjglSdlBrowserPatcher",
+    requiredJar, stubPatches, usageLock]);
+  const stubCount = (stubRun.out.match(/^SDL_FEATURE_STUB /gm) || []).length;
+  assert.equal(stubCount, entryCount - requiredMethods.length, "every entry point but the required ones is a stub");
+  mustRun(jarTool, ["--update", "--file", requiredJar, "-C", stubPatches, "."]);
+  const stubbedEntry = entries.find((entry) => entry.name === "SDL_GetClipboardText");
+  assertStub(javapCode([requiredJar], `org.lwjgl.sdl.${stubbedEntry.owner}`), stubbedEntry);
+  console.log("lwjgl-sdl-browser-patcher-smoke: the patcher fails closed without the seam's required entry points; "
+    + `${stubCount} FEATURE stubs otherwise`);
 
   // ---------------------------------------------------------------- 4. JVM unit test
   const testClasses = join(work, "test-classes");
@@ -241,13 +309,13 @@ try {
   assert.match(scripts.out, /JSBODY_OK dev\/gaius\/browser\/BrowserInputTelemetry\.reportMouseHandlerEntry\(JJII\)V/);
   console.log(`lwjgl-sdl-browser-patcher-smoke: ${scripts.out.trim().split(/\r?\n/).at(-1)}`);
 
-  // ---------------------------------------------------------------- 6. InputPatches263
+  // ---------------------------------------------------------------- 6. the 26.3 input group
   const driverSource = join(work, "driver/P2SmokeDriver.java");
   await mkdir(join(work, "driver"), {recursive: true});
   await writeFile(driverSource, String.raw`
+import dev.gaius.tools.Minecraft263BrowserPatcher;
 import dev.gaius.tools.ModernSymbols;
 import dev.gaius.tools.PatchRegistry;
-import dev.gaius.tools.m263.InputPatches263;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 
@@ -257,15 +325,16 @@ public final class P2SmokeDriver {
         String jar = args[1];
         Path out = Path.of(args[2]);
         if (mode.equals("m263")) {
-            PatchRegistry.configureProfile("26.3");
-            InputPatches263.apply(jar, out, ModernSymbols.probe(jar));
+            PatchRegistry.configureProfile("${RENDERPEARL_PROFILE.id}");
+            Minecraft263BrowserPatcher.inputPatches(jar, out, ModernSymbols.probe(jar));
             PatchRegistry.printSummary();
         } else if (mode.equals("mcp")) {
             PatchRegistry.configureProfile(args[3]);
-            Class<?> patcher = Class.forName("dev.gaius.tools.MinecraftClientPatcher");
-            call(patcher, "patchBrowserInputCallbacks", jar, out);
-            call(patcher, "patchInputConstants", jar, out.resolve("com/mojang/blaze3d/platform/InputConstants.class"));
-            call(patcher, "patchOpenUri", jar, out.resolve("net/minecraft/util/Util$OS.class"));
+            Class<?> input = Class.forName("dev.gaius.tools.patches.input.InputPatches");
+            Class<?> platform = Class.forName("dev.gaius.tools.patches.platform.PlatformPatches");
+            call(input, "patchBrowserInputCallbacks", jar, out);
+            call(input, "patchInputConstants", jar, out.resolve("com/mojang/blaze3d/platform/InputConstants.class"));
+            call(platform, "patchOpenUri", jar, out.resolve("net/minecraft/util/Util$OS.class"));
             PatchRegistry.printSummary();
         } else if (mode.equals("init")) {
             for (int index = 1; index < args.length; index++) {
@@ -286,7 +355,8 @@ public final class P2SmokeDriver {
   await javacArgfile("driver", toolClasspath, driverClasses, [driverSource]);
   const driverClasspath = [driverClasses, ...toolClasspath];
   const m263Out = join(work, "m263-out");
-  const m263 = mustRun(java, ["-classpath", driverClasspath.join(delimiter), "P2SmokeDriver", "m263", client263, m263Out]);
+  const m263 = mustRun(java, ["-classpath", driverClasspath.join(delimiter), `-Dgaius.usage.lock=${usageLock}`,
+    "P2SmokeDriver", "m263", client263, m263Out]);
   assert.match(m263.out, new RegExp(`the client references ${entryCount} SDL entry points, all among the ${entryCount}`));
   assert.match(m263.out, /^PATCH_SUMMARY applied=4 dropped=0 bringupSkipped=0$/m);
   const patchedClient = [m263Out, client263];
@@ -304,7 +374,7 @@ public final class P2SmokeDriver {
   assert.equal(hook("reportMouseHandlerDispatch", "DDZLjava/lang/Object;"), 1);
   assert.equal(hook("reportMouseClickedResult", "ZDDLjava/lang/Object;"), 1);
   assert.match(mouse, /dload +7\ndload +9\niload +6\naload +11\ninvokestatic .*reportMouseHandlerDispatch/,
-    "dispatch telemetry must load the 26.3 locals x=7 y=9 pressed=6 screen=11");
+    "dispatch telemetry must load the " + RENDERPEARL_PROFILE.id + " locals x=7 y=9 pressed=6 screen=11");
   assert.match(mouse, /instanceof .*net\/minecraft\/client\/gui\/screens\/LoadingOverlay/, "LoadingOverlay gate missing");
 
   const openUri = methodCode(javapCode(patchedClient, "com.mojang.blaze3d.Blaze3D"),
@@ -327,35 +397,35 @@ public final class P2SmokeDriver {
     "com.mojang.blaze3d.Blaze3D", "com.mojang.blaze3d.platform.SdlDebug"]);
   assert.equal((initialized.out.match(/^CLASS_INIT_VERIFIED /gm) || []).length, 4,
     `patched input classes failed JVM verification:\n${initialized.out}\n${initialized.err}`);
-  console.log("lwjgl-sdl-browser-patcher-smoke: InputPatches263 output verified (runNow x8, onButton hooks, openUri, SdlDebug)");
+  console.log("lwjgl-sdl-browser-patcher-smoke: 26.3 input group output verified (runNow x8, onButton hooks, openUri, SdlDebug)");
 
   // ---------------------------------------------------------------- 7. MinecraftClientPatcher P2 methods
   const mcp263Out = join(work, "mcp-263");
-  const mcp263 = mustRun(java, ["-classpath", driverClasspath.join(delimiter), "P2SmokeDriver", "mcp", client263, mcp263Out, "26.3"]);
+  const mcp263 = mustRun(java, ["-classpath", driverClasspath.join(delimiter), "P2SmokeDriver", "mcp", client263, mcp263Out, RENDERPEARL_PROFILE.id]);
   for (const id of [
     "MinecraftClientPatcher.patchBrowserMouseHandler",
     "MinecraftClientPatcher.patchBrowserKeyboardHandler",
     "MinecraftClientPatcher.patchInputConstants.glfw",
     "MinecraftClientPatcher.patchOpenUri.utilOs",
   ]) {
-    assert.match(mcp263.out, new RegExp(`^PATCH_DROPPED ${id.replaceAll(".", "\\.")}$`, "m"), `26.3 must drop ${id}`);
+    assert.match(mcp263.out, new RegExp(`^PATCH_DROPPED ${id.replaceAll(".", "\\.")}$`, "m"), `${RENDERPEARL_PROFILE.id} must drop ${id}`);
   }
   assert.match(mcp263.out, /^PATCH_SUMMARY applied=0 dropped=4 bringupSkipped=0$/m);
-  assert.ok(!existsSync(mcp263Out), "26.3 must not write GLFW-era input classes");
+  assert.ok(!existsSync(mcp263Out), "" + RENDERPEARL_PROFILE.id + " must not write GLFW-era input classes");
   if (existsSync(client262)) {
     const mcp262Out = join(work, "mcp-262");
-    const mcp262 = mustRun(java, ["-classpath", driverClasspath.join(delimiter), "P2SmokeDriver", "mcp", client262, mcp262Out, "26.2"]);
+    const mcp262 = mustRun(java, ["-classpath", driverClasspath.join(delimiter), "P2SmokeDriver", "mcp", client262, mcp262Out, CANONICAL_PROFILE.id]);
     assert.doesNotMatch(mcp262.out, /PATCH_DROPPED/);
     for (const entry of ["net/minecraft/client/MouseHandler.class", "net/minecraft/client/KeyboardHandler.class",
       "com/mojang/blaze3d/platform/InputConstants.class", "net/minecraft/util/Util$OS.class"]) {
-      assert.ok(existsSync(join(mcp262Out, entry)), `26.2 no longer writes ${entry}`);
+      assert.ok(existsSync(join(mcp262Out, entry)), `${CANONICAL_PROFILE.id} no longer writes ${entry}`);
     }
     const mouse262 = javapCode([mcp262Out, client262], "net.minecraft.client.MouseHandler");
     assert.match(mouse262, /org\/lwjgl\/glfw\/BrowserGlfw\.reportMouseHandlerEntry:\(JJII\)V/,
-      "26.2 keeps the BrowserGlfw telemetry");
-    console.log("lwjgl-sdl-browser-patcher-smoke: MinecraftClientPatcher drops its GLFW input patches on 26.3 and keeps 26.2");
+      "" + CANONICAL_PROFILE.id + " keeps the BrowserGlfw telemetry");
+    console.log("lwjgl-sdl-browser-patcher-smoke: MinecraftClientPatcher drops its GLFW input patches on " + RENDERPEARL_PROFILE.id + " and keeps " + CANONICAL_PROFILE.id + "");
   } else {
-    console.log("lwjgl-sdl-browser-patcher-smoke: port/work/26.2 missing, 26.2 half of step 7 not run");
+    console.log("lwjgl-sdl-browser-patcher-smoke: port/work/" + CANONICAL_PROFILE.id + " missing, " + CANONICAL_PROFILE.id + " half of step 7 not run");
   }
   console.log("lwjgl-sdl-browser-patcher-smoke: OK");
 } finally {

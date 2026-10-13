@@ -134,6 +134,7 @@ function createEnv({cores = 4, deviceMemory = 8, simd = true} = {}) {
     Blob: class { constructor(parts) { this.parts = parts; } },
   });
   vm.runInContext(policySource, context, {filename: "kernel-policy.js"});
+  context.GaiusKernelMirror = {enabled: () => true, allowed: () => true};
   vm.runInContext(runtimeSource, context, {filename: "kernel-runtime.js"});
   return {context, log, Runtime: context.GaiusKernelRuntime};
 }

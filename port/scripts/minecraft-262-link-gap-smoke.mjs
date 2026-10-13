@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
+import {patcherSource} from "./patcher-sources.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {existsSync} from "node:fs";
@@ -24,9 +26,9 @@ const profileId = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
     : (/^\d+(?:\.\d+)+$/.test(buildProfileId) ? buildProfileId
-      : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2")));
-if (profileId !== "26.2") {
-  throw new Error(`Minecraft 26.2 link-gap smoke is 26.2-only; got profile ${profileId}`);
+      : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : CANONICAL_PROFILE.id)));
+if (profileId !== CANONICAL_PROFILE.id) {
+  throw new Error(`Minecraft ${CANONICAL_PROFILE.id} link-gap smoke is ${CANONICAL_PROFILE.id}-only; got profile ${profileId}`);
 }
 const isolated = Boolean(
   process.env.GAIUS_OVERLAY_DIRECTORY
@@ -39,12 +41,19 @@ const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY || join(
 const buildRoot = nativePath(process.env.GAIUS_BUILD_ROOT || join(
   root, "port/target", isolated ? profileId : "",
 ));
-const patchedJar = join(overlayRoot, "client-named-26.2-gaius.jar");
+const patchedJar = join(overlayRoot, "client-named-" + CANONICAL_PROFILE.id + "-gaius.jar");
 const runtimeClasses = join(buildRoot, "maven/classes");
 const targetingSourcePath = fileURLToPath(
   new URL("../src/main/java/dev/gaius/browser/BrowserTargeting.java", import.meta.url),
 );
 const targetingClassPath = join(runtimeClasses, "dev/gaius/browser/BrowserTargeting.class");
+if (!existsSync(targetingClassPath)) {
+  // Exit 2 is reserved for an unmet build prerequisite; 0 is a passing smoke
+  // and 1 is a detected link-gap regression.
+  console.log(`MINECRAFT_262_LINK_GAP_SMOKE SKIPPED(prerequisite): missing ${targetingClassPath}`);
+  console.log("Build the Maven runtime classes before rerunning this smoke.");
+  process.exit(2);
+}
 function javaTool(name) {
   for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]
     .filter(Boolean).map(nativePath)) {
@@ -53,14 +62,9 @@ function javaTool(name) {
   }
   return name;
 }
-const clientPatcher = await readFile(
-  new URL("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java", import.meta.url),
-  "utf8",
-);
-const versionPatcher = await readFile(
-  new URL("../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java", import.meta.url),
-  "utf8",
-);
+// A patcher step's text with its domain classes (port/tools/patchkit/README.md, "Domains").
+const clientPatcher = patcherSource("MinecraftClientPatcher");
+const versionPatcher = patcherSource("Minecraft262BrowserPatcher");
 const jdkCompat = await readFile(
   new URL("../src/main/java/dev/gaius/browser/BrowserJdkCompat.java", import.meta.url),
   "utf8",
@@ -84,22 +88,27 @@ for (const contract of [
   '"ChunkGenerationTask.runUntilWait"',
   '"ChunkGenerationTask.canLoadWithoutGeneration"',
   '"browserLayerActive"',
-  'patchRunUntilWaitActiveGate(',
+  'patchRunUntilWaitYieldGate(',
   'activeResume',
+  'freshReturn',
   'replaceChunkGenerationScheduleLayer(',
   "patchGlBufferMappedViewRanges(jar, root)",
   "patchLiveFrameTargeting(jar, root)",
   "patchSectionRenderTaskRetryYields(jar, root)",
   '"CompileTask", "ResortTransparencyTask"',
-  "replaceSpinWaitWithBoundedCancellation(method, owner)",
+  "replaceSpinWaitWithBoundedCancellation(method, owner",
   "clearUploadRetryOnReturns(method)",
   "patchFileFixerUpperHardLinks(jar, root)",
   'find(node, "supportsHardLinks", "(Ljava/nio/file/Path;)Z")',
   "patchIdentifierResolveAgainst(jar, root)",
   '"(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/lang/String;)"',
 ]) {
-  assert.ok(versionPatcher.includes(contract), "missing 26.2 patch contract: " + contract);
+  assert.ok(versionPatcher.includes(contract), "missing " + CANONICAL_PROFILE.id + " patch contract: " + contract);
 }
+// The former active-only gate was replaced by the yield gate (pending batch futures are
+// returned to ChunkMap instead of resuming inline); the old entry point must not linger.
+assert.ok(!versionPatcher.includes("patchRunUntilWaitActiveGate"),
+  CANONICAL_PROFILE.id + " patcher still carries the replaced active-only run-until-wait gate");
 for (const required of [
   "BROWSER_LAYER_YIELD",
   "CHUNK_GENERATION_YIELD",
@@ -109,20 +118,20 @@ for (const required of [
   "writeChunkGenerationYieldHelper",
 ]) {
   assert.ok(versionPatcher.includes(required),
-    `26.2 patcher is missing its pending-batch continuation: ${required}`);
+    `${CANONICAL_PROFILE.id} patcher is missing its pending-batch continuation: ${required}`);
 }
 assert.ok(versionPatcher.includes("requireNoServerWorkTurnReset"),
-  "26.2 task patcher does not guard the shared server-work clock from per-task resets");
+  "" + CANONICAL_PROFILE.id + " task patcher does not guard the shared server-work clock from per-task resets");
 for (const contract of [
   '"beginTaskWork",\n                "(Ljava/lang/String;)I"',
   '"endTaskWork",\n                "(I)V"',
 ]) {
   assert.ok(versionPatcher.includes(contract),
-    `missing 26.2 task-scope token contract: ${contract}`);
+    `missing ${CANONICAL_PROFILE.id} task-scope token contract: ${contract}`);
 }
 assert.ok(versionPatcher.includes(
   'writeComputeFrames(node, root.resolve(owner + ".class"))',
-), "26.2 task patcher does not recompute frames after task-scope instrumentation");
+), "" + CANONICAL_PROFILE.id + " task patcher does not recompute frames after task-scope instrumentation");
 for (const contract of [
   "browserWorldgenBeginServerWorkTurn()",
   "method.instructions.insertBefore(instruction, browserWorldgenBeginServerWorkTurn())",
@@ -171,15 +180,15 @@ function methodBody(output, signature) {
 
 const minecraft = javap("net.minecraft.client.Minecraft");
 assert.ok(!minecraft.includes("Field noRender:Z"),
-  "26.2 Minecraft telemetry still reads the removed noRender field");
+  "" + CANONICAL_PROFILE.id + " Minecraft telemetry still reads the removed noRender field");
 const renderFrame = methodBody(minecraft, "public void renderFrame(boolean)");
 const rendererUpdate = renderFrame.indexOf("GameRenderer.update");
 const deferredPick = renderFrame.indexOf("BrowserTargeting.deferFramePick");
 const rendererExtract = renderFrame.indexOf("GameRenderer.extract");
 assert.ok(rendererUpdate >= 0 && deferredPick > rendererUpdate && rendererExtract > deferredPick,
-  "26.2 renderFrame no longer defers its one pick between update and extract");
+  "" + CANONICAL_PROFILE.id + " renderFrame no longer defers its one pick between update and extract");
 assert.ok(!renderFrame.includes("Method pick:(F)V"),
-  "26.2 renderFrame still performs the stale pre-extract pick");
+  "" + CANONICAL_PROFILE.id + " renderFrame still performs the stale pre-extract pick");
 
 const gameRenderer = javap("net.minecraft.client.renderer.GameRenderer");
 const gameRendererExtract = methodBody(
@@ -190,17 +199,17 @@ const cameraExtract = gameRendererExtract.indexOf("Method extractCamera:");
 const refreshedPick = gameRendererExtract.indexOf("BrowserTargeting.refreshFramePick");
 const levelExtract = gameRendererExtract.indexOf("LevelExtractor.extract");
 assert.ok(cameraExtract >= 0 && refreshedPick > cameraExtract && levelExtract > refreshedPick,
-  "26.2 GameRenderer does not refresh targeting between camera and level extraction");
+  "" + CANONICAL_PROFILE.id + " GameRenderer does not refresh targeting between camera and level extraction");
 const cameraCallEnd = gameRendererExtract.indexOf("\n", cameraExtract);
 const targetingBridge = gameRendererExtract.slice(cameraCallEnd, refreshedPick);
 assert.match(targetingBridge, /fload\s+6/,
-  "26.2 frame targeting does not use the render camera's entity partial tick");
+  "" + CANONICAL_PROFILE.id + " frame targeting does not use the render camera's entity partial tick");
 assert.doesNotMatch(targetingBridge, /fload\s+5/,
-  "26.2 frame targeting still uses world partial ticks and can drift from the crosshair");
+  "" + CANONICAL_PROFILE.id + " frame targeting still uses world partial ticks and can drift from the crosshair");
 assert.equal(gameRenderer.match(/BrowserTargeting\.refreshFramePick/g)?.length, 1,
-  "26.2 GameRenderer must refresh targeting exactly once per rendered frame");
+  "" + CANONICAL_PROFILE.id + " GameRenderer must refresh targeting exactly once per rendered frame");
 assert.ok(!gameRenderer.includes("LocalPlayer.raycastHitResult"),
-  "26.2 GameRenderer embeds a second targeting raycast");
+  "" + CANONICAL_PROFILE.id + " GameRenderer embeds a second targeting raycast");
 
 const [targetingSourceStat, targetingClassStat] = await Promise.all([
   stat(targetingSourcePath),
@@ -312,8 +321,10 @@ assert.match(scheduleLayer, /ldc(?:_w)?\s+.*\/\/ int 16[\s\S]*if_icmplt/,
   "scheduleLayer must cap each browser turn at 16 holders");
 assert.match(scheduleLayer, /Field browserLayerYield/,
   "scheduleLayer must retain the batch future before returning");
-assert.equal(scheduleLayer.match(/Platform\.schedule/g)?.length, 1,
-  "scheduleLayer must schedule one asynchronous batch completion");
+// The continuation starts through Platform.startThread on the JavaScript target and through
+// HostLoop.startThread (a daemon fiber) on the WebAssembly GC target.
+assert.equal(scheduleLayer.match(/(?:Platform|HostLoop)\.startThread/g)?.length, 1,
+  "scheduleLayer must start one asynchronous batch completion");
 assert.match(runUntilWait, /CompletableFuture.isDone/,
   "runUntilWait must return while the batch completion is pending");
 assert.match(scheduleLayer, /Exception table:[\s\S]*Throwable/,
@@ -431,4 +442,4 @@ assert.ok(resolveAgainst.includes("dev/gaius/browser/BrowserJdkCompat.resolve"),
 assert.ok(!resolveAgainst.includes("Path.resolve:(Ljava/lang/String;[Ljava/lang/String;)"),
   "Identifier.resolveAgainst still calls unsupported varargs Path.resolve");
 
-console.log("Minecraft 26.2 link-gap smoke passed");
+console.log("Minecraft " + CANONICAL_PROFILE.id + " link-gap smoke passed");

@@ -13,6 +13,7 @@
 // (generator-missing, then a resend with the IR), terrain and biome results decode, the separate
 // surface job equals the surface run inside the terrain job, and the SIMD and baseline modules
 // produce byte-identical chunks.
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import {dirname, join} from "node:path";
@@ -30,7 +31,7 @@ const variants = {
   simd: readFileSync(join(wasmDir, "gaius_worldgen_wasm.simd.wasm")),
   baseline: readFileSync(join(wasmDir, "gaius_worldgen_wasm.baseline.wasm")),
 };
-const irs = {"26.2": readFileSync(join(wasmDir, "26.2.gwir")), "26.3": readFileSync(join(wasmDir, "26.3.gwir"))};
+const irs = {[CANONICAL_PROFILE.id]: readFileSync(join(wasmDir, "" + CANONICAL_PROFILE.id + ".gwir")), [RENDERPEARL_PROFILE.id]: readFileSync(join(wasmDir, "" + RENDERPEARL_PROFILE.id + ".gwir"))};
 
 const BOOTSTRAP = `
 const {parentPort, workerData} = require("node:worker_threads");
@@ -79,6 +80,8 @@ function createEnv() {
     },
   });
   vm.runInContext(poolSource, context, {filename: "kernel-pool.js"});
+  context.__gaiusKernelSemantics = {schemaVersion: 1, profile: "fixture", kernels: {worldgen: {enabled: true}}};
+  vm.runInContext(readFileSync(join(kernelsDir, "kernel-mirror.js"), "utf8"), context);
   vm.runInContext(codecSource, context, {filename: "worldgen-job.js"});
   const codec = context.GaiusWorldgenJob;
   const create = (moduleBytes, options) => context.GaiusKernelPool.create({moduleBytes, workerSource, ...options});
@@ -129,8 +132,9 @@ for (const profile of Object.keys(irs)) {
     const surfaced = await codec.surface(pool, gen, plain, {});
     assert.ok(bytesOf(surfaced.bytes).subarray(24).equals(bytesOf(chunks[1].bytes).subarray(24)),
       "the surface job equals the surface inside the terrain job");
-    const biomes = await codec.biomes(pool, gen, 0, 0);
-    assert.deepEqual(Array.from(biomes.ids), Array.from(chunks[0].biomes));
+    await assert.rejects(codec.biomes(pool, gen, 0, 0), /worldgen-fallback:multi-noise/);
+    const retry = await codec.terrain(pool, gen, 0, 0, {surface: true, biomes: true});
+    assert.deepEqual(Array.from(retry.biomes), Array.from(chunks[0].biomes));
     const telemetry = pool.telemetry();
     await env.shutdown(pool);
     return `${chosen.name} module, ${telemetry.completed} jobs, ${telemetry.failed} lazy-load retries`;

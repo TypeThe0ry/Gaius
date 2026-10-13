@@ -1,16 +1,59 @@
 {
   "id": "26.3",
+  "pages": {
+    "enabled": true,
+    "runtimes": ["wasm", "js"]
+  },
   "releaseType": "release",
+  "bringupAllowed": true,
   "protocolVersion": 777,
+  "packetSemantics": {
+    "loginSessionUuid": true,
+    "timeUpdate": "world-clocks"
+  },
+  "tickParity": {
+    "schema": 1,
+    "teleportAcknowledgement": "id-position",
+    "player": "TickParity",
+    "seed": "420040",
+    "ticks": 40,
+    "spawn": {"x": 0, "y": 80, "z": 0},
+    "viewDistance": 2,
+    "simulationDistance": 2,
+    "preloadRadius": 3,
+    "settle": "quiescent",
+    "normalization": {"rules": ["entity-constructor-uuid", "living-entity-constructor-yaw", "recipe-property-set-order", "advancement-progress-order-and-grant-time", "heightmap-type-order", "attribute-snapshot-order", "chunk-broadcast-holder-order"], "advancementPositionBytes": 8},
+    "setupCommands": ["gamerule spawn_mobs false", "gamerule respawn_radius 0", "gamerule advance_time false", "gamerule advance_weather false", "gamerule random_tick_speed 0", "time set 6000", "weather clear", "save-off"],
+    "moves": [{"tick": 4, "x": 0.5, "y": 80, "z": 0.5}, {"tick": 8, "x": 1.5, "y": 80, "z": 0.5}]
+  },
+  "relayProtocol": {
+    "loginLayoutVersion": 1
+  },
   "worldVersion": 5023,
   "javaVersion": 25,
   "classFileVersion": 69,
   "clientDistribution": "named",
   "worldgenTelemetryMode": "task-pulsed",
+  "worldgenReference": {
+    "source": "native/golden/worldgen/v26_3/dev/gaius/golden/worldgen/WorldgenReference.java",
+    "exporter": "mc/shared/renderpearl-1/src/java/dev/gaius/browser/kernel/worldgen/WorldgenExport263.java",
+    "mainClass": "dev.gaius.golden.worldgen.WorldgenReference",
+    "jvmHooks": [
+      "dev/gaius/browser/kernel/worldgen/WorldgenKernel263.java",
+      "dev/gaius/browser/kernel/worldgen/WorldgenKernelHooks263.java",
+      "dev/gaius/browser/kernel/worldgen/ChunkGeneratorKernelHooks263.java",
+      "dev/gaius/browser/kernel/worldgen/WorldgenExport263.java"
+    ],
+    "oreRules": ["BlockMatchTest", "TagMatchTest"],
+    "oreUnionRule": "AnyOfRuleTest",
+    "compatibility": "direct"
+  },
   "patchSet": "modern",
   "extraPatchers": [
     "Minecraft263BrowserPatcher"
   ],
+  "renderSeam": "renderpearl-1",
+  "terrainSectionUniformBlock": true,
   "packVersions": {
     "resource": {
       "major": 97,
@@ -20,6 +63,24 @@
       "major": 121,
       "minor": 0
     }
+  },
+  "inputSeam": "sdl3",
+  "shaderFront": "renderpearl",
+  "bringup": {
+    "shader": {
+      "source": "ShaderXlatCorpusDump.java",
+      "main": "dev.gaius.shaderxlat.ShaderXlatCorpusDump",
+      "arguments": ["webgpu", "{jar}", "{out}"],
+      "frontend": false
+    }
+  },
+  "kernelSemantics": {
+    "code": 2,
+    "meshVertexStride": 28,
+    "floorMode": "math-floor",
+    "synth": "f32",
+    "densityGraph": "sampler-f32",
+    "irVersion": 1
   },
   "storage": {
     "schema": 2,
@@ -34,5 +95,19 @@
     "serverSha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c",
     "assetIndexId": "34",
     "assetIndexSha1": "abfaa525f923f807df8b4e4d29c1b5e3a104adbe"
+  },
+  "kernelMirror": {
+    "lockSha256": "204b2b3441a8a9d8a6df23196f3d5e0c713aa13dfd57484beaaee5e13acd3d76",
+    "enabled": {
+      "noise": true,
+      "mesher": false,
+      "light": true,
+      "worldgen": true,
+      "shaderxlat": true,
+      "ore": false
+    },
+    "quarantined": {
+      "mesher": "Streaming section snapshots diverge between captures; use vanilla meshing until snapshot invalidation is verified."
+    }
   }
 }

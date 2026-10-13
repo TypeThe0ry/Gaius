@@ -40,6 +40,16 @@ import org.objectweb.asm.tree.VarInsnNode;
  * before the buffer start) and throw Buffer(Under|Over)flowException instead of
  * IndexOutOfBoundsException.</li>
  * </ul>
+ * {@code TByteBuffer.allocateDirect} takes the memory of a direct buffer from {@code Heap.alloc},
+ * which hands out a freed block as it is: it still holds the allocator's own bookkeeping (a free
+ * HeapNode leaf leaves height 1 at data offset 12) or the bytes of the buffer that held it before,
+ * while Java zeroes it. Vanilla relies on the zeroes: a new RegionFile keeps the header buffer it
+ * allocated as the location table of the new file, so the wasm server wrote stale bytes as the
+ * sector entries of chunks that were never stored ("Chunk [x, z] header is truncated", "Chunk
+ * found in invalid location", sector offsets out of range). The fix zeroes the block between the
+ * allocation's null check and the construction of the buffer; the JavaScript branch (a new
+ * Int8Array) is zeroed already.
+ *
  * Each fix replaces an exact instruction sequence and fails when the TeaVM code differs; the
  * stack shape never changes, so the original stack map frames are kept. The absolute-accessor
  * check is a new prologue whose branch targets carry frames equal to the method's entry frame.
@@ -60,6 +70,63 @@ public final class TeaVMClasslibWasmGcPatcher {
         fixPutBufferOffset(node);
         checkAbsoluteIndexes(node);
         write(Path.of(args[1]), node);
+        ClassNode byteBuffer = read(args[0], BYTE_BUFFER);
+        zeroAllocateDirect(byteBuffer);
+        write(Path.of(args[1]), byteBuffer);
+    }
+
+    /**
+     * {@code allocateDirect}, WebAssembly GC branch: {@code Heap.alloc(capacity); astore a; aload
+     * a; ifnonnull L; <OutOfMemoryError>; L: new TByteBufferWasmGC} gets {@code
+     * Address.fillZero(a, capacity)} at L. The stack is empty there and the locals stay, so the
+     * frame at L still holds.
+     */
+    static void zeroAllocateDirect(ClassNode node) {
+        MethodNode method = method(node, "allocateDirect", "(I)L" + BYTE_BUFFER + ";");
+        int patched = 0;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof MethodInsnNode call) || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals("org/teavm/runtime/heap/Heap") || !call.name.equals("alloc")
+                    || !call.desc.equals("(I)Lorg/teavm/interop/Address;")) {
+                continue;
+            }
+            AbstractInsnNode store = next(call);
+            AbstractInsnNode load = next(store);
+            AbstractInsnNode check = next(load);
+            if (!(store instanceof VarInsnNode address) || address.getOpcode() != Opcodes.ASTORE
+                    || !(load instanceof VarInsnNode loaded) || loaded.getOpcode() != Opcodes.ALOAD
+                    || loaded.var != address.var
+                    || !(check instanceof JumpInsnNode nonNull) || nonNull.getOpcode() != Opcodes.IFNONNULL) {
+                throw new IllegalStateException(node.name + ".allocateDirect: Heap.alloc is no longer followed "
+                        + "by its null check");
+            }
+            AbstractInsnNode create = next(nonNull.label);
+            if (!(create instanceof TypeInsnNode type) || type.getOpcode() != Opcodes.NEW
+                    || !type.desc.equals("org/teavm/classlib/java/nio/TByteBufferWasmGC")) {
+                throw new IllegalStateException(node.name + ".allocateDirect: the non-null branch of Heap.alloc "
+                        + "no longer builds a TByteBufferWasmGC");
+            }
+            InsnList zero = new InsnList();
+            zero.add(new VarInsnNode(Opcodes.ALOAD, address.var));
+            zero.add(new VarInsnNode(Opcodes.ILOAD, 0));
+            zero.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "org/teavm/interop/Address", "fillZero",
+                    "(Lorg/teavm/interop/Address;I)V", false));
+            method.instructions.insertBefore(create, zero);
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IllegalStateException(node.name + ".allocateDirect: expected one Heap.alloc, found "
+                    + patched);
+        }
+    }
+
+    /** The next instruction after {@code insn}, skipping labels, line numbers and frames. */
+    private static AbstractInsnNode next(AbstractInsnNode insn) {
+        AbstractInsnNode next = insn == null ? null : insn.getNext();
+        while (next != null && next.getOpcode() < 0) {
+            next = next.getNext();
+        }
+        return next;
     }
 
     /** The absolute accessors of TByteBufferNative: name, descriptor, access width in bytes. */

@@ -9,6 +9,7 @@
  * real WebSocket binary frame.
  */
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "../../port/scripts/verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {
     constants as cryptoConstants,
@@ -31,9 +32,7 @@ import { deflateSync, inflateSync } from "node:zlib";
 import { WebSocket as NodeWebSocket } from "./node_modules/ws/wrapper.mjs";
 import {
     decodeClientboundLoginDistances,
-    MINECRAFT_1_21_11,
-    MINECRAFT_26_2,
-    MINECRAFT_26_3,
+    MINECRAFT_PROFILES,
 } from "./dist/protocol.js";
 
 const repository = fileURLToPath(new URL("../../", import.meta.url));
@@ -157,13 +156,13 @@ const STRESS_TIER_TARGETS = Object.freeze({
     }),
 });
 const CANONICAL_PROFILES = Object.freeze({
-    "26.2": Object.freeze({
+    [CANONICAL_PROFILE.id]: Object.freeze({
         protocolVersion: 776,
         worldVersion: 4903,
         javaVersion: 25,
         serverSha1: "823e2250d24b3ddac457a60c92a6a941943fcd6a",
     }),
-    "1.21.11": Object.freeze({
+    [LEGACY_PROFILE.id]: Object.freeze({
         protocolVersion: 774,
         worldVersion: 4671,
         javaVersion: 21,
@@ -171,8 +170,8 @@ const CANONICAL_PROFILES = Object.freeze({
     }),
 });
 const STRICT_RUNTIME_JAVA_POLICY = Object.freeze({
-    "1.21.11": "major-exactly-21",
-    "26.2": "major-at-least-25",
+    [LEGACY_PROFILE.id]: "major-exactly-21",
+    [CANONICAL_PROFILE.id]: "major-at-least-25",
 });
 const RELAY_RUNTIME_GAUGES = Object.freeze([
     "activeLocalTunnelSessions",
@@ -451,7 +450,7 @@ const ARRIVAL_TRACE_EVENT_KIND_SET = new Set(ARRIVAL_TRACE_EVENT_KINDS);
 const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
     "gaius.browser-client-arrival-periodic-server-sync.v1";
 const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
-const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = "26.2";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = CANONICAL_PROFILE.id;
 const ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION = 776;
 const ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID = 113;
 const ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS = 1000;
@@ -8747,7 +8746,7 @@ function assertCanonicalProfile(profile) {
 }
 
 function resolveWireProfile(profile) {
-    const resolved = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3]
+    const resolved = MINECRAFT_PROFILES
         .find((candidate) => candidate.protocolVersion === profile.protocolVersion &&
             candidate.name === profile.id);
     assert.ok(resolved, `unsupported browser full-path profile ${profile.id}/${profile.protocolVersion}`);
@@ -8792,7 +8791,7 @@ async function listen(server, port, host) {
 
 function runtimeJavaMajorMeetsPolicy(profile, major) {
     if (!Number.isSafeInteger(major)) return false;
-    if (releaseEvidenceMode && profile.id === "1.21.11") return major === 21;
+    if (releaseEvidenceMode && profile.id === LEGACY_PROFILE.id) return major === 21;
     return major >= profile.javaVersion;
 }
 
@@ -8847,7 +8846,7 @@ async function resolveJavaExecutable(profile) {
         const version = result.error ?? `Java ${result.major}`;
         diagnostics.push(`${candidate} [${source}]: ${version}`);
     }
-    const policy = releaseEvidenceMode && profile.id === "1.21.11"
+    const policy = releaseEvidenceMode && profile.id === LEGACY_PROFILE.id
         ? "Java 21 exactly"
         : `Java >= ${profile.javaVersion}`;
     throw new Error(`No ${policy} for ${profile.id}: ${diagnostics.join("; ")}`);

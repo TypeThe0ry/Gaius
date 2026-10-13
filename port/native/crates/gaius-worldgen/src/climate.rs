@@ -4,7 +4,8 @@
 //! (stable sorts, the same bucket sizes and cost function), so its shape and
 //! therefore its tie-breaking are vanilla's. Vanilla warm-starts each search
 //! with the previous result of the calling thread; [`Searcher`] keeps that
-//! candidate per job, so results only depend on the job's own query order.
+//! candidate per job, which cannot preserve vanilla's cross-chunk thread history.
+//! Ambiguous biome values therefore require a vanilla context or a declined job.
 
 use crate::ir::ClimateEntry;
 
@@ -247,17 +248,34 @@ impl RTree {
             Kind::SubTree(_) => unreachable!("search returns leaves"),
         }
     }
+
+    fn competing_value(&self, node: u32, target: &[i64; DIMENSIONS], fitness: i64, value: u32) -> bool {
+        if self.distance(node, target) > fitness {
+            return false;
+        }
+        match &self.nodes[node as usize].kind {
+            Kind::Leaf(candidate) => *candidate != value && self.distance(node, target) == fitness,
+            Kind::SubTree(children) => children
+                .iter()
+                .any(|&child| self.competing_value(child, target, fitness, value)),
+        }
+    }
 }
 
 /// One job's view of a tree: the warm-start candidate of `RTree.search`.
 pub struct Searcher<'a> {
     tree: &'a RTree,
     last: Option<u32>,
+    ambiguous: bool,
 }
 
 impl<'a> Searcher<'a> {
     pub fn new(tree: &'a RTree) -> Self {
-        Searcher { tree, last: None }
+        Searcher {
+            tree,
+            last: None,
+            ambiguous: false,
+        }
     }
 
     /// `findValue(Climate.target(...))` for an already quantized target.
@@ -265,13 +283,33 @@ impl<'a> Searcher<'a> {
         let t = [target[0], target[1], target[2], target[3], target[4], target[5], 0];
         let leaf = self.tree.search_node(self.tree.root, &t, self.last);
         self.last = Some(leaf);
-        self.tree.value(leaf)
+        let value = self.tree.value(leaf);
+        self.ambiguous |= self
+            .tree
+            .competing_value(self.tree.root, &t, self.tree.distance(leaf, &t), value);
+        value
+    }
+
+    pub fn is_ambiguous(&self) -> bool {
+        self.ambiguous
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn competing_biomes_require_thread_context_but_duplicate_values_do_not() {
+        let tree = RTree::new(&[entry(0.0, 0.0, 7), entry(0.0, 0.0, 8)], 6);
+        let mut searcher = Searcher::new(&tree);
+        searcher.find([0; 6]);
+        assert!(searcher.is_ambiguous());
+        let tree = RTree::new(&[entry(0.0, 0.0, 7), entry(0.0, 0.0, 7)], 6);
+        let mut searcher = Searcher::new(&tree);
+        assert_eq!(searcher.find([0; 6]), 7);
+        assert!(!searcher.is_ambiguous());
+    }
 
     fn entry(t: f32, h: f32, biome: u32) -> ClimateEntry {
         let q = quantize;

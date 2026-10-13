@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {existsSync} from "node:fs";
@@ -7,6 +8,7 @@ import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {homedir, tmpdir} from "node:os";
 import {basename, delimiter, join} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 
 const scriptsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -14,14 +16,9 @@ const schedulerPath = fileURLToPath(
   new URL("../src/main/java/dev/gaius/browser/BrowserRenderScheduler.java", import.meta.url),
 );
 const scheduler = await readFile(schedulerPath, "utf8");
-const patcher = await readFile(
-  new URL("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java", import.meta.url),
-  "utf8",
-);
-const patcher262 = await readFile(
-  new URL("../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java", import.meta.url),
-  "utf8",
-);
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const patcher = stepSource("MinecraftClientPatcher");
+const patcher262 = stepSource("Minecraft262BrowserPatcher");
 const nativePath = (value) => {
   if (!value) return value;
   const text = String(value);
@@ -56,13 +53,13 @@ const configuredProfileId = process.env.GAIUS_VERSION_PROFILE_PATH
 if (configuredProfileId !== version) {
   throw new Error(`render pipeline smoke is for profile ${version}, got ${configuredProfileId}`);
 }
-if (version !== "26.2") {
-  throw new Error(`render pipeline backpressure smoke is 26.2-only; got profile ${version}`);
+if (version !== CANONICAL_PROFILE.id) {
+  throw new Error(`render pipeline backpressure smoke is ${CANONICAL_PROFILE.id}-only; got profile ${version}`);
 }
 const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY ||
   `${repositoryRoot}/port/work/overlays${process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? `/${version}` : ""}`);
 const overlayJar = `${overlayRoot}/client-named-${version}-gaius.jar`;
-const rawClientJar = join(repositoryRoot, "port/work/26.2/client-named.jar");
+const rawClientJar = join(repositoryRoot, "port/work/" + CANONICAL_PROFILE.id + "/client-named.jar");
 const toolsSource = join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools");
 const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
 const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
@@ -183,7 +180,7 @@ for (const contract of [
   '"finishUberNodeCleanup"',
   '"UberGpuBuffer upload budget patch must run before node cleanup patch"',
 ]) {
-  assert.ok(patcher262.includes(contract), `missing 26.2 progress patch contract: ${contract}`);
+  assert.ok(patcher262.includes(contract), `missing ${CANONICAL_PROFILE.id} progress patch contract: ${contract}`);
 }
 
 function javapFrom(classpath, className) {
@@ -230,7 +227,7 @@ try {
   ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 60_000});
   execFileSync(javaTool("java"), [
     "-classpath", [classesDirectory, patcherClasspath].join(delimiter),
-    "dev.gaius.tools.MinecraftClientPatcher", rawClientJar, patchesDirectory, "26.2",
+    "dev.gaius.tools.MinecraftClientPatcher", rawClientJar, patchesDirectory, CANONICAL_PROFILE.id,
   ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 60_000});
 
   const patchedDispatcher = javapFrom(
@@ -394,7 +391,7 @@ assert.ok(runTask.includes("BrowserRenderScheduler.rememberDispatcherContinuatio
 assert.equal(
   runTask.split("BrowserRenderScheduler.finishDispatcherRun").length - 1,
   3,
-  "not every 26.2 runTask return reports the real dispatcher backlog",
+  "not every " + CANONICAL_PROFILE.id + " runTask return reports the real dispatcher backlog",
 );
 assert.ok(dispose.includes("BrowserRenderScheduler.disposeDispatcher"),
   "dispatcher dispose does not release its queued runner");
@@ -573,11 +570,22 @@ public final class Window {
     public static void cancelAnimationFrame(int requestId) {}
 }
 `],
+    // HostLoop (the JavaScript build's classlib overlay, compiled below) delegates scheduling to
+    // Platform; the stub runs every command inline so the harness stays single-threaded.
+    ["org/teavm/platform/PlatformRunnable.java", String.raw`
+package org.teavm.platform;
+@FunctionalInterface
+public interface PlatformRunnable {
+    void run();
+}
+`],
     ["org/teavm/platform/Platform.java", String.raw`
 package org.teavm.platform;
 public final class Platform {
     private Platform() {}
-    public static void schedule(Runnable command, int timeout) { command.run(); }
+    public static void startThread(PlatformRunnable command) { command.run(); }
+    public static int schedule(PlatformRunnable command, int timeout) { command.run(); return 1; }
+    public static void killSchedule(int id) {}
 }
 `],
     ["dev/gaius/browser/render/BrowserMeshInstallQueue.java", String.raw`
@@ -761,16 +769,32 @@ public final class BrowserRenderSchedulerUberCleanupRegression {
     await writeFile(sourcePath, contents);
     sourcePaths.push(sourcePath);
   }
-  execFileSync(javaTool("javac"), ["--release", "17", "-d", classesDirectory, schedulerPath, ...sourcePaths], {
+  // The scheduler publishes telemetry through Float64Array views (JsArrays) and starts its pump
+  // through HostLoop; both compile unchanged from the JavaScript build's classlib overlay
+  // against TeaVM's JSO jars and the Platform stub above.
+  const teavmRoot = join(homedir(), ".m2/repository/org/teavm");
+  const teavmClasspath = ["teavm-interop", "teavm-jso", "teavm-jso-apis"]
+    .map((name) => join(teavmRoot, name, "0.15.0", `${name}-0.15.0.jar`));
+  for (const jar of teavmClasspath) {
+    assert.ok(existsSync(jar), `missing TeaVM JSO jar for the render scheduler harness: ${jar}`);
+  }
+  const classlibOverlay = join(repositoryRoot, "port/overrides/classlib/src/main/java/dev/gaius/browser");
+  const runtimeClasspath = [classesDirectory, ...teavmClasspath].join(delimiter);
+  execFileSync(javaTool("javac"), [
+    "--release", "17", "-proc:none", "-classpath", teavmClasspath.join(delimiter),
+    "-d", classesDirectory, schedulerPath,
+    join(classlibOverlay, "HostLoop.java"), join(classlibOverlay, "JsArrays.java"),
+    ...sourcePaths,
+  ], {
     cwd: scriptsDirectory,
     stdio: "inherit",
   });
-  execFileSync(javaTool("java"), ["-cp", classesDirectory,
+  execFileSync(javaTool("java"), ["-cp", runtimeClasspath,
     "dev.gaius.browser.BrowserRenderSchedulerRetryRegression"], {
     cwd: scriptsDirectory,
     stdio: "inherit",
   });
-  execFileSync(javaTool("java"), ["-cp", classesDirectory,
+  execFileSync(javaTool("java"), ["-cp", runtimeClasspath,
     "dev.gaius.browser.BrowserRenderSchedulerUberCleanupRegression"], {
     cwd: scriptsDirectory,
     stdio: "inherit",

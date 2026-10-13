@@ -5,7 +5,7 @@
 
 use crate::ir::{IrError, NoiseDef, NoiseParams};
 use gaius_noise::synth32::{NoiseStack, NormalNoise, NormalNoiseParameters, Normalization};
-use gaius_noise::{synth64, PositionalRandomFactory, Profile, RandomKind, RandomSource};
+use gaius_noise::{synth64, PositionalRandomFactory, RandomKind, RandomSource, Semantics};
 
 #[derive(Clone, Debug)]
 pub enum NoiseInst {
@@ -108,7 +108,7 @@ fn recipe(params: &NoiseParams) -> NormalNoiseParameters {
 /// Builds every noise exactly like `RandomState` (`Noises.instantiate` and the nether
 /// legacy biome special cases).
 pub fn instantiate(
-    profile: Profile,
+    semantics: Semantics,
     seed: i64,
     factory: &PositionalRandomFactory,
     defs: &[NoiseDef],
@@ -119,7 +119,7 @@ pub fn instantiate(
                 Some(offset) => RandomSource::new(RandomKind::Legacy, seed.wrapping_add(offset)),
                 None => factory.from_hash_of(&def.name),
             };
-            if profile.uses_synth32() {
+            if semantics.uses_synth32() {
                 let noise = NormalNoise::new(recipe(&def.params));
                 Ok(NoiseInst::Stack(if def.legacy_nether_offset.is_some() {
                     noise.create_for_legacy_nether_biome(&mut random)
@@ -137,7 +137,7 @@ pub fn instantiate(
                         def.name
                     )));
                 };
-                let floor = profile.floor_mode();
+                let floor = semantics.floor_mode;
                 Ok(NoiseInst::Normal(if def.legacy_nether_offset.is_some() {
                     synth64::NormalNoise::create_legacy_nether_biome(&mut random, *first_octave, amplitudes, floor)
                 } else {

@@ -1,23 +1,25 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 
 const scriptsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const benchmarkPath = fileURLToPath(new URL("./chrome-chunk-benchmark.mjs", import.meta.url));
 const benchmarkSource = await readFile(benchmarkPath, "utf8");
 const isolatedBenchmarkEnvironment = {
   ...process.env,
-  GAIUS_VERSION_PROFILE_PATH: "versions/26.2.json",
-  GAIUS_BUILD_ROOT: "port/target/26.2",
+  GAIUS_VERSION_PROFILE_PATH: "versions/" + CANONICAL_PROFILE.id + ".json",
+  GAIUS_BUILD_ROOT: "port/target/" + CANONICAL_PROFILE.id + "",
   // Allow the caller to point the smoke at an independently hashed release
   // dist (for example a cluster artifact) while retaining the profile/build
   // identity contract below.  The default remains the repository profile
   // directory and still fails closed when its manifest is stale.
-  GAIUS_DIST_DIRECTORY: process.env.GAIUS_DIST_DIRECTORY || "port/web/dist/26.2",
-  GAIUS_OVERLAY_DIRECTORY: "port/work/overlays/26.2",
+  GAIUS_DIST_DIRECTORY: process.env.GAIUS_DIST_DIRECTORY || "port/web/dist/" + CANONICAL_PROFILE.id + "",
+  GAIUS_OVERLAY_DIRECTORY: "port/work/overlays/" + CANONICAL_PROFILE.id + "",
 };
 const configuration = JSON.parse(execFileSync(
   process.execPath,
@@ -37,8 +39,8 @@ assert.equal(configuration.workerDistanceMode, "natural-observation");
 assert.equal(configuration.workerDistancePin, false);
 assert.equal(configuration.workerDistanceContract.mode, "natural-observation");
 assert.equal(configuration.workerDistanceContract.releaseEligible, true);
-assert.equal(configuration.workerDistanceContract.releaseTargetProfile, "26.2");
-assert.equal(configuration.workerDistanceContract.activeProfileId, "26.2");
+assert.equal(configuration.workerDistanceContract.releaseTargetProfile, CANONICAL_PROFILE.id);
+assert.equal(configuration.workerDistanceContract.activeProfileId, CANONICAL_PROFILE.id);
 assert.equal(configuration.workerDistanceContract.expectedStartDistance, "8:6");
 assert.equal(
   configuration.workerDistanceContract.effectiveDistanceModel,
@@ -51,31 +53,30 @@ assert.equal(
 const performanceContract = JSON.parse(await readFile(configuration.contractPath, "utf8"));
 assert.equal(String(performanceContract.environment?.graphicsPreset).toLowerCase(), "fancy",
   "the natural 8:6 distance profile must seed the FANCY graphics preset");
-const browserPatcherSource = await readFile(fileURLToPath(new URL(
-  "../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java", import.meta.url,
-)), "utf8");
+// The modern patch set step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const browserPatcherSource = stepSource("Minecraft262BrowserPatcher");
 assert.match(browserPatcherSource,
   /graphicsPresetArm\(apply, presetSwitch, 1, "FANCY", 16\)/,
-  "26.2 patcher must locate the ordinal-one FANCY preset arm");
+  "" + CANONICAL_PROFILE.id + " patcher must locate the ordinal-one FANCY preset arm");
 assert.match(browserPatcherSource,
   /"FANCY",\s*"renderDistance",\s*16\);[\s\S]*?"FANCY",\s*"simulationDistance",\s*12\);\s*fancyRenderDistance\.operand = 8;\s*fancySimulationDistance\.operand = 6;/,
-  "26.2 patcher must pin the FANCY preset to the browser 8/6 distances");
+  "" + CANONICAL_PROFILE.id + " patcher must pin the FANCY preset to the browser 8/6 distances");
 assert.match(browserPatcherSource,
   /"FABULOUS",\s*"renderDistance",\s*32\);[\s\S]*?"FABULOUS",\s*"simulationDistance",\s*12\);[\s\S]*?fabulousRenderDistance\.operand = 8;\s*fabulousSimulationDistance\.operand = 6;/,
-  "26.2 patcher must pin the FABULOUS preset to the browser 8/6 distances");
+  "" + CANONICAL_PROFILE.id + " patcher must pin the FABULOUS preset to the browser 8/6 distances");
 assert.doesNotMatch(browserPatcherSource, /GraphicsPreset\.CUSTOM|"CUSTOM"/,
-  "26.2 distance contract must not switch the graphics preset to CUSTOM");
+  "" + CANONICAL_PROFILE.id + " distance contract must not switch the graphics preset to CUSTOM");
 assert.equal(configuration.activeVersionProfile.storageSchema, 2);
 assert.match(configuration.activeVersionProfile.storageDatabaseName, /^gaius-fs-v2-/);
 assert.match(configuration.activeVersionProfile.storagePrefix, /^gaius\.fs\.v2:/);
 assert.match(configuration.activeVersionProfile.storageOpfsDirectory, /^regions-v2-/);
 assert.equal(configuration.isolatedEnvironment, true);
 assert.equal(configuration.attachMode, "disabled-input-required");
-assert.equal(configuration.distRoot.endsWith("\\26.2") || configuration.distRoot.endsWith("/26.2"), true);
-assert.equal(configuration.buildIdentity.profile, "26.2");
-assert.equal(configuration.buildIdentity.profilePath, "versions/26.2.json");
-assert.equal(configuration.buildIdentity.nestedProfile.id, "26.2");
-assert.equal(configuration.buildIdentity.nestedProfile.path, "versions/26.2.json");
+assert.equal(configuration.distRoot.endsWith("\\" + CANONICAL_PROFILE.id + "") || configuration.distRoot.endsWith("/" + CANONICAL_PROFILE.id + ""), true);
+assert.equal(configuration.buildIdentity.profile, CANONICAL_PROFILE.id);
+assert.equal(configuration.buildIdentity.profilePath, "versions/" + CANONICAL_PROFILE.id + ".json");
+assert.equal(configuration.buildIdentity.nestedProfile.id, CANONICAL_PROFILE.id);
+assert.equal(configuration.buildIdentity.nestedProfile.path, "versions/" + CANONICAL_PROFILE.id + ".json");
 assert.equal(configuration.buildIdentity.nestedProfile.protocolVersion, 776);
 assert.equal(configuration.buildIdentity.nestedProfile.worldVersion, 4903);
 const pinConfiguration = JSON.parse(execFileSync(
@@ -92,7 +93,7 @@ assert.equal(pinConfiguration.workerDistanceMode, "harness-pin-diagnostic");
 assert.equal(pinConfiguration.workerDistancePin, true);
 assert.equal(pinConfiguration.workerDistanceContract.mode, "harness-pin-diagnostic");
 assert.equal(pinConfiguration.workerDistanceContract.releaseEligible, false);
-assert.equal(pinConfiguration.workerDistanceContract.releaseTargetProfile, "26.2");
+assert.equal(pinConfiguration.workerDistanceContract.releaseTargetProfile, CANONICAL_PROFILE.id);
 assert.equal(pinConfiguration.gating, false);
 assert.equal(pinConfiguration.releaseEvidence, false);
 assert.equal(pinConfiguration.mode, "diagnostic-pin-non-gating");

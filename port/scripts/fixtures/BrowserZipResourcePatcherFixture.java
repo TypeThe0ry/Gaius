@@ -38,7 +38,7 @@ public final class BrowserZipResourcePatcherFixture {
     }
 
     private static void invokePrivatePatch(Path jar, Path output) throws Exception {
-        Class<?> patcher = Class.forName("dev.gaius.tools.MinecraftClientPatcher");
+        Class<?> patcher = Class.forName("dev.gaius.tools.patches.resources.ResourcePatches");
         Method method = patcher.getDeclaredMethod("patchFilePackResourcesBrowserIndex", String.class, Path.class);
         method.setAccessible(true);
         try {

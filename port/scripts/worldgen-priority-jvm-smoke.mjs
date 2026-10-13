@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { VERSION_PROFILES } from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -16,7 +17,7 @@ const rawJarOption = option("--raw-jar");
 if (!patchedJarOption === !rawJarOption) {
   console.error("usage: node port/scripts/worldgen-priority-jvm-smoke.mjs "
     + "(--jar PATCHED_CLIENT.jar | --raw-jar port/work/<version>/client-named.jar) "
-    + "[--classpath-file classpath.txt]");
+    + "[--classpath-file classpath.txt] [--profile PROFILE]");
   process.exit(2);
 }
 
@@ -84,6 +85,9 @@ function schedulerSourceForJvm() {
 try {
   let jar = patchedJarOption ? resolve(patchedJarOption) : null;
   if (rawJar) {
+    const profileId = option("--profile") || basename(dirname(rawJar));
+    const profile = VERSION_PROFILES.find((candidate) => candidate.id === profileId);
+    assert.ok(profile, "raw jar requires a known profile directory or --profile PROFILE");
     // Patch a private copy with the production patcher; never touch the fetched input.
     const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
     const asmClasspath = [join(asmRoot, "asm/9.8/asm-9.8.jar"),
@@ -94,16 +98,13 @@ try {
     mkdirSync(patchOutput, { recursive: true });
     jar = join(root, "client-patched.jar");
     copyFileSync(rawJar, jar);
-    // The patcher registers the light and worldgen kernel patches (tools/kernel); -sourcepath
-    // picks up anything else they reference.
+    // The patcher registers the light and worldgen kernel patches (the light and worldgen domain
+    // packages); -sourcepath picks them up with anything else they reference.
     const toolSources = join(repositoryRoot, "port/tools/src/main/java");
-    const kernelPatches = join(toolSources, "dev/gaius/tools/kernel");
     run(javac, ["--release", "21", "-proc:none", "-classpath", asmClasspath, "-sourcepath", toolSources,
-      "-d", toolClasses, join(toolSources, "dev/gaius/tools/MinecraftServerWorkerPatcher.java"),
-      ...readdirSync(kernelPatches).filter((name) => name.endsWith(".java")).sort()
-        .map((name) => join(kernelPatches, name))],
+      "-d", toolClasses, join(toolSources, "dev/gaius/tools/MinecraftServerWorkerPatcher.java")],
       "patcher compile");
-    const patchLog = run(java, ["-classpath", [toolClasses, asmClasspath].join(delimiter),
+    const patchLog = run(java, [`-Dgaius.profile=${profile.id}`, "-classpath", [toolClasses, asmClasspath].join(delimiter),
       "dev.gaius.tools.MinecraftServerWorkerPatcher", jar, patchOutput], "MinecraftServerWorkerPatcher");
     assert.match(patchLog, /budgeted bookkeeping turns/,
       "patcher fell back to single-task turns on a StrictQueue-shaped client");

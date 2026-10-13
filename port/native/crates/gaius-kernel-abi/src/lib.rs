@@ -63,10 +63,17 @@ pub mod kind {
     pub const TERRAIN: u16 = WORLDGEN_FAMILY | 0x03;
     /// `run_surface`: surface rules over a filled chunk.
     pub const SURFACE: u16 = WORLDGEN_FAMILY | 0x04;
+    pub const ORE: u16 = WORLDGEN_FAMILY | 0x05;
     /// Shader translation.
     pub const SHADER_FAMILY: u16 = 0x0500;
     /// `run_shader_xlat`: one SPIR-V module to WGSL.
     pub const SHADER_XLAT: u16 = SHADER_FAMILY | 0x01;
+    /// `run_shader_link`: reflects and rebinds a blaze3d pipeline's two shaderc modules.
+    pub const SHADER_LINK: u16 = SHADER_FAMILY | 0x02;
+    /// PNG image decoding.
+    pub const PNG_FAMILY: u16 = 0x0700;
+    /// `run_png_decode`: encoded PNG to the browser STB override pixel layout.
+    pub const PNG_DECODE: u16 = PNG_FAMILY | 0x01;
 }
 
 /// Run status, stored in [`RunDescriptor`] and [`ResultHeader`].

@@ -14,6 +14,12 @@ maven_path() {
 config="$root/port/config.json"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
+# The storage allow-lists in the sources (page, Worker and file system layers) are generated
+# from port/versions/*.json by port/tools/profilegen; a profile added or changed without
+# regenerating them would build a client that refuses its own storage.  The check's report
+# goes to stderr: callers take this script's stdout as the path of the POM it wrote.
+node "$root/port/tools/profilegen/profilegen.mjs" --check >&2 \
+  || { echo "Run node port/tools/profilegen/profilegen.mjs --write and commit the result" >&2; exit 1; }
 gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
@@ -113,7 +119,7 @@ case "$teavm_role" in
     default_max_top_level_names=80000
     default_sync_clinits=true
     default_sync_monitors=true
-    default_async_barrier="$teavm_all_barrier_groups"
+    default_async_barrier="object,throwable,map,collection,stringbuilder"
     default_pin_runtime_names=true
     ;;
   *)
@@ -214,23 +220,26 @@ excluded_library_prefixes="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:-}"
 # method signatures. Keep the source available for the named profile while
 # excluding it from the legacy client compilation set.
 compiler_source_excludes=""
-if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "obfuscated-with-mappings" ]]; then
-  compiler_source_excludes="            <excludes>
-              <exclude>dev/gaius/browser/PlatformSmoke.java</exclude>
-              <exclude>dev/gaius/browser/BrowserProfile.java</exclude>
-              <exclude>dev/gaius/browser/BrowserProfileScreen.java</exclude>
-              <exclude>dev/gaius/browser/BrowserSectionAudit.java</exclude>
-            </excludes>"
+compile_excludes=$(node "$root/port/tools/sourcesets/sourcesets.mjs" compiler-excludes \
+  --profile "$version" --target "$teavm_target" --root "$root")
+if [[ -n "$compile_excludes" ]]; then
+  compiler_source_excludes="            <excludes>"
+  while IFS= read -r source; do
+    compiler_source_excludes+=$'\n'"              <exclude>$source</exclude>"
+  done <<<"$compile_excludes"
+  compiler_source_excludes+=$'\n'"            </excludes>"
 fi
 
-# Profile source sets: port/src/main/java is shared by every profile.
-# port/src/versions/<profile>/java replaces shared files with the same relative
-# path (and may add new ones), and port/src/versions/<profile>/excludes.txt
-# lists shared relative paths the profile does not compile (format: see
-# gaius_version_excludes in version-profile.sh).  The merged tree is staged
-# under $build_root/sources and becomes the only Maven source directory.  A
-# profile without a version directory stages an exact copy of
-# port/src/main/java (every current profile, 1.21.11, 26.2 and 26.3, has one).
+# Profile source sets: port/src/main/java is shared by every profile, and the
+# source sets of port/mc/shared that the profile's fields select (render seam
+# generation, patch set; port/mc/shared/sourcesets.json) are laid over it: each
+# set's src/excludes.txt drops shared relative paths, its src/java files replace
+# the files with the same relative path (and may add new ones), and its
+# relocations.tsv moves vanilla packages in the code of the files it did not
+# provide; port/src/target-<target>/java comes last.  No profile id selects a
+# source directory, so a new profile with known fields needs no source change.
+# port/tools/sourcesets/sourcesets.mjs stages the merged tree under
+# $build_root/sources, which becomes the only Maven source directory.
 #
 # The staged tree is replaced only when its content changes, and a replaced
 # tree is copied without preserving modification times.  A staged path can
@@ -241,32 +250,15 @@ fi
 # replaced tree is newer than any class compiled before, so Maven recompiles
 # (it rebuilds the whole module on any change anyway), while an unchanged tree
 # keeps its times and an unchanged rebuild stays up to date.
-shared_source_root="$root/port/src/main/java"
-version_source_root="$root/port/src/versions/$version/java"
-version_source_excludes="$root/port/src/versions/$version/excludes.txt"
-target_source_root="$root/port/src/target-$teavm_target/java"
 staged_source_directory="$build_root/sources"
 
 stage_profile_sources() {
   local staging="$staged_source_directory.staging.$$"
-  local excludes
-  local excluded
-  excludes="$(gaius_version_excludes "$version_source_excludes" "$shared_source_root")" \
-    || exit 1
   rm -rf "$staging"
-  mkdir -p "$staging"
-  cp -R "$shared_source_root/." "$staging/"
-  while IFS= read -r excluded; do
-    if [[ -n "$excluded" ]]; then
-      rm -f "$staging/$excluded"
-    fi
-  done <<<"$excludes"
-  if [[ -d "$version_source_root" ]]; then
-    cp -R "$version_source_root/." "$staging/"
-  fi
-  if [[ -d "$target_source_root" ]]; then
-    cp -R "$target_source_root/." "$staging/"
-  fi
+  node "$root/port/tools/sourcesets/sourcesets.mjs" stage --kind src \
+    --profile "$(maven_path "$GAIUS_VERSION_PROFILE")" --target "$teavm_target" \
+    --out "$(maven_path "$staging")" >&2 \
+    || exit 1
   if [[ -d "$staged_source_directory" ]] \
       && diff -rq "$staged_source_directory" "$staging" >/dev/null 2>&1; then
     rm -rf "$staging"
@@ -310,6 +302,37 @@ for boolean_name in source_maps_generated debug_information_generated minifying 
   esac
 done
 
+# WebAssembly GC symbols (v0.4.0 WP8).  For the wasmgc target GAIUS_MINIFYING
+# is TeaVM's obfuscation switch, which only leaves out the wasm name section
+# (77.6 MB of the 154 MB SIMPLE client); build-wasmgc.sh --release keeps it and
+# splits it into a symbol file instead.  GAIUS_DEBUG_INFO=true writes TeaVM's
+# line and method tables, the input of its WebAssembly GC stack deobfuscator,
+# either into a separate <target file>.teadbg next to the module (EXTERNAL, the
+# default) or into custom sections of the module (EMBEDDED); TeaVM 0.15 fills
+# them for SIMPLE builds and for very few functions of an ADVANCED one.  An
+# obfuscated module without debug information could not be symbolized at all,
+# so that combination is refused unless GAIUS_WASM_ALLOW_NO_SYMBOLS=true.  None
+# of this applies to, or changes, a js POM.
+wasm_debug_info_element=""
+if [[ "$teavm_target" == wasmgc ]]; then
+  wasm_debug_info_location="${GAIUS_WASM_DEBUG_INFO_LOCATION:-EXTERNAL}"
+  case "$wasm_debug_info_location" in
+    EXTERNAL|EMBEDDED) ;;
+    *)
+      echo "Invalid GAIUS_WASM_DEBUG_INFO_LOCATION: $wasm_debug_info_location (expected EXTERNAL or EMBEDDED)" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$minifying" == true && "$debug_information_generated" != true \
+      && "${GAIUS_WASM_ALLOW_NO_SYMBOLS:-false}" != true ]]; then
+    echo "An obfuscated wasmgc build (GAIUS_MINIFYING=true) needs GAIUS_DEBUG_INFO=true for its deobfuscation file" >&2
+    echo "(set GAIUS_WASM_ALLOW_NO_SYMBOLS=true to build a module that cannot be symbolized)" >&2
+    exit 1
+  fi
+  wasm_debug_info_element="              <wasmDebugInfoLocation>$wasm_debug_info_location</wasmDebugInfoLocation>
+"
+fi
+
 if [[ ! -f "$metadata" || ! -f "$client" || ! -f "$patched_classlib" ]]; then
   echo "Run fetch-version.sh and remap-client.sh first" >&2
   echo "Then run build-overlays.sh" >&2
@@ -345,9 +368,9 @@ if [[ -n "${GAIUS_TEAVM_ASYNC_DUMP:-}" ]]; then
 fi
 # JSPI mode (v0.4.0 design D3): the wasmgc roles compile no method as a coroutine and
 # suspend through WebAssembly.Suspending imports instead (GaiusTeaVMOptions.JSPI).
-# GAIUS_TEAVM_JSPI=false keeps TeaVM's coroutine (Fiber) mode for comparison runs.
+# The coroutine mode was removed: GaiusTeaVMOptions.platformTags fails a wasmgc role without it.
 jspi_properties=""
-if [[ "$teavm_target" == wasmgc && "${GAIUS_TEAVM_JSPI:-true}" == "true" ]]; then
+if [[ "$teavm_target" == wasmgc ]]; then
   jspi_properties="                <property>
                   <name>gaius.teavm.jspi</name>
                   <value>true</value>
@@ -545,7 +568,7 @@ $compiler_source_excludes
               <assertionsRemoved>$assertions_removed</assertionsRemoved>
               <stopOnErrors>true</stopOnErrors>
               <maxTopLevelNames>$max_top_level_names</maxTopLevelNames>
-${target_type_element}              <properties>
+${target_type_element}${wasm_debug_info_element}              <properties>
                 <property>
                   <name>gaius.teavm.role</name>
                   <value>$teavm_role</value>

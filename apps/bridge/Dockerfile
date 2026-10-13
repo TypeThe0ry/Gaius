@@ -6,6 +6,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 
 COPY dist ./dist
+COPY protocols ./protocols
 
 ENV NODE_ENV=production
 ENV GAIUS_BRIDGE_HOST=0.0.0.0

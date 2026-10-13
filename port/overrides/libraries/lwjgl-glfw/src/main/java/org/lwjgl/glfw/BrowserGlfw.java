@@ -41,6 +41,10 @@ public final class BrowserGlfw {
 
     private static boolean shouldClose;
     private static int swapInterval;
+    /** GLFW_CLIENT_API of the next window: OpenGL (a WebGL 2 context) or GLFW_NO_API (none). */
+    private static int clientApiHint = GLFW.GLFW_OPENGL_API;
+    private static int windowClientApi = GLFW.GLFW_OPENGL_API;
+    private static boolean windowOpen;
     private static double cursorX;
     private static double cursorY;
     private static ByteBuffer videoModeMemory;
@@ -49,6 +53,7 @@ public final class BrowserGlfw {
     }
 
     public static boolean init() {
+        installCanvasHost();
         installDomBridge();
         return true;
     }
@@ -57,21 +62,48 @@ public final class BrowserGlfw {
     }
 
     public static void defaultWindowHints() {
+        clientApiHint = GLFW.GLFW_OPENGL_API;
     }
 
+    /** Only GLFW_CLIENT_API matters: GLFW_NO_API windows (a WebGPU backend) never get a GL context. */
     public static void windowHint(int hint, int value) {
+        if (hint == GLFW.GLFW_CLIENT_API) {
+            clientApiHint = value;
+        }
     }
 
     public static void windowHintString(int hint, CharSequence value) {
     }
 
+    /**
+     * Adopts (or creates) the game canvas. The WebGL 2 context is not taken here (PLAN-DELTA 3.4):
+     * an OpenGL window gets it at {@link #makeContextCurrent}, or from the first read of
+     * {@code window.__gaiusWebGL}, whichever comes first; a GLFW_NO_API window never does, so a
+     * WebGPU backend can take the canvas instead.
+     */
     public static long createWindow(int width, int height, CharSequence title, long monitor, long share) {
+        installCanvasHost();
         createCanvas(width, height, title == null ? "Minecraft" : title.toString());
+        windowClientApi = clientApiHint;
+        windowOpen = true;
+        if (windowClientApi != GLFW.GLFW_NO_API) {
+            deferContext();
+        }
         shouldClose = false;
         return WINDOW;
     }
 
+    /**
+     * Drops a context that was never made current and gives the next window a fresh canvas when
+     * this one holds a context another API cannot share (a WebGPU backend that gave up after
+     * configuring it; PLAN-DELTA 3.4 rule 2). A WebGL 2 context stays for the next GL window.
+     */
     public static void destroyWindow(long window) {
+        if (window != WINDOW || !windowOpen) {
+            return;
+        }
+        windowOpen = false;
+        releaseWindowCanvas();
     }
 
     public static boolean windowShouldClose(long window) {
@@ -404,10 +436,13 @@ public final class BrowserGlfw {
     }
 
     public static void makeContextCurrent(long window) {
+        if (window == WINDOW && windowOpen && windowClientApi != GLFW.GLFW_NO_API) {
+            attachContext();
+        }
     }
 
     public static long getCurrentContext() {
-        return WINDOW;
+        return windowOpen && windowClientApi == GLFW.GLFW_NO_API ? 0L : WINDOW;
     }
 
     @JSBody(script = """
@@ -484,16 +519,15 @@ public final class BrowserGlfw {
     private static native boolean swapBuffersJs();
 
     /**
-     * The per-frame yield after a present. In the JSPI WebAssembly GC build (HostLoop.jspi(),
-     * constant-folded) the thread parks until the same frame-yield callback fires, without
-     * TeaVM's coroutines; a present from a JS callback (no thread to suspend) skips the yield,
-     * as the coroutine build does.
+     * The per-frame yield after a present. The WebAssembly GC build (HostLoop.jspi(),
+     * constant-folded) does not yield here: the present only records its swap interval, and the
+     * patched Minecraft.run waits for the next frame at the head of its loop
+     * (HostLoop.awaitAnimationFrame, design D4) with the pacing of scheduleFrameYield
+     * (gaius-jspi.js), so the browser gets its turn between two frames and never inside one.
      */
     private static void presentYield(boolean hidden, int interval) {
         if (HostLoop.jspi()) {
-            if (HostLoop.canSuspend()) {
-                HostLoop.awaitHost(resume -> scheduleFrameYield(hidden, interval, resume::run));
-            }
+            HostLoop.framePresented(hidden, interval);
             return;
         }
         yieldAfterPresent(hidden, interval);
@@ -1220,14 +1254,82 @@ public final class BrowserGlfw {
             """)
     private static native void installDomBridge();
 
+    /**
+     * The game canvas registry shared with the SDL shim and the WebGPU glue
+     * ({@code window.__gaiusCanvasHost}): {@code current()} is the element with the canvas id
+     * ({@code mc-canvas}, named only here), {@code replace(reason)} swaps it
+     * for a fresh element with the same attributes and size. A canvas keeps the kind of its first
+     * context for life (marked as {@code __gaiusContextKind}), so a backend that follows another
+     * one in the same session needs a new element (PLAN-DELTA 3.4 rule 2).
+     */
+    @JSBody(script = """
+            const w = window;
+            if (w.__gaiusCanvasHost && w.__gaiusCanvasHost.version >= 1) return;
+            const host = {
+              version: 1,
+              id: 'mc-canvas',
+              replacements: 0,
+              lastReason: '',
+              hooks: []
+            };
+            host.current = function () {
+              return document.getElementById(host.id);
+            };
+            host.ensure = function () {
+              let canvas = host.current();
+              if (!canvas) {
+                canvas = document.createElement('canvas');
+                canvas.id = host.id;
+                canvas.tabIndex = 0;
+                document.body.appendChild(canvas);
+              }
+              return canvas;
+            };
+            host.replace = function (reason) {
+              const previous = host.current();
+              const canvas = document.createElement('canvas');
+              if (previous) {
+                const attributes = previous.attributes;
+                for (let index = 0; index < attributes.length; index++) {
+                  canvas.setAttribute(attributes[index].name, attributes[index].value);
+                }
+                canvas.width = previous.width;
+                canvas.height = previous.height;
+                const focused = document.activeElement === previous;
+                previous.replaceWith(canvas);
+                if (focused && canvas.focus) canvas.focus();
+              } else {
+                canvas.id = host.id;
+                canvas.tabIndex = 0;
+                document.body.appendChild(canvas);
+              }
+              host.replacements++;
+              host.lastReason = String(reason || '');
+              w.__gaiusCanvasRect = null;
+              for (let index = 0; index < host.hooks.length; index++) {
+                try {
+                  host.hooks[index](canvas, previous, host.lastReason);
+                } catch (ignored) {
+                  // A failing hook must not keep the canvas from being replaced.
+                }
+              }
+              try {
+                w.dispatchEvent(new CustomEvent('gaius:canvas-replaced',
+                  {detail: {canvas: canvas, previous: previous, reason: host.lastReason}}));
+              } catch (ignored) {
+                // Listeners are optional.
+              }
+              return canvas;
+            };
+            host.onReplace = function (hook) {
+              if (typeof hook === 'function') host.hooks.push(hook);
+            };
+            w.__gaiusCanvasHost = host;
+            """)
+    private static native void installCanvasHost();
+
     @JSBody(params = {"width", "height", "title"}, script = """
-            let canvasElement=document.getElementById('mc-canvas');
-            if (!canvasElement) {
-              canvasElement=document.createElement('canvas');
-              canvasElement.id='mc-canvas';
-              canvasElement.tabIndex=0;
-              document.body.appendChild(canvasElement);
-            }
+            const canvasElement=window.__gaiusCanvasHost.ensure();
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
             } else {
@@ -1240,32 +1342,113 @@ public final class BrowserGlfw {
               canvasElement.height=Math.max(1,Math.round(height*pixelRatio));
             }
             document.title=title; canvasElement.focus();
-            let preserveDrawingBuffer = false;
-            try {
-              preserveDrawingBuffer = new URLSearchParams(location.search).get('preserveDrawingBuffer') === '1';
-            } catch (ignored) {
-              preserveDrawingBuffer = false;
-            }
-            window.__gaiusWebGL=canvasElement.getContext('webgl2',{
-              alpha:false,
-              antialias:false,
-              depth:true,
-              stencil:true,
-              powerPreference:'high-performance',
-              preserveDrawingBuffer: preserveDrawingBuffer
-            });
-            if (!window.__gaiusWebGL) throw new Error('WebGL 2 is required');
-            // Lets the quality runtime enable its extensions on the game context before
-            // the first frame instead of attaching lazily.
-            if (window.GaiusQuality && window.GaiusQuality.runtime) {
-              try {
-                window.GaiusQuality.runtime.onContext(window.__gaiusWebGL);
-              } catch (ignored) {
-                // The runtime reports its own failures; the context stays usable.
-              }
-            }
             """)
     private static native void createCanvas(int width, int height, String title);
+
+    /**
+     * An OpenGL window whose context is not current yet: {@code window.__gaiusWebGL} becomes an
+     * accessor that attaches the context on its first read (the GL shim and the quality layer
+     * read it there), then turns back into a plain value. A context that already lives on the
+     * canvas (a second GL window) is kept. The 1.21.11 WebGPU device factory ({@code D0Devices})
+     * uses this state ({@code window.__gaiusGlfwContext}: {@code pending}, {@code gl}) to keep the
+     * context off the canvas WebGPU renders to.
+     */
+    @JSBody(script = """
+            const w = window;
+            const state = w.__gaiusGlfwContext || (w.__gaiusGlfwContext = {gl: null, pending: false, attached: 0});
+            const current = w.__gaiusCanvasHost.current();
+            if (state.gl && current && state.gl.canvas === current) {
+              state.pending = false;
+              Object.defineProperty(w, '__gaiusWebGL',
+                {configurable: true, enumerable: true, writable: true, value: state.gl});
+              return;
+            }
+            state.gl = null;
+            state.pending = true;
+            w.__gaiusGlfwAttachContext = function () {
+              if (!state.pending) return state.gl;
+              state.pending = false;
+              let preserveDrawingBuffer = false;
+              try {
+                preserveDrawingBuffer = new URLSearchParams(location.search).get('preserveDrawingBuffer') === '1';
+              } catch (ignored) {
+                preserveDrawingBuffer = false;
+              }
+              const attributes = {
+                alpha: false,
+                antialias: false,
+                depth: true,
+                stencil: true,
+                powerPreference: 'high-performance',
+                preserveDrawingBuffer: preserveDrawingBuffer
+              };
+              const host = w.__gaiusCanvasHost;
+              let canvasElement = host.ensure();
+              let gl = canvasElement.getContext('webgl2', attributes);
+              if (!gl) {
+                // The canvas already holds another kind of context (an abandoned WebGPU attempt):
+                // PLAN-DELTA 3.4 rule 2, a fresh element for the GL context.
+                canvasElement = host.replace('glfw-webgl2-context');
+                gl = canvasElement.getContext('webgl2', attributes);
+              }
+              Object.defineProperty(w, '__gaiusWebGL',
+                {configurable: true, enumerable: true, writable: true, value: gl || null});
+              if (!gl) throw new Error('WebGL 2 is required');
+              canvasElement.__gaiusContextKind = 'webgl2';
+              state.gl = gl;
+              state.attached++;
+              w.__gaiusGpuBackend = 'webgl2';
+              // Lets the quality runtime enable its extensions on the game context before
+              // the first frame instead of attaching lazily.
+              if (w.GaiusQuality && w.GaiusQuality.runtime) {
+                try {
+                  w.GaiusQuality.runtime.onContext(gl);
+                } catch (ignored) {
+                  // The runtime reports its own failures; the context stays usable.
+                }
+              }
+              return gl;
+            };
+            Object.defineProperty(w, '__gaiusWebGL', {
+              configurable: true,
+              enumerable: true,
+              get: function () {
+                return w.__gaiusGlfwAttachContext();
+              },
+              set: function (value) {
+                state.pending = false;
+                Object.defineProperty(w, '__gaiusWebGL',
+                  {configurable: true, enumerable: true, writable: true, value: value});
+              }
+            });
+            """)
+    private static native void deferContext();
+
+    /** glfwMakeContextCurrent of an OpenGL window: attaches its WebGL 2 context now. */
+    @JSBody(script = """
+            const w = window;
+            const state = w.__gaiusGlfwContext;
+            if (state && state.pending && typeof w.__gaiusGlfwAttachContext === 'function') {
+              w.__gaiusGlfwAttachContext();
+            }
+            """)
+    private static native void attachContext();
+
+    @JSBody(script = """
+            const w = window;
+            const state = w.__gaiusGlfwContext;
+            if (state && state.pending) {
+              // The window goes away before its context was ever needed.
+              state.pending = false;
+              delete w.__gaiusWebGL;
+            }
+            const host = w.__gaiusCanvasHost;
+            const canvas = host ? host.current() : null;
+            if (canvas && canvas.__gaiusContextKind && canvas.__gaiusContextKind !== 'webgl2') {
+              host.replace('glfw-destroy-window');
+            }
+            """)
+    private static native void releaseWindowCanvas();
 
     @JSBody(params = {"title"}, script = "document.title=title;")
     private static native void setTitle(String title);

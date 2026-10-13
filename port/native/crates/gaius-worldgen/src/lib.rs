@@ -41,6 +41,7 @@ pub mod generator;
 pub mod ir;
 pub mod java;
 pub mod noises;
+pub mod ore;
 pub mod simd;
 pub mod surface;
 pub mod volume;

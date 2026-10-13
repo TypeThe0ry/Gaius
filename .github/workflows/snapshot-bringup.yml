@@ -1,0 +1,81 @@
+name: Snapshot bring-up
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapshot-bringup
+  cancel-in-progress: false
+
+jobs:
+  fast:
+    if: ${{ vars.GAIUS_SNAPSHOT_BRINGUP_ENABLED == 'true' }}
+    runs-on: ${{ vars.GAIUS_SNAPSHOT_BRINGUP_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_NET_OFFLINE: 'true'
+      MAVEN_OPTS: '-Xmx3g'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Initialize failure artifact and select reviewed Java release
+        id: baseline
+        run: |
+          mkdir -p ci-artifacts-snapshot/report
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const profiles = fs.readdirSync('port/versions').filter(name => name.endsWith('.json'))
+            .map(name => JSON.parse(fs.readFileSync(`port/versions/${name}`)));
+          const java = Math.max(...profiles.map(profile => profile.javaVersion));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `java=${java}\n`);
+          fs.writeFileSync('ci-artifacts-snapshot/report/bringup-report.json', JSON.stringify({schemaVersion: 1,
+            mode: 'fast', noBlockingItems: false, exitCode: 2, counts: {automatic: 0, review: 0, blocking: 1},
+            items: [{classification: 'blocking', stage: 'ci-bootstrap', title: 'Bootstrap or acquisition incomplete; inspect job logs'}],
+            claims: {teavm: false, chrome: false, parity: false, promotion: false}}, null, 2) + '\n');
+          fs.writeFileSync('ci-artifacts-snapshot/report/bringup-report.md', '# Snapshot bring-up\n\nBlocking: CI bootstrap/acquisition incomplete. Inspect job logs.\n');
+          NODE
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.baseline.outputs.java }}
+      - name: Restore offline tool caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: snapshot-tools-${{ runner.os }}-${{ hashFiles('port/native/Cargo.lock', 'port/config.json') }}
+          restore-keys: snapshot-tools-${{ runner.os }}-
+      - name: Fetch official inputs in CI and run offline fast mode
+        run: bash port/tools/bringup/snapshot-bringup.sh ci-artifacts-snapshot
+      - name: Upload report and bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-bringup-${{ github.run_id }}
+          path: |
+            ci-artifacts-snapshot/*.json
+            ci-artifacts-snapshot/*.txt
+            ci-artifacts-snapshot/*.log
+            ci-artifacts-snapshot/report/bringup-report.*
+            ci-artifacts-snapshot/report/profile.draft.json
+            ci-artifacts-snapshot/report/bringup-evidence-*/*.json
+            ci-artifacts-snapshot/report/bringup-evidence-*/*.log
+            ci-artifacts-snapshot/report/bringup-evidence-*/*.lock
+            ci-artifacts-snapshot/report/bringup-evidence-*/*.fingerprint
+            ci-artifacts-snapshot/report/bringup-evidence-*/*.txt
+            ci-artifacts-snapshot/report/bringup-evidence-*/patchkit/**/*.json
+            ci-artifacts-snapshot/report/bringup-evidence-*/shader-translation/results.json
+          if-no-files-found: error
+          retention-days: 14

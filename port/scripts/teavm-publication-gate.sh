@@ -323,3 +323,59 @@ gaius_teavm_remove_stale_incomplete_reports() {
   rm -f "${json_path%.json}.incomplete.json" \
     "${markdown_path%.md}.incomplete.md"
 }
+
+# WebAssembly GC and JavaScript-target CI gates (v0.4.0 WP1).  The rules live in
+# port/scripts/quickcheck/wasmgc_rules.py (letters a-g as in its docstring); these
+# wrappers run them from the build scripts and fail the calling build on a red rule.
+# Sourcing this file defines the functions only.
+gaius_quickcheck_rules() {
+  local root="$1"
+  shift
+  "$root/port/scripts/run-python.sh" "$root/port/scripts/quickcheck/wasmgc_rules.py" "$@"
+}
+
+# Rules c, d and e on the source tree, before overlays or TeaVM run.
+gaius_wasmgc_source_gate() {
+  local root="$1"
+  local json_path="${2:-}"
+  if ! gaius_quickcheck_rules "$root" source ${json_path:+--json "$json_path"}; then
+    echo "WebAssembly GC source rules failed (port/scripts/quickcheck/wasmgc_rules.py source)" >&2
+    return 1
+  fi
+}
+
+# Rules a and b on a compiled module and its TeaVM log (every wasmgc role compiles in JSPI
+# mode; GaiusTeaVMOptions.platformTags refuses a wasmgc role without it).
+gaius_wasmgc_artifact_gate() {
+  local root="$1"
+  local wasm_path="$2"
+  local log_path="$3"
+  local json_path="${4:-}"
+  if ! gaius_quickcheck_rules "$root" artifact --wasm "$wasm_path" --log "$log_path" \
+      ${json_path:+--json "$json_path"}; then
+    echo "WebAssembly GC artifact rules failed for $wasm_path" >&2
+    return 1
+  fi
+}
+
+# Rule f: the PATCH_* lines of a js-target build-overlays.sh log against the baseline.
+gaius_js_patch_summary_gate() {
+  local root="$1"
+  local profile="$2"
+  local overlay_log="$3"
+  if ! gaius_quickcheck_rules "$root" patch-summary --profile "$profile" --log "$overlay_log"; then
+    echo "The $profile JavaScript patch set differs from port/scripts/quickcheck/baselines/js-patch-summary.json" >&2
+    return 1
+  fi
+}
+
+# Rule g: the js POMs generate-pom.sh writes for these overlays against the baselines.
+gaius_js_pom_gate() {
+  local root="$1"
+  local profile="$2"
+  local overlay_directory="$3"
+  if ! gaius_quickcheck_rules "$root" pom --profile "$profile" --overlay-dir "$overlay_directory"; then
+    echo "The generated $profile JavaScript POMs differ from port/scripts/quickcheck/baselines/js-pom" >&2
+    return 1
+  fi
+}

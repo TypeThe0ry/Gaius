@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds every wasm kernel twice and writes the manifest the kernel runtime loads from:
+# Builds the worker wasm kernels twice and writes the runtime manifest:
 #   <name>.simd.wasm      optimized build, -C target-feature=+simd128
 #   <name>.baseline.wasm  the same crate without SIMD, for engines whose WebAssembly.validate
 #                         rejects the SIMD probe (port/web/kernels/kernel-runtime.js) or whose
@@ -15,7 +15,8 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=wasm32-unknown-unknown
-OUT="$HERE/target/kernels"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$HERE/target}"
+OUT="$TARGET_ROOT/kernels"
 
 while (( $# > 0 )); do
     case "$1" in
@@ -36,7 +37,9 @@ rustup target list --installed 2>/dev/null | grep -qx "$TARGET" || die "missing 
 crates=()
 for manifest in "$HERE"/crates/gaius-*-wasm/Cargo.toml; do
     [[ -f "$manifest" ]] || continue
-    crates+=("$(basename -- "$(dirname -- "$manifest")")")
+    crate="$(basename -- "$(dirname -- "$manifest")")"
+    [[ "$crate" != gaius-png-wasm ]] || continue
+    crates+=("$crate")
 done
 (( ${#crates[@]} > 0 )) || die "no kernel crates (crates/gaius-<name>-wasm)"
 packages=()
@@ -47,9 +50,9 @@ done
 cd "$HERE"
 build() {
     local variant="$1" flags="$2"
-    CARGO_TARGET_DIR="$HERE/target/wasm-$variant" \
+    CARGO_TARGET_DIR="$TARGET_ROOT/wasm-$variant" \
     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="$flags" \
-        cargo build --release --locked --target "$TARGET" "${packages[@]}"
+        cargo build --release --offline --locked --target "$TARGET" "${packages[@]}"
 }
 build simd "-C target-feature=+simd128"
 build baseline "-C target-feature=-simd128"
@@ -62,7 +65,7 @@ for crate in "${crates[@]}"; do
     name="${name//-/_}"
     artifact="${crate//-/_}.wasm"
     for variant in simd baseline; do
-        source="$HERE/target/wasm-$variant/$TARGET/release/$artifact"
+        source="$TARGET_ROOT/wasm-$variant/$TARGET/release/$artifact"
         [[ -f "$source" ]] || die "missing $source"
         cp -- "$source" "$OUT/$name.$variant.wasm"
     done

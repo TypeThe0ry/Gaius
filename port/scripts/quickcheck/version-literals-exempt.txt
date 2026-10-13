@@ -1,0 +1,1 @@
+port/native/kernel-mirror.toml | Reviewed vanilla bytecode inventory data: exact per-profile method applicability binds approved kernel locks; preserve its bytes, not executable version selection.

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
@@ -21,20 +22,20 @@ assert.match(source, /storage-flush-ack/);
 
 const storageProfiles = Object.freeze([
   Object.freeze({
-    profileId: "26.2",
+    profileId: CANONICAL_PROFILE.id,
     worldVersion: 4903,
     storageSchema: 2,
-    storageDatabaseName: "gaius-fs-v2-26.2",
-    storagePrefix: "gaius.fs.v2:26.2:",
-    storageOpfsDirectory: "regions-v2-26.2",
+    storageDatabaseName: "gaius-fs-v2-" + CANONICAL_PROFILE.id + "",
+    storagePrefix: "gaius.fs.v2:" + CANONICAL_PROFILE.id + ":",
+    storageOpfsDirectory: "regions-v2-" + CANONICAL_PROFILE.id + "",
   }),
   Object.freeze({
-    profileId: "1.21.11",
+    profileId: LEGACY_PROFILE.id,
     worldVersion: 4671,
     storageSchema: 2,
-    storageDatabaseName: "gaius-fs-v2-1.21.11",
-    storagePrefix: "gaius.fs.v2:1.21.11:",
-    storageOpfsDirectory: "regions-v2-1.21.11",
+    storageDatabaseName: "gaius-fs-v2-" + LEGACY_PROFILE.id + "",
+    storagePrefix: "gaius.fs.v2:" + LEGACY_PROFILE.id + ":",
+    storageOpfsDirectory: "regions-v2-" + LEGACY_PROFILE.id + "",
   }),
 ]);
 

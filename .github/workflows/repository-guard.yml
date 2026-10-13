@@ -121,6 +121,7 @@ jobs:
           set -euo pipefail
           python3 port/scripts/test-index-template.py
           python3 port/scripts/test-postprocess-index-shell.py
+          node port/scripts/runtime-lease-smoke.mjs
           python3 port/scripts/test-portable-artifact-identity.py
           python3 port/scripts/test-vanilla-resource-order.py
           python3 port/scripts/test-build-portable-html.py
@@ -132,14 +133,25 @@ jobs:
           set -euo pipefail
           for script in port/web/boot/gaius-boot.js port/web/sw/gaius-sw.js port/web/kernels/*.js \
               port/web/runtime/quality/*.js port/web/singleplayer/server-worker-bootstrap.js \
-              port/web/runtime/wasmgc/*.js port/web/runtime/wasmgc/*.mjs port/web/runtime/webgpu/*.js; do
+              port/web/runtime/wasmgc/*.js port/web/runtime/wasmgc/*.mjs port/web/runtime/webgpu/*.js \
+              port/tests/jspi/*.mjs; do
             node --check "$script"
           done
+          # The wasm frame wait (gaius-jspi.js createFramePacer, design D4) on a virtual clock.
+          node port/tests/jspi/frame-pacer-test.mjs
+          # Every shaderc/spvc function the browser loader calls is in the toolchain's export
+          # list (static check; no module needed).
+          node port/wasm/shader-toolchain/check-loader-exports.mjs
           node port/scripts/gaius-boot-smoke.mjs
+          node port/scripts/gaius-boot-gpu-smoke.mjs
           node port/scripts/launcher-quality-smoke.mjs
           node port/scripts/service-worker-headers-smoke.mjs
           node port/scripts/kernel-scheduler-policy-smoke.mjs
           node port/scripts/kernel-runtime-smoke.mjs
+          node port/scripts/kernel-mirror-smoke.mjs
+          bash port/scripts/test-wasm-opt-release.sh
+          bash -n port/scripts/build-release-matrix.sh port/scripts/check-wasmgc-reproducible.sh \
+            port/scripts/wasm-opt-release.sh port/web/runtime/webgpu/build-translator.sh
 
   native-kernels:
     runs-on: ubuntu-latest
@@ -173,15 +185,94 @@ jobs:
           ./build-wasm.sh --check
           ./build-light-wasm.sh --check
           ./build-worldgen-wasm.sh --check
-          cargo run --locked -p gaius-worldgen-wasm --example example_ir -- target/wasm-worldgen
-          ./build-wasm-variants.sh --out target/kernels
-          test -s target/kernels/kernels.json
+          cargo run --locked -p gaius-worldgen-wasm --example example_ir -- "${CARGO_TARGET_DIR:-target}/wasm-worldgen"
+          ./build-wasm-variants.sh --out "${CARGO_TARGET_DIR:-target}/kernels"
+          test -s "${CARGO_TARGET_DIR:-target}/kernels/kernels.json"
 
       - name: Worldgen kernel pool and facade smokes
         run: |
           set -euo pipefail
           node port/scripts/worldgen-kernel-pool-smoke.mjs
           node port/scripts/worldgen-kernel-facade-smoke.mjs
+          # The seed parity comparison (JVM, js and wasm worlds) on synthetic results.
+          node port/scripts/worldgen-seed-parity.mjs --self-test
+
+  wasmgc-gates:
+    # v0.4.0 WP1: the WebAssembly GC rules that need no Minecraft download, and the
+    # D14 lints (P3 enforced for product code; P2 and reachability report only).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Every WebAssembly GC rule and lint fails on an injected violation
+        run: |
+          set -euo pipefail
+          for script in port/tools/wasm/*.mjs; do
+            node --check "$script"
+          done
+          node port/tools/wasm/wasm-check.mjs --self-test
+          node port/tools/wasm/wasm-symbols.mjs --self-test
+          node port/tools/wasm/wasm-symbolize.mjs --self-test
+          # Rules a-h: a clean case passes and an injected violation fails each one.
+          python3 port/scripts/quickcheck/wasmgc_rules.py self-test
+          python3 port/scripts/quickcheck/lint_version_literals.py --self-test
+          python3 port/scripts/quickcheck/lint_vanilla_symbols.py --self-test
+          python3 port/scripts/quickcheck/lint_wasm_reach.py --self-test
+          node port/tools/sourcesets/sourcesets.mjs self-test
+          python3 port/scripts/quickcheck/test_lint_source_similarity.py
+
+      - name: WebAssembly GC source rules (c, d, e, h) before any build
+        # c: no @JSByRef or org.teavm.platform in target-wasmgc roots; d: @JSBody
+        # arguments <= 31; e: no Java array copies on the wasm path of the lwjgl overrides;
+        # h: no Java arrays of JS object types on the wasm path.
+        run: python3 port/scripts/quickcheck/wasmgc_rules.py source
+
+      - name: Sources generated from the version profiles are current
+        # port/tools/profilegen validates the profile fields the build and the kernels read and
+        # renders the storage allow-lists from port/versions/*.json.
+        run: node port/tools/profilegen/profilegen.mjs --check
+
+      - name: Source sets of port/mc/shared resolve for every profile
+        # Every profile, kind (src, client) and target resolves its port/mc/shared source sets
+        # with no stale exclude or relocation line (D16 P9; port/mc/shared/README.md).
+        run: node port/tools/sourcesets/sourcesets.mjs check
+
+      - name: P9 cross-source-set similarity
+        # Fails on a pair of source files above the threshold that has no reason in
+        # port/mc/shared/similarity-exceptions.json (D16 P9; port/mc/shared/README.md).
+        run: python3 port/scripts/quickcheck/lint_source_similarity.py --enforce
+
+      - name: Overlay directory writer lock
+        # overlay-lock.sh: one lock per overlay directory, and build-overlays.sh joins it only
+        # when its caller holds it.
+        run: bash port/scripts/test-overlay-lock.sh
+
+      - name: Lints - P3 version literals (enforced for product code), P2 vanilla symbols, wasm reachability
+        run: |
+          set -euo pipefail
+          # P3: no Minecraft version literal in product code outside port/versions/*.json and
+          # generated regions, except the lines version-literals-allow.txt names (each with
+          # its owner's pending change); verification scripts are reported only.
+          python3 port/scripts/quickcheck/lint_version_literals.py --enforce-product
+          python3 port/scripts/quickcheck/lint_vanilla_symbols.py
+          python3 port/scripts/quickcheck/lint_wasm_reach.py
+
+      - name: Frozen legacy verification scripts gain no file
+        # quick-check and the 26.3 one-off scripts are frozen in port/scripts/legacy (maint/D14
+        # M1 item 8): no new file there, no new version-named script elsewhere in port/scripts.
+        run: |
+          set -euo pipefail
+          python3 port/scripts/legacy/check-frozen.py --self-test
+          python3 port/scripts/legacy/check-frozen.py
 
   bridge-smoke:
     runs-on: ubuntu-latest
@@ -201,6 +292,12 @@ jobs:
 
       - name: Install RelayNode dependencies
         run: npm ci --prefix apps/bridge
+
+      - name: Verify RelayNode protocol tables and offline report parity
+        run: |
+          set -euo pipefail
+          npm run test:protocols --prefix apps/bridge
+          node apps/bridge/scripts/gen-protocol-ids.mjs --all --check --skip-missing --out "$RUNNER_TEMP/relay-protocols"
 
       - name: Run RelayNode protocol and registry smoke tests for every profile
         run: |
@@ -281,9 +378,18 @@ jobs:
           node port/scripts/browser-compression-decoder-production-smoke.mjs
           node port/scripts/gson-type-token-external-overlay-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs
+          # WP3 packed telemetry and WP4 (ptr,len) GL/AL uploads over a real WebAssembly.Memory.
+          node port/scripts/browser-packed-telemetry-smoke.mjs
+          node port/scripts/lwjgl-linear-upload-smoke.mjs
+          node port/scripts/lwjgl-linear-byte-upload-smoke.mjs
+          node port/scripts/minecraft-state-report-smoke.mjs
 
       - name: Validate singleplayer storage and session lifecycle
-        run: node tools/check-singleplayer-lifecycle.mjs
+        run: |
+          set -euo pipefail
+          node tools/check-singleplayer-lifecycle.mjs
+          # A page opened from disk starts its server Worker from a blob and hands it its files.
+          node port/scripts/singleplayer-file-worker-smoke.mjs
 
   patcher-bytecode-smoke:
     runs-on: ubuntu-latest
@@ -331,6 +437,13 @@ jobs:
             test "$actual_major" = "$expected_major"
           done
 
+      - name: Validate kernel mirror normalization and approval gates
+        run: node port/tools/kernelmirror/test-kernelmirror.mjs
+
+      - name: Regenerate kernel mirror locks and report differences (warn mode)
+        continue-on-error: true
+        run: node port/tools/kernelmirror/kernelmirror.mjs generate --check --warn
+
       - name: Bootstrap ASM and TeaVM callback verifier dependencies
         run: |
           set -euo pipefail
@@ -368,6 +481,41 @@ jobs:
           # 26.3 half runs in the version-profiles job.
           node port/scripts/authlib-keyset-constructor-smoke.mjs --run 26.2
 
+      - name: patchkit - method targets and static initializer gates (warn mode)
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # The registrations of port/tools, port/tools/patchkit/classification.tsv, the
+          # target-skip lists and the patcher chain of build-overlays.sh agree; the manifest
+          # generator and the lock diff pass their fixtures.
+          node port/tools/patchkit/patchkit.mjs --self-test
+          node --test port/tools/patchkit/target-lock.test.mjs
+          node port/tools/patchkit/patchkit.mjs --bytecode-test
+          # Every patcher of the client chain on the vanilla jars, for both TeaVM targets (no
+          # overlays, no TeaVM). A failing REQUIRED patch fails the step; a manifest that differs
+          # from the lock is warned, including unacknowledged method target changes. A changed
+          # static-write set is a hard failure even in warn mode; lock writes require exact review.
+          node port/tools/patchkit/patchkit.mjs check --profile 1.21.11 --profile 26.2 \
+            --compare --warn --quiet
+
+      - name: 1.21.11 render seam - blaze3d-direct-0 tests, REQUIRED patches and the SPI fingerprint
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # The seam and the WebGPU core compile against the TeaVM JSO API.
+          for artifact in teavm-interop teavm-jso teavm-jso-apis; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=org.teavm:${artifact}:0.15.0" \
+              -Dtransitive=false
+          done
+          # Enum bridges and the texel expansion on the 1.21.11 jar; the two REQUIRED patches of
+          # Minecraft12111BrowserPatcher under -Xverify:all (WebGPU and GL layouts, the JavaScript
+          # target untouched); the SPI fingerprint of port/mc/profiles/1.21.11/spi.fingerprint.
+          bash port/mc/seams/test-seam.sh blaze3d-direct-0
+          bash port/mc/seams/blaze3d-direct-0/patches/verify-patches.sh "$RUNNER_TEMP/d0-patches"
+          bash port/tools/seamprobe/seamprobe.sh 1.21.11 --check
+
       - name: Check repository diff formatting
         run: git diff --check
 
@@ -394,7 +542,9 @@ jobs:
           java-version: "26"
 
       - name: Validate every version profile and bring-up list
-        run: node port/scripts/check-version-profile.mjs --all
+        run: |
+          node port/scripts/check-version-profile.mjs --all
+          node port/scripts/check-version-profile-smoke.mjs --out "$RUNNER_TEMP/version-profile-smoke"
 
       - name: Bootstrap 26.3 smoke dependencies
         env:
@@ -457,6 +607,10 @@ jobs:
           node port/scripts/check-version-profile.mjs \
             --profile 26.3 --remote --require-local
 
+      - name: Regenerate the fetched kernel mirror locks and report differences (warn mode)
+        continue-on-error: true
+        run: node port/tools/kernelmirror/kernelmirror.mjs generate --check --warn
+
       - name: Refuse 26.3 release builds in bring-up mode
         run: |
           set -euo pipefail
@@ -491,11 +645,15 @@ jobs:
           node port/scripts/check-build-log-skips.mjs --profile 26.3 --strict-list \
             --allow '^Skipping LWJGL module lwjgl-(glfw|tinyfd): not in the Minecraft 26\.3 libraries$' \
             "$log"
-          # The 26.3 source set (port/src/versions/26.3) compiles against the
+          # The 26.3 source sets (port/mc/shared, renderpearl-1) compile against the
           # overlays (javac only; the TeaVM goal is bound to package).
           ./port/scripts/generate-pom.sh
           ./port/mvnw --batch-mode --no-transfer-progress \
             --file port/target/26.3/generated-pom.xml compile
+          node port/tools/sourcesets/canonical-link.mjs --profile 26.3 \
+            --overlay-dir port/work/overlays/26.3 --out "$RUNNER_TEMP/p9-link"
+          node port/tools/sourcesets/test-canonical-link.mjs --out "$RUNNER_TEMP/p9-tests"
+          node port/tools/sourcesets/test-version-ops.mjs --out "$RUNNER_TEMP/p9-tests"
           # G3: no link gap, on the JVM or against TeaVM's class library, other than the
           # reviewed known issues of port/scripts/link-gap/known-26.3.json.
           node port/scripts/minecraft-link-gap-smoke.mjs --profile 26.3 --expect-zero --quiet
@@ -514,16 +672,59 @@ jobs:
           grep -Fq 'Refusing to build a release from bring-up overlays' \
             "$RUNNER_TEMP/release-refused-overlays.log"
 
+      - name: 26.3 external API surface - usage.lock, api.lock and JDK gaps
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # What vanilla references in the JDK and the native libraries equals
+          # port/mc/profiles/26.3/usage.lock (the SDL entry table is generated from it), and
+          # each library override version directory's api.lock matches the 26.3 jar it selects.
+          bash port/tools/extrefs/extrefs.sh check 26.3
+          # Every JDK member vanilla uses is in the class library (classlib overlay plus
+          # port/overrides/jdk), patched away in the overlay client jar, or a known link gap.
+          bash port/tools/extrefs/extrefs.sh jdk 26.3 \
+            --patched port/work/overlays/26.3/client-named-26.3-gaius.jar --strict | tail -n 20
+
+      - name: WP1 (f) and (g) - the 26.3 JavaScript patch set and POMs equal the baselines
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # The JavaScript build is the frozen fallback: the PATCH_* lines of its overlay
+          # build and the POMs generate-pom.sh writes for the client and Worker roles
+          # (development and release) change only together with these baselines.
+          python3 port/scripts/quickcheck/wasmgc_rules.py patch-summary --profile 26.3 \
+            --log "$RUNNER_TEMP/build-overlays-26.3.log"
+          python3 port/scripts/quickcheck/wasmgc_rules.py pom --profile 26.3
+
+      - name: 26.3 render seam - renderpearl-1 enum bridges and the SPI fingerprint
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # The seam's EnumBridge maps every vanilla enum constant and flag (javac + java,
+          # offline: the vanilla jar and libraries of port/work, ASM and the TeaVM JSO jars
+          # of the steps above).
+          bash port/mc/seams/test-seam.sh renderpearl-1
+          # The signature and method-body closure of the renderpearl SPI equals
+          # port/mc/profiles/26.3/spi.fingerprint (exit 1: the seam must change; exit 2:
+          # only bodies changed, review them and refresh the fingerprint).
+          bash port/tools/seamprobe/seamprobe.sh 26.3 --check
+
       - name: 26.3 quick-check domain modules
         env:
           GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
         run: |
           set -euo pipefail
           export GAIUS_JAVA_HOME="$JAVA_HOME"
-          # port/scripts/quickcheck/profile_263_{render,input,terrain,worldgen,
-          # server,ui}.py on the overlays and the javac output of the previous
-          # step, through quick-check's profile dispatch (no TeaVM build).
-          python3 port/scripts/quick-check.py --domain-modules
+          # port/scripts/legacy/quickcheck/profile_263_{render,input,terrain,
+          # worldgen,server,ui}.py on the overlays and the javac output of the
+          # previous step, through quick-check's profile dispatch (no TeaVM build).
+          python3 port/scripts/legacy/quick-check.py --domain-modules
 
       - name: 26.3 patcher and runtime smokes
         env:
@@ -535,21 +736,76 @@ jobs:
           # javac output above; none needs the TeaVM client build.
           node port/scripts/worldgen-seed-parity.mjs --helpers
           node port/scripts/lwjgl-sdl-browser-patcher-smoke.mjs
-          node port/scripts/minecraft-263-terrain-patcher-smoke.mjs
-          node port/scripts/minecraft-263-gpu-buffer-pool-smoke.mjs
-          node port/scripts/minecraft-263-mappable-ring-telemetry-smoke.mjs
+          node port/scripts/legacy/minecraft-263-terrain-patcher-smoke.mjs
+          node port/scripts/legacy/minecraft-263-gpu-buffer-pool-smoke.mjs
+          node port/scripts/legacy/minecraft-263-mappable-ring-telemetry-smoke.mjs
           node port/scripts/gpu-fence-retire-smoke.mjs
           node port/scripts/authlib-keyset-constructor-smoke.mjs --run 26.3
-          node port/scripts/vanilla-pack-layers-263-smoke.mjs
-          node port/scripts/bitmap-font-sharing-263-smoke.mjs
+          node port/scripts/legacy/vanilla-pack-layers-263-smoke.mjs
+          node port/scripts/legacy/bitmap-font-sharing-263-smoke.mjs
           bash port/scripts/lwjgl-browser-compat-smoke.sh
           bash port/scripts/browser-memory-lifecycle-smoke.sh
           node port/scripts/shader-corpus-smoke.mjs --stages overlay,harness,compare
           node port/scripts/lwjgl-memory-backend-teavm-smoke.mjs --profile 26.3
+          node port/scripts/server-offthread-wait-teavm-smoke.mjs
           # The section queue smoke asserts wall-clock p99 poll budgets: one
           # retry absorbs a noisy runner, a real regression fails both runs.
           node port/scripts/section-task-queue-smoke.mjs \
             || node port/scripts/section-task-queue-smoke.mjs
+
+      - name: patchkit - check mode and the 26.3 patch manifests (warn mode)
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # As in the patcher-bytecode-smoke job, for the 26.3 chain (Minecraft263BrowserPatcher
+          # included): FAILED REQUIRED and changed static-write sets fail; target drift is warned.
+          node port/tools/patchkit/patchkit.mjs check --profile 26.3 --compare --warn --quiet
+
+      - name: Set up Node.js 24 for the JSPI suite
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # TeaVM 0.15's WebAssembly GC dependency analysis reads JDK class files, which its
+      # relocated ASM only parses up to class-file version 69 (Java 25).
+      - name: Set up JDK 25 for the TeaVM compile of the JSPI suite
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: JSPI semantic suite on the 26.3 WebAssembly GC overlays
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          teavm="$(jq -er .teaVMVersion port/config.json)"
+          # port/tests/jspi/build.sh compiles against the class library's whole runtime
+          # class path (jso, platform, metaprogramming, relocated libraries, jzlib, joda-time).
+          for artifact in "org.teavm:teavm-classlib:$teavm" "org.teavm:teavm-tooling:$teavm"; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get "-Dartifact=$artifact"
+          done
+          # wasmgc overlays next to the js ones: the patched teavm-core and teavm-classlib
+          # of the JSPI mode, and G4 for the wasm build (every target skip registered in
+          # port/tools/target-skips/wasmgc.txt).
+          export GAIUS_OVERLAY_DIRECTORY="$RUNNER_TEMP/wasmgc-overlays"
+          log="$RUNNER_TEMP/build-overlays-wasmgc-26.3.log"
+          GAIUS_TEAVM_TARGET=wasmgc GAIUS_BUILD_ROOT="$RUNNER_TEMP/wasmgc-build" \
+            GAIUS_DIST_DIRECTORY="$RUNNER_TEMP/wasmgc-dist" \
+            ./port/scripts/build-overlays.sh >"$log" 2>&1 \
+            || { tail -n 80 "$log"; exit 1; }
+          node port/scripts/check-build-log-skips.mjs --profile 26.3 --strict-list \
+            --allow '^Skipping LWJGL module lwjgl-(glfw|tinyfd): not in the Minecraft 26\.3 libraries$' \
+            "$log"
+          # The S5 semantic checks plus JVM class initialization (18), the probes and the
+          # WP2 checks, compiled as a small WEBASSEMBLY_GC program (-Xmx3g) and run in Node,
+          # which run-node.mjs restarts with --experimental-wasm-jspi.
+          bash port/tests/jspi/build.sh "$RUNNER_TEMP/jspi-suite"
+          node port/tests/jspi/run-node.mjs "$RUNNER_TEMP/jspi-suite"
 
   overlay-gates-26-2:
     # G1 (26.2 overlay bytes), G3 (link gaps) and G4 (silent skips) for every
@@ -623,21 +879,24 @@ jobs:
           python3 port/scripts/overlay-golden-diff.py snapshot \
             port/work/overlays/26.2 "$RUNNER_TEMP/g1-head-26.2.json"
 
-      - name: G1 - 26.2 overlay products are byte-identical to the base
-        env:
-          G1_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'g1-approved-change') }}
+      - name: G1 - 26.2 overlay products match the reviewed baseline
         run: |
           set -euo pipefail
-          if python3 port/scripts/overlay-golden-diff.py diff \
+          profile="$(jq -er '.id' "port/$GAIUS_VERSION_PROFILE_PATH")"
+          python3 port/scripts/overlay-golden-diff.py diff \
               "$RUNNER_TEMP/g1-base-26.2.json" "$RUNNER_TEMP/g1-head-26.2.json" \
-              --products --strict-added; then
-            exit 0
-          fi
-          if [[ "$G1_APPROVED" == "true" ]]; then
-            echo "::warning::26.2 overlay products changed; accepted by the g1-approved-change label"
-            exit 0
-          fi
-          exit 1
+              --products --strict-added \
+              --profile "$profile" --accept port/reviews/g1-js-overlays.json
+
+      - name: 26.2 render seam - blaze3d-backend-1 enum bridges and the SPI fingerprint
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # As the renderpearl-1 step of version-profiles, for the 26.2 seam: its EnumBridge
+          # and GLSL location tests on the 26.2 jar, and the SPI fingerprint of
+          # port/mc/profiles/26.2/spi.fingerprint.
+          bash port/mc/seams/test-seam.sh blaze3d-backend-1
+          bash port/tools/seamprobe/seamprobe.sh 26.2 --check
 
       - name: G4 - no unregistered skips in the 26.2 build log
         run: |
@@ -650,27 +909,34 @@ jobs:
             --allow '^Skipping LWJGL module lwjgl-(shaderc|spvc): the Minecraft 26\.2 client has no renderpearl OpenGL path$' \
             "$RUNNER_TEMP/head-build-overlays-26.2.log"
 
+      - name: WP1 (f) and (g) - the 26.2 JavaScript patch set and POMs equal the baselines
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          python3 port/scripts/quickcheck/wasmgc_rules.py patch-summary --profile 26.2 \
+            --log "$RUNNER_TEMP/head-build-overlays-26.2.log"
+          python3 port/scripts/quickcheck/wasmgc_rules.py pom --profile 26.2
+
       - name: G3 - no new 26.2 link gaps; staged sources equal the 26.2 source set
         run: |
           set -euo pipefail
           export GAIUS_JAVA_HOME="$JAVA_HOME"
           ./port/scripts/generate-pom.sh
-          # The staged tree is port/src/main/java with port/src/versions/26.2/java
-          # copied over it (generate-pom.sh stage_profile_sources).  26.2 has no
-          # excludes.txt; one added later must be applied here as well.
-          test ! -e port/src/versions/26.2/excludes.txt
+          # The staged tree is port/src/main/java with the port/mc/shared source sets 26.2
+          # selects laid over it, with profile fields bound by the same source resolver.
+          test "$(node port/tools/sourcesets/sourcesets.mjs list --profile 26.2 --kind src 2>&1 >/dev/null)" \
+            = "sourcesets: src js: sets canonical"
           expected="$RUNNER_TEMP/expected-26.2-sources"
           rm -rf "$expected"
           mkdir -p "$expected"
-          cp -R port/src/main/java/. "$expected/"
-          if [[ -d port/src/versions/26.2/java ]]; then
-            cp -R port/src/versions/26.2/java/. "$expected/"
-          fi
+          node port/tools/sourcesets/sourcesets.mjs stage --profile 26.2 --kind src --out "$expected"
           diff -r "$expected" port/target/26.2/sources
           ./port/mvnw --batch-mode --no-transfer-progress \
             --file port/target/26.2/generated-pom.xml compile
           node port/scripts/minecraft-link-gap-smoke.mjs --profile 26.2 \
             --baseline "$RUNNER_TEMP/g3-base-26.2.json"
+          node port/tools/sourcesets/canonical-link.mjs --profile 26.2 \
+            --overlay-dir port/work/overlays/26.2 --out "$RUNNER_TEMP/p9-link"
 
   paper-plugin-tests:
     runs-on: ubuntu-latest

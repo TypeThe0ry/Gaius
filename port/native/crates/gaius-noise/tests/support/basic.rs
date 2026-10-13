@@ -3,7 +3,7 @@
 use super::json::{enc_f32, enc_f64, enc_i32, enc_i64, f32_of, Case, Outcome};
 use gaius_noise::mth::{self, float};
 use gaius_noise::random::{LegacyRandom, XoroshiroRandom};
-use gaius_noise::{synth32, synth64, Profile, RandomSource};
+use gaius_noise::{synth32, synth64, RandomSource, Semantics};
 
 fn xoroshiro(case: &Case) -> Result<XoroshiroRandom, String> {
     match case.str("ctor")? {
@@ -43,17 +43,17 @@ pub fn positional_from_hash(case: &Case) -> Outcome {
     Ok(case.outputs.iter().map(|_| enc_i64(random.next_long())).collect())
 }
 
-pub fn mth(profile: Profile, case: &Case) -> Outcome {
+pub fn mth(semantics: Semantics, case: &Case) -> Outcome {
     let name = case.str("fn")?;
     match case.str("precision")? {
-        "f64" => mth_f64(profile, name, case),
-        "f32" => mth_f32(profile, name, case),
+        "f64" => mth_f64(semantics, name, case),
+        "f32" => mth_f32(semantics, name, case),
         other => Err(format!("unknown precision \"{other}\"")),
     }
 }
 
-fn mth_f64(profile: Profile, name: &str, case: &Case) -> Outcome {
-    let floor = profile.floor_mode();
+fn mth_f64(semantics: Semantics, name: &str, case: &Case) -> Outcome {
+    let floor = semantics.floor_mode;
     let arity = match name {
         "floor" | "lfloor" | "smoothstep" | "wrap" => 1,
         "lerp" => 3,
@@ -69,7 +69,7 @@ fn mth_f64(profile: Profile, name: &str, case: &Case) -> Outcome {
             "floor" => enc_i32(floor.floor(a[0])),
             "lfloor" => enc_i64(floor.lfloor(a[0])),
             "smoothstep" => enc_f64(mth::smoothstep(a[0])),
-            "wrap" if profile.uses_synth32() => enc_f64(synth32::wrap(a[0])),
+            "wrap" if semantics.uses_synth32() => enc_f64(synth32::wrap(a[0])),
             "wrap" => enc_f64(synth64::wrap(floor, a[0])),
             "lerp" => enc_f64(mth::lerp(a[0], a[1], a[2])),
             "lerp2" => enc_f64(mth::lerp2(a[0], a[1], a[2], a[3], a[4], a[5])),
@@ -82,7 +82,7 @@ fn mth_f64(profile: Profile, name: &str, case: &Case) -> Outcome {
         .collect())
 }
 
-fn mth_f32(profile: Profile, name: &str, case: &Case) -> Outcome {
+fn mth_f32(semantics: Semantics, name: &str, case: &Case) -> Outcome {
     let arity = match name {
         "floor" | "smoothstep" => 1,
         "lerp" => 3,
@@ -101,7 +101,7 @@ fn mth_f32(profile: Profile, name: &str, case: &Case) -> Outcome {
     Ok(rows
         .iter()
         .map(|a| match name {
-            "floor" => enc_i32(profile.floor_mode().floor_f32(a[0])),
+            "floor" => enc_i32(semantics.floor_mode.floor_f32(a[0])),
             "smoothstep" => enc_f32(float::smoothstep(a[0])),
             "lerp" => enc_f32(float::lerp(a[0], a[1], a[2])),
             "lerp2" => enc_f32(float::lerp2(a[0], a[1], a[2], a[3], a[4], a[5])),

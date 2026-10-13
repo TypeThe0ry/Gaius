@@ -24,6 +24,9 @@ import org.teavm.jso.JSBody;
  * column that left view or was unloaded, so its next check starts a new wait instead of
  * granting at once.</p>
  *
+ * <p>An enabled mesh kernel always requires vanilla's complete loaded-and-lit neighborhood.
+ * Provisional compilation remains available when the section stays on the vanilla compiler.</p>
+ *
  * <p>URL {@code gaiusNeighborGate=provisional} restores the v0.2 center-only gate,
  * {@code gaiusNeighborGate=vanilla} waits for all neighbors like the desktop game.</p>
  */
@@ -72,6 +75,13 @@ public final class BrowserNeighborReadiness {
                 LAST_CHECKED.remove(column);
             }
             return true;
+        }
+        // The kernel snapshots live light/biomes together with vanilla's copied block region.
+        // Do not create that region at the provisional streaming frontier: a later-ready
+        // neighbor cannot repair an already copied empty section. Keep vanilla's loaded-and-lit
+        // neighbor requirement while meshing is asynchronous, including diagnostic gate modes.
+        if (dev.gaius.browser.kernel.KernelMirror.enabled("mesher")) {
+            return false;
         }
         int gateMode = mode();
         if (gateMode == MODE_PROVISIONAL) {

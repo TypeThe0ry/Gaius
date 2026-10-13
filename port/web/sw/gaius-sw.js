@@ -5,7 +5,11 @@
 //    and worker response this worker serves gets
 //      Cross-Origin-Opener-Policy: same-origin
 //      Cross-Origin-Embedder-Policy: credentialless (default) | require-corp
-//    and every same-origin response a Cross-Origin-Resource-Policy: same-origin. Once a page
+//    (and Cross-Origin-Resource-Policy: same-origin). Every other response goes to the page as
+//    the object the network or the cache returned: a same-origin subresource needs no CORP
+//    under either embedder policy, and only an unchanged response keeps what Chrome ties to
+//    it, the CacheStorage entry or the HTTP cache entry that V8's code cache for scripts and
+//    WebAssembly modules lives with (a copy with added headers is a new, uncached body). Once a page
 //    loads under this worker, crossOriginIsolated is true and the kernel runtime may use shared
 //    WebAssembly memory. The mode comes from this script's own URL: gaius-sw.js?coep=
 //    credentialless | require-corp | off. Cross-origin requests are never touched
@@ -17,21 +21,31 @@
 //    keep: [urls]} after it booted; entries under this worker's scope outside the last two
 //    generations are deleted (sibling profiles on the same origin share the cache and prune
 //    their own scopes). Entries over 4 MB are not stored while less than 1 GB of quota is left.
-// 3. Everything else same-origin is network-first; navigations and small files fall back to
+// 3. Gzip-only WebAssembly modules. The site ships the big WebAssembly GC modules only as
+//    <name>.wasm.<hash>.gz (build-pages-site.py) and the page asks for <name>.<hash>.wasm.
+//    When the host has no such file (404), the worker fetches the .gz sibling and serves it
+//    inflated as application/wasm while it stores the same bytes under the .wasm URL; later
+//    boots get that CacheStorage entry, for which Chrome keeps the V8 code cache next to the
+//    entry. Pruning keeps such an entry while its .gz is kept.
+// 4. Everything else same-origin is network-first; navigations and small files fall back to
 //    "gaius-shell-v1" when the network fails, so a cached site still starts offline.
-// 4. A CacheStorage failure never fails a request: it is fetched from the network instead.
+// 5. A CacheStorage failure never fails a request: it is fetched from the network instead.
 //
 // file:// pages have no Service Worker; the portable single-file build never registers one.
 // The policy functions are exposed as self.GaiusServiceWorker for the node smoke.
 (function (scope) {
   "use strict";
 
-  const SW_VERSION = 1;
+  const SW_VERSION = 2;
   const IMMUTABLE_CACHE = "gaius-immutable-v1";
   const SHELL_CACHE = "gaius-shell-v1";
   const KNOWN_CACHES = [IMMUTABLE_CACHE, SHELL_CACHE];
   const META_PATH = "__gaius-sw/generations.json";
   const HASHED_NAME = /\.[0-9a-f]{16,64}\.[A-Za-z0-9]+$/;
+  // <name>.<hash>.wasm, whose gzip sibling is <name>.wasm.<hash>.gz.
+  const HASHED_WASM = /^(.*\/)?([^/]+)\.([0-9a-f]{16,64})\.wasm$/;
+  // An inflated module is about four times its .gz (the quota check needs a size up front).
+  const INFLATE_ESTIMATE = 4;
   const COEP_MODES = ["credentialless", "require-corp", "off"];
   const SHELL_MAX_BYTES = 4 * 1024 * 1024;
   const NULL_BODY_STATUS = [101, 103, 204, 205, 304];
@@ -61,7 +75,23 @@
     return HASHED_NAME.test(url.pathname);
   }
 
-  // Documents and workers carry the embedder policy; everything else only needs CORP.
+  // The .gz sibling of a hashed .wasm URL (without query), or null for any other URL.
+  function gzipSibling(href) {
+    let url;
+    try {
+      url = new URL(href);
+    } catch (_) {
+      return null;
+    }
+    const match = HASHED_WASM.exec(url.pathname);
+    if (!match) return null;
+    url.pathname = (match[1] || "") + match[2] + ".wasm." + match[3] + ".gz";
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  }
+
+  // Documents and workers carry the embedder policy; everything else is passed through.
   function isPolicyContainer(request) {
     if (request.mode === "navigate") return true;
     const destination = request.destination || "";
@@ -70,7 +100,7 @@
   }
 
   function withIsolationHeaders(response, request, config) {
-    if (!response || config.coep === "off") return response;
+    if (!response || config.coep === "off" || !isPolicyContainer(request)) return response;
     if (response.type === "opaque" || response.type === "opaqueredirect" || response.type === "error"
         || response.status === 0) {
       return response;
@@ -122,6 +152,8 @@
     const scopeOrigin = deps.scopeOrigin;
     const scopeUrl = deps.scopeUrl;
     const estimate = deps.estimate;
+    const Inflate = deps.DecompressionStream;
+    const RequestCtor = deps.Request;
     // Sibling profiles (<repo>/26.2/, <repo>/26.3/, ...) register their own workers on this
     // origin and share its CacheStorage; this worker only manages entries under its scope.
     const scopePrefix = scopeUrl ? stripSearch(scopeUrl) : "";
@@ -133,8 +165,7 @@
 
     // Large entries are not stored while the origin is short of quota: world saves (IndexedDB,
     // OPFS) share it, and a cache miss only costs a download.
-    async function roomFor(response) {
-      const length = Number(response.headers.get("Content-Length"));
+    async function roomForBytes(length) {
       if (!(length > LARGE_ENTRY_BYTES) || typeof estimate !== "function") return true;
       try {
         const quota = await estimate();
@@ -145,6 +176,39 @@
       }
     }
 
+    function roomFor(response) {
+      return roomForBytes(Number(response.headers.get("Content-Length")));
+    }
+
+    // A gzip-only module: fetch <name>.wasm.<hash>.gz and answer at once with the inflated
+    // stream (compileStreaming overlaps the inflation), while a second branch of the same stream
+    // is stored under the .wasm URL; later boots read the stored entry, which V8 keeps its code
+    // cache with. Without room for the entry the module is only served. null: no usable .gz.
+    async function inflated(event, request, cache) {
+      const source = gzipSibling(request.url);
+      if (!source || typeof Inflate !== "function") return null;
+      const gzip = await fetchFn(typeof RequestCtor === "function" ? new RequestCtor(source) : source);
+      if (!cacheable(gzip) || !gzip.body) return null;
+      // Keep validators stable across SW restarts. V8's streaming Wasm cache keys
+      // include the response identity; the content-hashed request URL is the
+      // immutable identity for a module, so derive a deterministic ETag from it.
+      const validator = '"gaius-wasm-' + encodeURIComponent(stripSearch(request.url)) + '"';
+      const module = (body) => new Response(body, {
+        status: 200, statusText: "OK", headers: {
+          "Content-Type": "application/wasm", "Cache-Control": "public, max-age=31536000, immutable",
+          "ETag": validator, "Last-Modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+        },
+      });
+      const stream = gzip.body.pipeThrough(new Inflate("gzip"));
+      if (!(await roomForBytes(Number(gzip.headers.get("Content-Length")) * INFLATE_ESTIMATE))) {
+        return {response: module(stream), source: "inflated-uncached"};
+      }
+      const [page, store] = stream.tee();
+      // A failed store (quota, a damaged .gz) only means the next boot inflates again.
+      waitUntil(event, cache.put(stripSearch(request.url), module(store)));
+      return {response: module(page), source: "inflated"};
+    }
+
     async function immutable(event, request) {
       const cache = await caches.open(IMMUTABLE_CACHE);
       const hit = await cache.match(request, {ignoreSearch: true});
@@ -153,6 +217,9 @@
       if (cacheable(response)) {
         const copy = response.clone();
         waitUntil(event, roomFor(copy).then((room) => room ? cache.put(stripSearch(request.url), copy) : null));
+      } else if (response && response.status === 404) {
+        const module = await inflated(event, request, cache);
+        if (module) return module;
       }
       return {response, source: "network"};
     }
@@ -226,7 +293,9 @@
         const href = stripSearch(typeof request === "string" ? request : request.url);
         // Another profile's entries belong to that profile's worker and generations.
         if (!inScope(request)) continue;
-        if (!union.has(href)) {
+        // An inflated module lives as long as the .gz it came from.
+        const gzip = gzipSibling(href);
+        if (!union.has(href) && !(gzip && union.has(gzip))) {
           await cache.delete(request);
           deleted++;
         }
@@ -252,7 +321,7 @@
 
   const api = {
     SW_VERSION, IMMUTABLE_CACHE, SHELL_CACHE, HASHED_NAME,
-    configFromUrl, isImmutable, strategyFor, withIsolationHeaders, createWorker, stripSearch,
+    configFromUrl, isImmutable, strategyFor, withIsolationHeaders, createWorker, stripSearch, gzipSibling,
   };
   scope.GaiusServiceWorker = api;
 
@@ -268,6 +337,8 @@
     scopeUrl,
     estimate: scope.navigator && scope.navigator.storage && typeof scope.navigator.storage.estimate === "function"
       ? () => scope.navigator.storage.estimate() : null,
+    DecompressionStream: scope.DecompressionStream,
+    Request: scope.Request,
   });
   api.worker = worker;
 

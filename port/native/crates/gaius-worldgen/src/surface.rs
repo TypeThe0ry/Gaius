@@ -175,8 +175,41 @@ struct Context {
     stone_depth_below: i32,
     water_height: i32,
     biome: Option<u16>,
-    noise_xz: Vec<Option<f64>>,
-    noise_y: Vec<Option<f64>>,
+    noise_xz: NoiseCache,
+    noise_y: NoiseCache,
+}
+
+struct NoiseCache {
+    values: Vec<f64>,
+    stamps: Vec<u32>,
+    generation: u32,
+}
+
+impl NoiseCache {
+    fn new(size: usize) -> Self {
+        Self {
+            values: vec![0.0; size],
+            stamps: vec![0; size],
+            generation: 1,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.stamps.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    fn get(&self, slot: usize) -> Option<f64> {
+        (self.stamps[slot] == self.generation).then(|| self.values[slot])
+    }
+
+    fn set(&mut self, slot: usize, value: f64) {
+        self.values[slot] = value;
+        self.stamps[slot] = self.generation;
+    }
 }
 
 struct OreBuffers {
@@ -253,8 +286,8 @@ impl<'a, H: SurfaceHost> SurfaceRun<'a, H> {
                 stone_depth_below: 0,
                 water_height: i32::MIN,
                 biome: None,
-                noise_xz: vec![None; noise_slots],
-                noise_y: vec![None; noise_slots],
+                noise_xz: NoiseCache::new(noise_slots),
+                noise_y: NoiseCache::new(noise_slots),
             },
         }
     }
@@ -283,8 +316,8 @@ impl<'a, H: SurfaceHost> SurfaceRun<'a, H> {
         self.ctx.surface_secondary = None;
         self.ctx.min_surface_level = None;
         self.ctx.steep_heights = None;
-        self.ctx.noise_xz.iter_mut().for_each(|v| *v = None);
-        self.ctx.noise_y.iter_mut().for_each(|v| *v = None);
+        self.ctx.noise_xz.clear();
+        self.ctx.noise_y.clear();
         self.ctx.biome = None;
     }
 
@@ -294,7 +327,7 @@ impl<'a, H: SurfaceHost> SurfaceRun<'a, H> {
         self.ctx.water_height = water;
         self.ctx.block_y = y;
         self.ctx.biome = None;
-        self.ctx.noise_y.iter_mut().for_each(|v| *v = None);
+        self.ctx.noise_y.clear();
     }
 
     fn biome(&mut self) -> u16 {
@@ -334,7 +367,7 @@ impl<'a, H: SurfaceHost> SurfaceRun<'a, H> {
             }
             Condition::NoiseThreshold { noise, min, max, is_3d } => {
                 let cache = if *is_3d { &self.ctx.noise_y } else { &self.ctx.noise_xz };
-                let value = match cache[c as usize] {
+                let value = match cache.get(c as usize) {
                     Some(v) => v,
                     None => {
                         let (x, y, z) = (
@@ -344,9 +377,9 @@ impl<'a, H: SurfaceHost> SurfaceRun<'a, H> {
                         );
                         let v = self.host.noise(*noise, x, if *is_3d { y } else { 0.0 }, z);
                         if *is_3d {
-                            self.ctx.noise_y[c as usize] = Some(v);
+                            self.ctx.noise_y.set(c as usize, v);
                         } else {
-                            self.ctx.noise_xz[c as usize] = Some(v);
+                            self.ctx.noise_xz.set(c as usize, v);
                         }
                         v
                     }
@@ -752,5 +785,37 @@ impl<'a, H: SurfaceHost> SurfaceRun<'a, H> {
             }
             y -= 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NoiseCache;
+
+    #[test]
+    fn noise_cache_invalidation_preserves_bits() {
+        let mut cache = NoiseCache::new(2);
+        assert_eq!(cache.get(0), None);
+        for value in [-0.0, f64::from_bits(0x7ff8_0000_0000_0042)] {
+            cache.set(0, value);
+            assert_eq!(cache.get(0).unwrap().to_bits(), value.to_bits());
+            assert_eq!(cache.get(1), None);
+            cache.clear();
+            assert_eq!(cache.get(0), None);
+        }
+    }
+
+    #[test]
+    fn noise_cache_generation_wrap_drops_stale_entries() {
+        let mut cache = NoiseCache::new(2);
+        cache.set(0, 12.0);
+        cache.generation = u32::MAX;
+        cache.set(1, 34.0);
+        cache.clear();
+        assert_eq!(cache.generation, 1);
+        assert_eq!(cache.get(0), None);
+        assert_eq!(cache.get(1), None);
+        cache.set(1, 56.0);
+        assert_eq!(cache.get(1), Some(56.0));
     }
 }

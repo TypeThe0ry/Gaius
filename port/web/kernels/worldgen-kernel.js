@@ -71,6 +71,7 @@
     "backpressure", "stale", "cancelled", "superseded", "terminated", "runtime-disabled",
     "runtime-unavailable", "kernel-disabled", "pool-unavailable", "unavailable", "timeout",
     "draining", "noise-evicted",
+    "needs-vanilla",
   ]);
 
   const now = () => (global.performance && global.performance.now ? global.performance.now() : Date.now());
@@ -108,6 +109,7 @@
     surfaceChanges: 0,
     ringJobs: 0,
     ringFallbacks: 0,
+    kindStats: Object.create(null),
   };
 
   function config() {
@@ -132,7 +134,8 @@
 
   function switchedOff() {
     const c = config();
-    return urlDisabled() || (c !== null && c.enabled === false);
+    return !global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled(KERNEL)
+      || urlDisabled() || (c !== null && c.enabled === false);
   }
 
   function hostMode() {
@@ -447,10 +450,20 @@
     try {
       if (ok) {
         state.completed++;
+        const completedStat = state.kindStats[job.kind];
+        if (completedStat) completedStat.completed++;
         job.onResult(value);
       } else if (isTransient(value)) {
         state.transient++;
-        if (isFallback(value)) state.ringFallbacks++;
+        const transientStat = state.kindStats[job.kind];
+        if (transientStat) {
+          transientStat.transient++;
+          if (value && value.code === "timeout") transientStat.timeout++;
+        }
+        if (isFallback(value)) {
+          state.ringFallbacks++;
+          if (transientStat) transientStat.fallback++;
+        }
         job.onError("transient:" + messageOf(value));
       } else {
         generatorFailed(job.key, value);
@@ -515,7 +528,15 @@
 
   // ---- job submission ----
 
-  function submit(key, chunkX, chunkZ, resultBytes, run, onResult, onError) {
+  function declineMirror(onError) {
+    if (global.GaiusKernelMirror && global.GaiusKernelMirror.enabled(KERNEL)) return false;
+    state.transient++;
+    onError("transient:needs-vanilla:NEEDS_VANILLA: kernel mirror is disabled");
+    return true;
+  }
+
+  function submit(kind, key, chunkX, chunkZ, resultBytes, run, onResult, onError) {
+    if (declineMirror(onError)) return;
     const g = state.generators.get(key >>> 0);
     if (!g || g.failed) {
       onError("generator unavailable");
@@ -527,10 +548,12 @@
       return;
     }
     const job = {
-      ticket: state.nextTicket++, key, settled: false, deadline: now() + deadlineMs(), onResult, onError,
+      ticket: state.nextTicket++, kind, key, settled: false, deadline: now() + deadlineMs(), onResult, onError,
     };
     state.pending.set(job.ticket, job);
     state.jobs++;
+    const stat = state.kindStats[kind] || (state.kindStats[kind] = {submitted: 0, completed: 0, fallback: 0, transient: 0, timeout: 0});
+    stat.submitted++;
     ensureWatchdog();
     runner().then((r) => {
       if (job.settled) return null;
@@ -686,7 +709,7 @@
     const keep = (flags & FLAG_KEEP_NOISE) !== 0;
     const kernelFlags = flags & KERNEL_FLAGS_MASK;
     const ring = ringOf(ringBiomes);
-    submit(key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.terrain(r, handle, chunkX, chunkZ, {
+    submit("TERRAIN", key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.terrain(r, handle, chunkX, chunkZ, {
       surface: (kernelFlags & J.FLAG_SURFACE) !== 0,
       biomes: (kernelFlags & J.FLAG_BIOMES) !== 0,
       beard: beardOf(beard),
@@ -700,7 +723,7 @@
 
   function submitBiomes(key, chunkX, chunkZ, onResult, onError) {
     const J = global.GaiusWorldgenJob;
-    submit(key, chunkX, chunkZ, BIOMES_RESULT_BYTES, (r, handle, opts) => J.biomes(r, handle, chunkX, chunkZ, opts)
+    submit("BIOMES", key, chunkX, chunkZ, BIOMES_RESULT_BYTES, (r, handle, opts) => J.biomes(r, handle, chunkX, chunkZ, opts)
       .then((b) => new Int32Array(b.ids)), onResult, onError);
   }
 
@@ -708,13 +731,14 @@
   function submitSurface(key, chunkBytes, chunkX, chunkZ, beard, onResult, onError, ringBiomes) {
     const J = global.GaiusWorldgenJob;
     const ring = ringOf(ringBiomes);
-    submit(key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.surface(r, handle,
+    submit("SURFACE", key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.surface(r, handle,
       {bytes: chunkBytes, chunkX, chunkZ}, {beard: beardOf(beard), ringBiomes: ring}, opts).then(flatten),
       onResult, onError);
   }
 
   // Surface rules on a kept noise chunk; reports the changed blocks only. The entry is consumed.
   function submitSurfaceStored(key, token, chunkX, chunkZ, beard, onResult, onError, ringBiomes) {
+    if (declineMirror(onError)) return;
     const entry = state.store.get(token);
     if (!entry || entry.chunk.chunkX !== chunkX || entry.chunk.chunkZ !== chunkZ) {
       if (entry) dropStored(token);
@@ -726,7 +750,7 @@
     const J = global.GaiusWorldgenJob;
     const before = entry.chunk;
     const ring = ringOf(ringBiomes);
-    submit(key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.surface(r, handle,
+    submit("SURFACE", key, chunkX, chunkZ, TERRAIN_RESULT_BYTES, (r, handle, opts) => J.surface(r, handle,
       {bytes: before.bytes, chunkX, chunkZ}, {beard: beardOf(beard), ringBiomes: ring}, opts).then((after) => {
       const diff = surfaceDiff(before, after);
       state.surfaces++;
@@ -764,6 +788,7 @@
       surfaceChanges: state.surfaceChanges,
       ringJobs: state.ringJobs,
       ringFallbacks: state.ringFallbacks,
+      kinds: JSON.parse(JSON.stringify(state.kindStats)),
       pool: state.pool ? state.pool.telemetry() : null,
       hostRuntime: state.runtime ? state.runtime.telemetry() : null,
     };
@@ -788,5 +813,7 @@
     drain,
     resume,
     telemetry,
+    snapshot: () => ({kernel: telemetry(), worldgen: global.__gaiusWorldgenStats || null,
+      server: global.__gaiusServerTickTelemetry || null}),
   });
 })(typeof globalThis !== "undefined" ? globalThis : self);

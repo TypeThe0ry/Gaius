@@ -13,7 +13,8 @@
 //!
 //! ```text
 //! header   u32 magic "GWIR" (bytes 47 57 49 52), u16 version = 1,
-//!          u8 profile (0 = 1.21.11, 1 = 26.2, 2 = 26.3), u8 reserved,
+//!          u8 semantics (kernelSemantics.code of the profile, port/versions/<id>.json;
+//!          its irVersion must equal the header version), u8 reserved,
 //!          u32 section_count, u32 total_len (header included)
 //! section  u32 tag (four ASCII bytes read as little-endian u32), u32 len, len bytes
 //! ```
@@ -90,6 +91,7 @@
 //!   op 26 CACHE (26.3)       u32 input   (a deduplicated DensityFunctionCompiler cache)
 //!   op 27 FLAT_CACHE, 28 CACHE_2D, 29 CACHE_ONCE, 30 CACHE_ALL_IN_CELL (26.2 markers)  u32 input
 //!   op 31 BLEND_DENSITY      u32 input
+//!   op 32 SCALED_NOISE       u32 noise, u32 positive scale node; scale * abs(noise(x/scale, y/scale, z/scale))
 //! u32 m; per spline: u8 kind
 //!   0 constant: f32 value
 //!   1 multipoint: u32 coordinate (node), u32 n, f32 locations[n], f32 derivatives[n], u32 values[n] (splines)
@@ -180,24 +182,6 @@ impl IrError {
 impl core::fmt::Display for IrError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.message)
-    }
-}
-
-/// Released profiles; mirrors `gaius_noise::Profile` with the IR codes.
-pub fn profile_from_code(code: u8) -> Option<gaius_noise::Profile> {
-    match code {
-        0 => Some(gaius_noise::Profile::V1_21_11),
-        1 => Some(gaius_noise::Profile::V26_2),
-        2 => Some(gaius_noise::Profile::V26_3),
-        _ => None,
-    }
-}
-
-pub fn profile_code(profile: gaius_noise::Profile) -> u8 {
-    match profile {
-        gaius_noise::Profile::V1_21_11 => 0,
-        gaius_noise::Profile::V26_2 => 1,
-        gaius_noise::Profile::V26_3 => 2,
     }
 }
 
@@ -440,6 +424,10 @@ pub enum Op {
     Cache(u32),
     Marker(Marker, u32),
     BlendDensity(u32),
+    ScaledNoise {
+        noise: u32,
+        scale: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -650,7 +638,7 @@ pub struct Biomes {
 /// A decoded generator IR.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ir {
-    pub profile: gaius_noise::Profile,
+    pub semantics: gaius_noise::Semantics,
     pub settings: Settings,
     pub states: States,
     pub noises: Vec<NoiseDef>,
@@ -682,7 +670,15 @@ impl Ir {
         if version != VERSION {
             return Err(IrError::new(format!("unsupported IR version {version}")));
         }
-        let profile = profile_from_code(r.u8()?).ok_or_else(|| IrError::new("unknown profile"))?;
+        let code = r.u8()?;
+        let semantics = gaius_noise::Semantics::from_code(code)
+            .ok_or_else(|| IrError::new(format!("unknown kernel semantics code {code}")))?;
+        if semantics.ir_version != version {
+            return Err(IrError::new(format!(
+                "kernel semantics code {code} declares IR version {}, not {version}",
+                semantics.ir_version
+            )));
+        }
         r.u8()?;
         let section_count = r.u32()?;
         let total = r.u32()? as usize;
@@ -720,7 +716,7 @@ impl Ir {
             }
         }
         let ir = Ir {
-            profile,
+            semantics,
             settings: settings.ok_or_else(|| IrError::new("missing SETT section"))?,
             states: states.ok_or_else(|| IrError::new("missing STAT section"))?,
             noises,
@@ -800,6 +796,23 @@ impl Ir {
                         return Err(IrError::new(format!("node {index}: noise out of range")));
                     }
                 }
+                Op::ScaledNoise { noise, scale } => {
+                    check(*scale)?;
+                    let positive_constant = |child: u32| matches!(self.nodes[child as usize].op, Op::Const(value) if value.is_finite() && value > 0.0);
+                    let safe_scale = match &self.nodes[*scale as usize].op {
+                        Op::Const(_) => positive_constant(*scale),
+                        Op::IntervalSelect { functions, .. } => functions.iter().all(|child| positive_constant(*child)),
+                        _ => false,
+                    };
+                    if *noise >= n_noises
+                        || self.nodes[*scale as usize].min <= 0.0
+                        || !self.nodes[*scale as usize].min.is_finite()
+                        || !self.nodes[*scale as usize].max.is_finite()
+                        || !safe_scale
+                    {
+                        return Err(IrError::new(format!("node {index}: invalid scaled noise")));
+                    }
+                }
                 Op::Unary(_, a)
                 | Op::MulOrAdd { input: a, .. }
                 | Op::Clamp(a, _, _)
@@ -863,10 +876,7 @@ impl Ir {
                 _ => {}
             }
             if let Op::Interpolated { cell_xz, cell_y, .. } = node.op {
-                if cell_xz < 0
-                    || cell_y < 0
-                    || (self.profile == gaius_noise::Profile::V26_3 && (cell_xz == 0 || cell_y == 0))
-                {
+                if cell_xz < 0 || cell_y < 0 || (self.semantics.uses_sampler32() && (cell_xz == 0 || cell_y == 0)) {
                     return Err(IrError::new(format!("node {index}: bad interpolation cell")));
                 }
             }
@@ -1275,6 +1285,10 @@ fn decode_density(body: &[u8]) -> Result<(Vec<Node>, Vec<SplineDef>), IrError> {
             29 => Op::Marker(Marker::CacheOnce, r.u32()?),
             30 => Op::Marker(Marker::CacheAllInCell, r.u32()?),
             31 => Op::BlendDensity(r.u32()?),
+            32 => Op::ScaledNoise {
+                noise: r.u32()?,
+                scale: r.u32()?,
+            },
             _ => return Err(r.error("unknown density op")),
         };
         nodes.push(Node { op, axes, min, max });

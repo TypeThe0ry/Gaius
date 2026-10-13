@@ -165,8 +165,23 @@ public final class BrowserPacketScheduler {
     private static final Object[] retiredPacketProcessorOwners =
             new Object[RETIRED_PACKET_PROCESSOR_OWNER_LIMIT];
     private static int retiredPacketProcessorOwnerCursor;
+    /**
+     * {@link BrowserIntegratedServerMain#isWorkerServer()} once known: 1 on the integrated
+     * server's Worker, -1 on the page, 0 not read yet. The realm of a running program never
+     * changes, so the per-packet and per-frame paths below ask JavaScript once.
+     */
+    private static int workerServerState;
 
     private BrowserPacketScheduler() {
+    }
+
+    private static boolean workerServer() {
+        int state = workerServerState;
+        if (state == 0) {
+            state = BrowserIntegratedServerMain.isWorkerServer() ? 1 : -1;
+            workerServerState = state;
+        }
+        return state > 0;
     }
 
     private static PacketProcessorLedger findPacketProcessorLedger(Object owner) {
@@ -417,7 +432,7 @@ public final class BrowserPacketScheduler {
     private static boolean tryBeginOwnerClientPacketDrain(
             PacketProcessorLedger ledger, boolean critical) {
         if (ledger == null || ledger.retired || !ledger.accountingValid
-                || BrowserIntegratedServerMain.isWorkerServer()
+                || workerServer()
                 || ledger.clientPacketDrainActive
                 || ledger.queuedPacketHandleDepth > 0
                 || ledger.queuedPackets < CLIENT_PACKET_DRAIN_THRESHOLD) {
@@ -674,7 +689,7 @@ public final class BrowserPacketScheduler {
             beginOwnerBatch(ledger);
             return;
         }
-        boolean workerServer = BrowserIntegratedServerMain.isWorkerServer();
+        boolean workerServer = workerServer();
         if (clientPacketDrainActive && !workerServer) {
             // Pressure recovery is work-conserving within the same two-millisecond boundary.
             // The 256-packet count is only a fail-safe if clock accounting breaks; the target
@@ -747,7 +762,7 @@ public final class BrowserPacketScheduler {
      * can be attributed to it.
      */
     public static void beginClientFrame() {
-        if (BrowserIntegratedServerMain.isWorkerServer()) {
+        if (workerServer()) {
             return;
         }
         PacketProcessorLedger previous = currentPacketProcessorLedger();
@@ -763,7 +778,7 @@ public final class BrowserPacketScheduler {
     }
 
     private static void beginOwnerBatch(PacketProcessorLedger ledger) {
-        boolean workerServer = BrowserIntegratedServerMain.isWorkerServer();
+        boolean workerServer = workerServer();
         if (ledger.clientPacketDrainActive && !workerServer) {
             ledger.clientPacketDrainRequestedPackets = Math.max(
                     1, ledger.queuedPackets - CLIENT_PACKET_DRAIN_TARGET_QUEUE);
@@ -949,7 +964,7 @@ public final class BrowserPacketScheduler {
         if (ledger != null) {
             return tryBeginOwnerClientPacketDrain(ledger, critical);
         }
-        if (BrowserIntegratedServerMain.isWorkerServer()
+        if (workerServer()
                 || clientPacketDrainActive
                 || queuedPacketHandleDepth > 0
                 || queuedPackets < CLIENT_PACKET_DRAIN_THRESHOLD) {
@@ -989,7 +1004,7 @@ public final class BrowserPacketScheduler {
      * asking why the claim was skipped.</p>
      */
     public static String clientPacketDrainClaimSkipReason(Object owner) {
-        if (BrowserIntegratedServerMain.isWorkerServer()) {
+        if (workerServer()) {
             return "worker-server";
         }
         if (owner == null) {
@@ -1147,7 +1162,7 @@ public final class BrowserPacketScheduler {
 
     /** Returns true when a server movement packet should wait behind the active worldgen slice. */
     public static boolean shouldDeferQueuedPacket(Object packet) {
-        if (packet == null || !BrowserIntegratedServerMain.isWorkerServer()) {
+        if (packet == null || !workerServer()) {
             return false;
         }
         String name = packet.getClass().getName();

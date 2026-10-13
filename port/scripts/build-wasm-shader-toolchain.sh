@@ -75,6 +75,41 @@ posix_path() {
 
 module_files=(gaius-shaderc.js gaius-shaderc.wasm gaius-spvc.js gaius-spvc.wasm)
 
+# ---- exported C API -------------------------------------------------------------
+# Exactly the entry points the loader calls (plus malloc/free for its buffers);
+# port/wasm/shader-toolchain/check-loader-exports.mjs keeps the two lists in step.
+# auto_map_locations: the blaze3d GLSL front-end (26.2, 1.21.11) compiles like
+# GlslCompiler, which sets it; renderpearl (26.3) does not call it.
+spvc_exports=(
+  spvc_context_create spvc_context_destroy spvc_context_get_last_error_string
+  spvc_context_parse_spirv spvc_context_create_compiler
+  spvc_compiler_create_compiler_options spvc_compiler_options_set_uint
+  spvc_compiler_options_set_bool spvc_compiler_install_compiler_options
+  spvc_compiler_create_shader_resources spvc_resources_get_resource_list_for_type
+  spvc_compiler_get_decoration spvc_compiler_set_name spvc_compiler_get_name
+  spvc_compiler_set_entry_point spvc_compiler_compile
+  spvc_compiler_get_binary_offset_for_decoration spvc_compiler_get_declared_struct_size
+  spvc_compiler_get_type_handle spvc_type_get_basetype spvc_type_get_image_dimension
+  spvc_type_get_vector_size spvc_type_get_num_array_dimensions spvc_type_get_array_dimension
+  malloc free
+)
+shaderc_exports=(
+  shaderc_compiler_initialize shaderc_compiler_release
+  shaderc_compile_options_initialize shaderc_compile_options_release
+  shaderc_compile_options_add_macro_definition shaderc_compile_options_set_target_env
+  shaderc_compile_options_set_auto_bind_uniforms shaderc_compile_options_set_preserve_bindings
+  shaderc_compile_options_set_auto_map_locations
+  shaderc_compile_options_set_generate_debug_info shaderc_compile_options_set_optimization_level
+  shaderc_compile_options_set_include_callbacks shaderc_compile_into_spv
+  shaderc_result_get_length shaderc_result_get_bytes shaderc_result_get_compilation_status
+  shaderc_result_get_error_message shaderc_result_get_num_warnings
+  shaderc_result_get_num_errors shaderc_result_release
+  malloc free
+)
+# The shaderc exports of the modules this run publishes (recorded in the manifest).
+module_shaderc_exports=""
+module_spvc_exports=""
+
 build_modules() {
   # ---- toolchain ---------------------------------------------------------------
   if [[ -n "$emsdk" ]]; then
@@ -139,33 +174,6 @@ build_modules() {
   fetch_source "$src/shaderc/third_party/spirv-headers" "$GAIUS_ST_SPIRV_HEADERS_URL" "$GAIUS_ST_SPIRV_HEADERS_COMMIT"
   fetch_source "$src/SPIRV-Cross" "$GAIUS_ST_SPIRV_CROSS_URL" "$GAIUS_ST_SPIRV_CROSS_COMMIT"
 
-  # ---- exported C API -------------------------------------------------------------
-  # Exactly the entry points the loader calls (plus malloc/free for its buffers).
-  spvc_exports=(
-    spvc_context_create spvc_context_destroy spvc_context_get_last_error_string
-    spvc_context_parse_spirv spvc_context_create_compiler
-    spvc_compiler_create_compiler_options spvc_compiler_options_set_uint
-    spvc_compiler_options_set_bool spvc_compiler_install_compiler_options
-    spvc_compiler_create_shader_resources spvc_resources_get_resource_list_for_type
-    spvc_compiler_get_decoration spvc_compiler_set_name spvc_compiler_get_name
-    spvc_compiler_set_entry_point spvc_compiler_compile
-    spvc_compiler_get_binary_offset_for_decoration spvc_compiler_get_declared_struct_size
-    spvc_compiler_get_type_handle spvc_type_get_basetype spvc_type_get_image_dimension
-    spvc_type_get_vector_size spvc_type_get_num_array_dimensions spvc_type_get_array_dimension
-    malloc free
-  )
-  shaderc_exports=(
-    shaderc_compiler_initialize shaderc_compiler_release
-    shaderc_compile_options_initialize shaderc_compile_options_release
-    shaderc_compile_options_add_macro_definition shaderc_compile_options_set_target_env
-    shaderc_compile_options_set_auto_bind_uniforms shaderc_compile_options_set_preserve_bindings
-    shaderc_compile_options_set_generate_debug_info shaderc_compile_options_set_optimization_level
-    shaderc_compile_options_set_include_callbacks shaderc_compile_into_spv
-    shaderc_result_get_length shaderc_result_get_bytes shaderc_result_get_compilation_status
-    shaderc_result_get_error_message shaderc_result_get_num_warnings
-    shaderc_result_get_num_errors shaderc_result_release
-    malloc free
-  )
   join_exports() {
     local list="" name
     for name in "$@"; do list="${list:+$list,}_$name"; done
@@ -241,6 +249,8 @@ build_modules() {
     printf '%s' "$stamp" >"$build/stamp"
   fi
   module_dir="$build"
+  module_shaderc_exports="${shaderc_exports[*]}"
+  module_spvc_exports="${spvc_exports[*]}"
 }
 
 # use_prebuilt DIR: verifies an earlier run's modules against the pins.
@@ -277,6 +287,15 @@ use_prebuilt() {
       exit 1
     fi
   done
+  # Modules built before an export was added still work for the profiles that do not need it;
+  # say which exports they lack (a manifest without the record predates it).
+  module_shaderc_exports="$(jq -r '.exports.shaderc // empty' "$manifest")"
+  module_spvc_exports="$(jq -r '.exports.spvc // empty' "$manifest")"
+  if [[ "$module_shaderc_exports" != "${shaderc_exports[*]}" || "$module_spvc_exports" != "${spvc_exports[*]}" ]]; then
+    echo "build-wasm-shader-toolchain: warning: the prebuilt modules do not export exactly what the loader" \
+      "may call (manifest exports: '${module_shaderc_exports:-not recorded}'); the blaze3d profiles (26.2," \
+      "1.21.11) need shaderc_compile_options_set_auto_map_locations: rebuild with emsdk" >&2
+  fi
   echo "Using the prebuilt shader toolchain modules in $dir"
   module_dir="$dir"
 }
@@ -309,6 +328,10 @@ describe() {
     "$GAIUS_ST_SHADERC_COMMIT" "$GAIUS_ST_GLSLANG_COMMIT" "$GAIUS_ST_SPIRV_TOOLS_COMMIT"
   printf '    "spirv-headers": "%s",\n    "spirv-cross": "%s"\n  },\n' \
     "$GAIUS_ST_SPIRV_HEADERS_COMMIT" "$GAIUS_ST_SPIRV_CROSS_COMMIT"
+  if [[ -n "$module_shaderc_exports" ]]; then
+    printf '  "exports": {\n    "shaderc": "%s",\n    "spvc": "%s"\n  },\n' \
+      "$module_shaderc_exports" "$module_spvc_exports"
+  fi
   printf '  "files": {\n'
   describe gaius-shader-toolchain.js; printf ',\n'
   describe gaius-shaderc.js; printf ',\n'

@@ -200,6 +200,9 @@ public final class BrowserMemory {
         };
     }
 
+    public static void claimOwner(long address, int owner) {
+    }
+
     public static long allocate(long byteCount) {
         return allocate(byteCount, RegionOwnership.EXPLICIT);
     }

@@ -19,9 +19,7 @@ import { WebSocket } from "./node_modules/ws/wrapper.mjs";
 import { parseConnectRequest } from "./dist/policy.js";
 import {
     decodeClientboundLoginDistances,
-    MINECRAFT_1_21_11,
-    MINECRAFT_26_2,
-    MINECRAFT_26_3,
+    MINECRAFT_PROFILES,
 } from "./dist/protocol.js";
 
 const host = "127.0.0.1";
@@ -987,13 +985,13 @@ function parseBoundedFloat(name, defaultValue, minimum, maximum) {
 
 function resolveSmokeMinecraftProfile(value) {
     const key = String(value ?? "").trim();
-    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3]
+    const profile = MINECRAFT_PROFILES
             .find((candidate) => candidate.name === key ||
                     String(candidate.protocolVersion) === key);
     if (profile === undefined) {
         throw new Error(
                 `Unsupported smoke Minecraft version ${value}; ` +
-                "expected 1.21.11/774, 26.2/776 or 26.3/777");
+                `expected ${MINECRAFT_PROFILES.map(profile => `${profile.name}/${profile.protocolVersion}`).join(", ")}`);
     }
     return profile;
 }

@@ -8,6 +8,7 @@
  * owns profile ordering, environment isolation, timeout, and aggregation.
  */
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "../../port/scripts/verification-profiles.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,7 @@ import { fileURLToPath } from "node:url";
 const bridgeDirectory = fileURLToPath(new URL(".", import.meta.url));
 const smokePath = fileURLToPath(
     new URL("./browser-full-path-smoke.mjs", import.meta.url));
-const profiles = ["26.2", "1.21.11"];
+const profiles = [CANONICAL_PROFILE.id, LEGACY_PROFILE.id];
 const requiredAcceptance = Object.freeze({
     clients: 4,
     minimumChunkPackets: 9,
@@ -35,15 +36,15 @@ const multiplayerPerformanceTarget = Object.freeze({
     maxSoakPhaseStallMillis: 500,
 });
 const canonicalProfiles = Object.freeze({
-    "26.2": Object.freeze({
-        canonicalPath: "port/versions/26.2.json",
+    [CANONICAL_PROFILE.id]: Object.freeze({
+        canonicalPath: "port/versions/" + CANONICAL_PROFILE.id + ".json",
         protocolVersion: 776,
         worldVersion: 4903,
         javaVersion: 25,
         serverSha1: "823e2250d24b3ddac457a60c92a6a941943fcd6a",
     }),
-    "1.21.11": Object.freeze({
-        canonicalPath: "port/versions/1.21.11.json",
+    [LEGACY_PROFILE.id]: Object.freeze({
+        canonicalPath: "port/versions/" + LEGACY_PROFILE.id + ".json",
         protocolVersion: 774,
         worldVersion: 4671,
         javaVersion: 21,
@@ -68,8 +69,8 @@ const browserCleanupGauges = Object.freeze([
     "decodedPacketQueue",
 ]);
 const runtimeJavaPolicy = Object.freeze({
-    "1.21.11": "major-exactly-21",
-    "26.2": "major-at-least-25",
+    [LEGACY_PROFILE.id]: "major-exactly-21",
+    [CANONICAL_PROFILE.id]: "major-at-least-25",
 });
 const requiredChildAcceptance = Object.freeze({
     ...requiredAcceptance,
@@ -131,7 +132,7 @@ const contractEnvironmentProbe = process.argv.length === 3 &&
     process.argv[2] === "--contract-env";
 
 if (contractEnvironmentProbe) {
-    const environment = childEnvironment("26.2");
+    const environment = childEnvironment(CANONICAL_PROFILE.id);
     console.log(JSON.stringify({
         removedPollution: ENV_POLLUTION_PROBE_NAMES.filter((name) =>
             environment[name] === undefined),
@@ -856,15 +857,15 @@ function checkRuntimeJava(value, profile, label, failures, add, equal) {
         `${label} runtime Java executable evidence is missing`);
     add(Number.isSafeInteger(major),
         `${label} runtime Java major is invalid: ${JSON.stringify(major)}`);
-    const accepted = profile === "1.21.11" ? major === 21 : major >= 25;
+    const accepted = profile === LEGACY_PROFILE.id ? major === 21 : major >= 25;
     add(accepted,
         `${label} runtime Java policy failed for ${profile}: ${JSON.stringify(major)}`);
-    if (profile === "1.21.11" && Number.isSafeInteger(major)) {
-        equal(major, 21, `${label} runtime Java major (1.21.11 exact policy)`);
+    if (profile === LEGACY_PROFILE.id && Number.isSafeInteger(major)) {
+        equal(major, 21, `${label} runtime Java major (${LEGACY_PROFILE.id} exact policy)`);
     }
-    if (profile === "26.2" && Number.isSafeInteger(major)) {
+    if (profile === CANONICAL_PROFILE.id && Number.isSafeInteger(major)) {
         add(major >= 25,
-            `${label} runtime Java major (26.2 minimum policy): ${major}`);
+            `${label} runtime Java major (${CANONICAL_PROFILE.id} minimum policy): ${major}`);
     }
 }
 

@@ -42,6 +42,17 @@
   var OPTION_PRESERVE_BINDINGS = 3;
   var OPTION_GENERATE_DEBUG_INFO = 4;
   var OPTION_OPTIMIZATION_LEVEL = 5;
+  // The blaze3d front-end of 26.2 and 1.21.11 (GlslCompiler sets it; renderpearl does not).
+  var OPTION_AUTO_MAP_LOCATIONS = 6;
+  // The export each option code calls.
+  var OPTION_EXPORTS = {
+    1: "_shaderc_compile_options_set_target_env",
+    2: "_shaderc_compile_options_set_auto_bind_uniforms",
+    3: "_shaderc_compile_options_set_preserve_bindings",
+    4: "_shaderc_compile_options_set_generate_debug_info",
+    5: "_shaderc_compile_options_set_optimization_level",
+    6: "_shaderc_compile_options_set_auto_map_locations"
+  };
 
   function describe(error) {
     if (error && typeof error === "object") {
@@ -421,10 +432,36 @@
         case OPTION_OPTIMIZATION_LEVEL:
           M._shaderc_compile_options_set_optimization_level(options, op.a);
           break;
+        case OPTION_AUTO_MAP_LOCATIONS:
+          M._shaderc_compile_options_set_auto_map_locations(options, op.a ? 1 : 0);
+          break;
         default:
           throw new Error("gaius shader toolchain: unknown shaderc option " + op.code);
       }
     }
+
+    // A job option the loaded module cannot apply: modules built before an export was added (the
+    // auto map locations export came with the blaze3d front-end). The job fails cleanly instead of
+    // retiring a healthy instance.
+    function unsupportedOption(M, ops) {
+      for (var i = 0; i < ops.length; i++) {
+        var name = OPTION_EXPORTS[ops[i].code];
+        if (ops[i].code !== 0 && name && typeof M[name] !== "function") {
+          var error = new Error("this gaius-shaderc.wasm does not export " + name.slice(1)
+            + " (rebuild it with port/scripts/build-wasm-shader-toolchain.sh)");
+          error.gaiusUnsupported = true;
+          return error;
+        }
+      }
+      return null;
+    }
+
+    // Whether the live shaderc module can apply option `code` (false while no instance is ready).
+    api.shadercSupportsOption = function (code) {
+      var M = shadercSlot.live();
+      var name = OPTION_EXPORTS[code | 0];
+      return M !== null && !!name && typeof M[name] === "function";
+    };
 
     api.shadercBegin = function () {
       var id = nextJob++;
@@ -497,6 +534,8 @@
           throw new Error("no shaderc instance is ready yet (a replacement is starting)");
         }
         var state = shadercSlot.state;
+        var unsupported = unsupportedOption(M, current.ops);
+        if (unsupported) throw unsupported;
         var options = M._shaderc_compile_options_initialize();
         if (!options) throw new Error("shaderc_compile_options_initialize failed");
         for (var i = 0; i < current.ops.length; i++) {
@@ -547,7 +586,7 @@
         current.status = SHADERC_STATUS_INTERNAL_ERROR;
         current.bytes = new Uint8Array(0);
         current.error = "Gaius shader toolchain: shaderc failed ("
-          + (M === null ? describe(error) : shadercSlot.retire(error)) + ")";
+          + (M === null || error.gaiusUnsupported ? describe(error) : shadercSlot.retire(error)) + ")";
         current.warnings = 0;
         current.errors = 1;
       }

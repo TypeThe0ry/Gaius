@@ -41,6 +41,13 @@ import org.teavm.runtime.Fiber;
  * <p>An activation that stops without unwinding (a wasm trap, which a build without strict
  * checks also raises for a null dereference or an array bound) is ended by the host through
  * {@link #abandon}.
+ *
+ * <p>Class initialization follows the JVM (design D3): every class initializer of a JSPI build
+ * starts with a guard that GaiusTeaVMOptions.wasmWrapMethodBody generates, which calls
+ * {@link #clinitEnter} and, on every exit of the initializer, {@link #clinitExit}. While an
+ * activation runs an initializer (it may suspend in it), another activation that triggers the
+ * same class parks until the initializer ends, instead of seeing the class half-initialized
+ * as TeaVM's stock code (which erases the initializer pointer before the body runs) lets it.
  */
 public final class TJspiThreadSupport {
     /** Handle of the main thread; its activation runs the program's main method. */
@@ -59,6 +66,24 @@ public final class TJspiThreadSupport {
     private static TThread[] parkedThreads = new TThread[16];
     /** Handle of the activation that runs Java code now, -1 while JS code calls into Java. */
     private static int active = -1;
+
+    // Class initializers that run now ({@link #clinitEnter}). These fields have no
+    // initializers: the generated guards call clinitEnter and clinitExit directly, also before
+    // this class's own static initializer has run (and for that initializer itself), so the
+    // state must be valid at its default values and must never be reset by that initializer.
+    /** Ids (GaiusTeaVMOptions.wasmWrapMethodBody) of the class initializers that run now. */
+    private static int[] clinitIds;
+    /**
+     * For each entry of {@link #clinitIds}: handle plus one of the activation that runs it
+     * (0: host code; -1: an abandoned activation, see {@link #clinitAbandon}).
+     */
+    private static int[] clinitOwners;
+    private static int clinitCount;
+    /** Class initializers on the stack of each activation, by handle plus one (0: host code). */
+    private static int[] clinitDepths;
+    /** Handles of the activations that wait in {@link #clinitEnter} for another activation. */
+    private static int[] clinitWaiting;
+    private static int clinitWaitingCount;
 
     static {
         JspiHost.install(new JspiHost.Threads() {
@@ -80,6 +105,11 @@ public final class TJspiThreadSupport {
             @Override
             public Object awaitResult(AsyncCallback<Object> result) {
                 return TJspiThreadSupport.awaitResult(result);
+            }
+
+            @Override
+            public void awaitFrame(int interval) {
+                TJspiThreadSupport.awaitFrame(interval);
             }
         });
     }
@@ -205,11 +235,17 @@ public final class TJspiThreadSupport {
         if (active == handle) {
             active = -1;
         }
-        if (handle <= MAIN || handle >= threads.length || threads[handle] == null) {
-            // The main thread (its failure reaches the boot through startMain) or a slot that
-            // run's finally already released.
+        if (handle == MAIN) {
+            // Its failure reaches the boot through startMain; threads that wait for a class it
+            // was initializing go on with the class as it is.
+            clinitAbandon(handle);
             return;
         }
+        if (handle < MAIN || handle >= threads.length || threads[handle] == null) {
+            // A slot that run's finally already released (and may have handed out again).
+            return;
+        }
+        clinitAbandon(handle);
         TThread thread = threads[handle];
         Runnable task = tasks[handle];
         threads[handle] = null;
@@ -264,9 +300,11 @@ public final class TJspiThreadSupport {
     private static int activeHandle(String what) {
         int handle = current();
         if (handle < 0) {
-            throw new IllegalStateException("Gaius JSPI: " + what + " outside a Java thread"
+            IllegalStateException failure = new IllegalStateException("Gaius JSPI: " + what + " outside a Java thread"
                     + " activation (a JS callback into Java cannot suspend; post the work to a"
-                    + " thread instead)");
+                    + " thread instead) [callback=" + JspiHost.callbackName() + "]");
+            failure.printStackTrace();
+            throw failure;
         }
         return handle;
     }
@@ -278,6 +316,7 @@ public final class TJspiThreadSupport {
      * a JS frame) would skip the finally block.
      */
     private static boolean park(int handle, double timeoutMillis) {
+        countClinitSuspend(handle);
         TThread thread = TThread.currentThread();
         active = -1;
         int result;
@@ -301,11 +340,262 @@ public final class TJspiThreadSupport {
         }
         TThread thread = TThread.currentThread();
         active = -1;
+        int suspended;
         try {
-            JspiHost.yieldNow(handle);
+            suspended = JspiHost.yieldNow(handle);
         } finally {
             active = handle;
             TThread.setCurrentThread(thread);
+        }
+        if (suspended != 0) {
+            countClinitSuspend(handle);
+        }
+    }
+
+    /**
+     * HostLoop.awaitAnimationFrame (design D4): suspends the current thread until the browser
+     * is ready for the next frame; {@code interval} is the swap interval of the last present.
+     * Returns at once in a JS callback, which has no thread to suspend.
+     */
+    static void awaitFrame(int interval) {
+        int handle = current();
+        if (handle < 0) {
+            return;
+        }
+        countClinitSuspend(handle);
+        TThread thread = TThread.currentThread();
+        active = -1;
+        try {
+            JspiHost.frame(handle, interval);
+        } finally {
+            active = handle;
+            TThread.setCurrentThread(thread);
+        }
+    }
+
+    /**
+     * Patched {@code Thread.join(long, int)} (join(long) and join() call it): the JVM's loop,
+     * which waits on the thread's finishedLock while the thread is alive and re-checks after
+     * every wake-up, so a spurious or foreign notify and a timed wait that ends early do not
+     * end the join. TeaVM's stock join waits once, outside any loop, and treats a thread that
+     * was never started as alive (TThread sets alive in its constructor); here a thread is alive
+     * from start() until runThread ends, as on the JVM. A join on the current thread returns at
+     * once, as the stock join does.
+     */
+    static void join(TThread thread, long millis, int nanos) throws InterruptedException {
+        if (millis < 0 || nanos < 0 || nanos > 999999) {
+            throw new TIllegalArgumentException();
+        }
+        if (thread == TThread.currentThread()) {
+            return;
+        }
+        if (nanos > 0 && millis < Long.MAX_VALUE) {
+            millis++;
+        }
+        Object lock = thread.finishedLock;
+        synchronized (lock) {
+            if (millis == 0) {
+                while (startedAndAlive(thread)) {
+                    lock.wait(0);
+                }
+            } else {
+                double deadline = (double) System.currentTimeMillis() + millis;
+                while (startedAndAlive(thread)) {
+                    double left = deadline - System.currentTimeMillis();
+                    if (left <= 0) {
+                        break;
+                    }
+                    lock.wait(left >= Long.MAX_VALUE ? Long.MAX_VALUE : (long) Math.ceil(left));
+                }
+            }
+        }
+    }
+
+    /** Started (it has an activation slot: TThread.gaiusJspiSlot) and runThread has not ended. */
+    private static boolean startedAndAlive(TThread thread) {
+        return thread.alive && thread.gaiusJspiSlot > 0;
+    }
+
+    /**
+     * Start of every class initializer of a JSPI build (the guard that
+     * GaiusTeaVMOptions.wasmWrapMethodBody generates; {@code id} numbers the class). Returns true
+     * when the caller must run the initializer body: no activation runs it yet, so the current
+     * one is now its initializing thread. Returns false when the body must be skipped: the
+     * current activation already runs it (a recursive request, as on the JVM), or another
+     * activation ran it while this one waited here, as the JVM's class initialization lock
+     * makes it wait. A JS callback cannot wait: it goes on with the class as it is, as TeaVM's
+     * stock code does for every caller, and the case is counted
+     * ({@link JspiHost#CLINIT_UNWAITABLE}).
+     *
+     * <p>The guard calls this without initializing this class (it may run before this class's
+     * own static initializer, and for it), so the path to the first return touches nothing but
+     * the clinit fields, which are valid at their default values.
+     *
+     * <p>Exported only so that the dependency analysis keeps it (and its body, which TeaVM
+     * would otherwise drop once it inlined the only call site) for the generated guards. TeaVM
+     * starts an exported method with the initialization of its class; this class's own
+     * initializer is therefore not guarded (GaiusTeaVMOptions.wasmWrapMethodBody), it runs
+     * before any thread exists, and the guard of every other class reaches it as already
+     * initialized.
+     */
+    @Export(name = "gaius.jspi.clinitEnter")
+    public static boolean clinitEnter(int id) {
+        int owner = active + 1;
+        int[] ids = clinitIds;
+        int count = clinitCount;
+        for (int i = count - 1; i >= 0; i--) {
+            if (ids[i] == id) {
+                return clinitBusy(id, clinitOwners[i], owner);
+            }
+        }
+        if (ids == null || count == ids.length) {
+            int size = ids == null ? 16 : ids.length * 2;
+            int[] grownIds = new int[size];
+            int[] grownOwners = new int[size];
+            for (int i = 0; i < count; i++) {
+                grownIds[i] = ids[i];
+                grownOwners[i] = clinitOwners[i];
+            }
+            clinitIds = grownIds;
+            clinitOwners = grownOwners;
+            ids = grownIds;
+        }
+        ids[count] = id;
+        clinitOwners[count] = owner;
+        clinitCount = count + 1;
+        int[] depths = clinitDepths;
+        if (depths == null || owner >= depths.length) {
+            // No library calls on this path (Math.max would request Math's initializer).
+            int size = depths == null ? 16 : depths.length * 2;
+            if (size <= owner) {
+                size = owner + 1;
+            }
+            int[] grown = new int[size];
+            if (depths != null) {
+                for (int i = 0; i < depths.length; i++) {
+                    grown[i] = depths[i];
+                }
+            }
+            clinitDepths = grown;
+            depths = grown;
+        }
+        depths[owner]++;
+        return true;
+    }
+
+    /**
+     * End of every class initializer that {@link #clinitEnter} let run, on its normal and its
+     * exceptional exit (the guard erases TeaVM's initializer pointer right before, so later
+     * requests skip the initializer): the class is initialized, the activations that wait for
+     * it resume. Exported for the same reason as clinitEnter.
+     */
+    @Export(name = "gaius.jspi.clinitExit")
+    public static void clinitExit(int id) {
+        int[] ids = clinitIds;
+        int count = clinitCount;
+        for (int i = count - 1; i >= 0; i--) {
+            if (ids[i] != id) {
+                continue;
+            }
+            int owner = clinitOwners[i];
+            for (int j = i + 1; j < count; j++) {
+                ids[j - 1] = ids[j];
+                clinitOwners[j - 1] = clinitOwners[j];
+            }
+            clinitCount = count - 1;
+            int[] depths = clinitDepths;
+            if (owner >= 0 && depths != null && owner < depths.length && depths[owner] > 0) {
+                depths[owner]--;
+            }
+            if (clinitWaitingCount > 0) {
+                for (int k = 0; k < clinitWaitingCount; k++) {
+                    JspiHost.unpark(clinitWaiting[k]);
+                }
+            }
+            return;
+        }
+    }
+
+    /**
+     * The class initializer {@code id} runs already ({@code initOwner}): returns false after
+     * waiting for it when another activation runs it. Host code (owner 0) cannot suspend, so a
+     * host entry that is still there was cut short by a trap, as are the entries of an
+     * abandoned activation (-1): nobody will end them, and the caller goes on.
+     */
+    private static boolean clinitBusy(int id, int initOwner, int owner) {
+        if (initOwner == owner || initOwner <= 0) {
+            return false;
+        }
+        int handle = current();
+        if (handle < 0) {
+            JspiHost.clinitEvent(JspiHost.CLINIT_UNWAITABLE);
+            return false;
+        }
+        JspiHost.clinitEvent(JspiHost.CLINIT_WAIT);
+        int[] waiting = clinitWaiting;
+        if (waiting == null || clinitWaitingCount == waiting.length) {
+            int[] grown = new int[waiting == null ? 8 : waiting.length * 2];
+            for (int i = 0; i < clinitWaitingCount; i++) {
+                grown[i] = waiting[i];
+            }
+            clinitWaiting = grown;
+        }
+        clinitWaiting[clinitWaitingCount++] = handle;
+        try {
+            while (clinitRunning(id)) {
+                park(handle, 0);
+            }
+        } finally {
+            for (int i = 0; i < clinitWaitingCount; i++) {
+                if (clinitWaiting[i] == handle) {
+                    clinitWaiting[i] = clinitWaiting[--clinitWaitingCount];
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** True while an activation that can still end it runs the class initializer {@code id}. */
+    private static boolean clinitRunning(int id) {
+        for (int i = clinitCount - 1; i >= 0; i--) {
+            if (clinitIds[i] == id) {
+                return clinitOwners[i] > 0;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The activation of {@code handle} stopped without unwinding ({@link #abandon}): the class
+     * initializers it was running never end. Their entries stay, marked as abandoned, so later
+     * requests skip the initializers (as after TeaVM's stock erase) instead of running them a
+     * second time, and the activations that wait for them go on.
+     */
+    private static void clinitAbandon(int handle) {
+        int owner = handle + 1;
+        boolean changed = false;
+        for (int i = 0; i < clinitCount; i++) {
+            if (clinitOwners[i] == owner) {
+                clinitOwners[i] = -1;
+                changed = true;
+            }
+        }
+        if (clinitDepths != null && owner < clinitDepths.length) {
+            clinitDepths[owner] = 0;
+        }
+        if (changed) {
+            for (int k = 0; k < clinitWaitingCount; k++) {
+                JspiHost.unpark(clinitWaiting[k]);
+            }
+        }
+    }
+
+    /** Counts a suspension of {@code handle} with a class initializer on its stack (telemetry). */
+    private static void countClinitSuspend(int handle) {
+        int[] depths = clinitDepths;
+        if (depths != null && handle + 1 < depths.length && depths[handle + 1] > 0) {
+            JspiHost.clinitEvent(JspiHost.CLINIT_SUSPEND);
         }
     }
 

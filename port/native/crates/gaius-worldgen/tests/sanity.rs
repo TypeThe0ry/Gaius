@@ -2,7 +2,7 @@
 //! density systems. They do not prove vanilla parity (that needs fixtures dumped
 //! from the client jars); they catch broken plumbing.
 
-use gaius_noise::Profile;
+use gaius_noise::Semantics;
 use gaius_worldgen::chunk::HeightmapKind;
 use gaius_worldgen::ir::example::{overworld, state};
 use gaius_worldgen::ir::Ir;
@@ -10,10 +10,10 @@ use gaius_worldgen::{Generator, TerrainRequest};
 
 #[test]
 fn ir_round_trips() {
-    for profile in [Profile::V26_2, Profile::V26_3] {
-        let ir = overworld(profile, 7);
+    for &semantics in Semantics::all() {
+        let ir = overworld(semantics, 7);
         let bytes = ir.encode();
-        assert_eq!(Ir::decode(&bytes).expect("decodes"), ir, "{profile:?}");
+        assert_eq!(Ir::decode(&bytes).expect("decodes"), ir, "{semantics:?}");
         let mut bad = bytes.clone();
         bad.truncate(bytes.len() - 3);
         assert!(Ir::decode(&bad).is_err());
@@ -22,8 +22,8 @@ fn ir_round_trips() {
 
 #[test]
 fn terrain_has_ground_air_and_sea() {
-    for profile in [Profile::V26_2, Profile::V26_3] {
-        let mut generator = Generator::load(&overworld(profile, 1234).encode()).expect("loads");
+    for &semantics in Semantics::all() {
+        let mut generator = Generator::load(&overworld(semantics, 1234).encode()).expect("loads");
         for (cx, cz) in [(0, 0), (-3, 5), (40, -17)] {
             let request = TerrainRequest {
                 chunk_x: cx,
@@ -38,24 +38,24 @@ fn terrain_has_ground_air_and_sea() {
             assert_ne!(
                 bottom,
                 state::AIR as u16,
-                "{profile:?} {cx} {cz}: the deep layers are solid"
+                "{semantics:?} {cx} {cz}: the deep layers are solid"
             );
             assert_eq!(
                 chunk.get(cx * 16, 318, cz * 16),
                 state::AIR as u16,
-                "{profile:?}: the sky is air"
+                "{semantics:?}: the sky is air"
             );
             for x in 0..16 {
                 for z in 0..16 {
                     let top = chunk.height_at(HeightmapKind::WorldSurface, x, z);
-                    assert!((-64..320).contains(&top), "{profile:?}: height {top}");
+                    assert!((-64..320).contains(&top), "{semantics:?}: height {top}");
                     let floor = chunk.height_at(HeightmapKind::OceanFloor, x, z);
                     assert!(floor <= top);
                     let at_top = chunk.get(cx * 16 + x, top, cz * 16 + z);
                     assert_ne!(
                         at_top,
                         state::AIR as u16,
-                        "{profile:?}: the heightmap points at a block"
+                        "{semantics:?}: the heightmap points at a block"
                     );
                 }
             }
@@ -64,17 +64,17 @@ fn terrain_has_ground_air_and_sea() {
             assert!(biomes.iter().all(|b| (40..=43).contains(b)));
             // The same request again is bit identical (no state leaks between jobs).
             let again = generator.run_terrain(&request);
-            assert_eq!(again.chunk.blocks, result.chunk.blocks, "{profile:?}: deterministic");
+            assert_eq!(again.chunk.blocks, result.chunk.blocks, "{semantics:?}: deterministic");
             assert_eq!(again.chunk.world_surface, result.chunk.world_surface);
-            assert_eq!(generator.run_biomes(cx, cz), biomes, "{profile:?}: biome job matches");
+            assert_eq!(generator.run_biomes(cx, cz), biomes, "{semantics:?}: biome job matches");
         }
     }
 }
 
 #[test]
 fn surface_job_matches_inline_surface() {
-    for profile in [Profile::V26_2, Profile::V26_3] {
-        let mut generator = Generator::load(&overworld(profile, 99).encode()).expect("loads");
+    for &semantics in Semantics::all() {
+        let mut generator = Generator::load(&overworld(semantics, 99).encode()).expect("loads");
         let mut request = TerrainRequest {
             chunk_x: 2,
             chunk_z: -1,
@@ -85,12 +85,12 @@ fn surface_job_matches_inline_surface() {
         let inline = generator.run_terrain(&request).chunk;
         generator.run_surface(&mut filled, Default::default());
         let differing = filled.blocks.iter().zip(&inline.blocks).filter(|(a, b)| a != b).count();
-        assert_eq!(differing, 0, "{profile:?}: {differing} blocks differ");
+        assert_eq!(differing, 0, "{semantics:?}: {differing} blocks differ");
         let surfaced = inline
             .blocks
             .iter()
             .filter(|&&b| b == state::GRASS as u16 || b == state::DIRT as u16)
             .count();
-        assert!(surfaced > 0, "{profile:?}: the surface rules placed blocks");
+        assert!(surfaced > 0, "{semantics:?}: the surface rules placed blocks");
     }
 }

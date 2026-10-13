@@ -1,5 +1,6 @@
 package dev.gaius.browser;
 
+import dev.gaius.browser.ops.VersionOps;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager;
@@ -37,7 +38,7 @@ public final class BrowserStructurePreloader {
         int failed = 0;
         double maxOne = 0.0;
         String stopReason = "completed";
-        StructureTemplateManager manager = server.getStructureManager();
+        StructureTemplateManager manager = VersionOps.INSTANCE.structureTemplateManager(server);
         recordStart(ids.length, limit, startedAt, 0, 0, 0, "running");
         if (nowMillis() >= deadline) {
             recordEnd(0, 0, 0, 0.0, Math.max(0.0, nowMillis() - startedAt), "budget");

@@ -97,19 +97,17 @@ gaius_load_version_profile() {
 # patches listed in port/tools/bringup/<profile>.txt are skipped.  Each list
 # line is "<patchId> | <owner package> | <reason>"; '#' starts a comment.
 # The mode is active only when the caller exports GAIUS_BRINGUP=1 and the
-# profile is not one of the release profiles (26.2, 1.21.11).  Every skipped
-# patch prints "BRINGUP_SKIP <patchId>" so check-build-log-skips.mjs can match
-# the build log against the list.
+# profile allows it ("bringupAllowed": true in port/versions/<id>.json; a new
+# profile does, a profile whose patches are all finished does not).  Every
+# skipped patch prints "BRINGUP_SKIP <patchId>" so check-build-log-skips.mjs can
+# match the build log against the list.
 gaius_bringup_list_path() {
   local root="$1"
   printf '%s\n' "$root/port/tools/bringup/$GAIUS_MINECRAFT_VERSION.txt"
 }
 
 gaius_bringup_profile_allowed() {
-  case "$GAIUS_MINECRAFT_VERSION" in
-    26.2|1.21.11) return 1 ;;
-  esac
-  return 0
+  jq -e '.bringupAllowed == true' "$GAIUS_VERSION_PROFILE" >/dev/null
 }
 
 gaius_bringup_active() {
@@ -212,10 +210,9 @@ gaius_bringup_ids() {
   '
 }
 
-# Prints the entries of a version excludes.txt, one relative path per line:
-# port/src/versions/<profile>/excludes.txt,
-# port/overrides/client/src/versions/<profile>/excludes.txt or
-# port/overrides/libraries/<name>/src/versions/<artifact-version>/excludes.txt.
+# Prints the entries of a library version excludes.txt, one relative path per line:
+# port/overrides/libraries/<name>/src/versions/<artifact-version>/excludes.txt
+# (the source sets of port/mc/shared have their own, read by port/tools/sourcesets).
 # Each entry is a path relative to SHARED_ROOT (the matching src/main/java).
 # '#' starts a comment, CR line ends and surrounding whitespace are ignored,
 # and an entry that does not name an existing file under SHARED_ROOT fails, so

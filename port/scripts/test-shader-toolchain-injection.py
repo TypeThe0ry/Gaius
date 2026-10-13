@@ -24,6 +24,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from verification_profiles import CANONICAL_ID, RENDERPEARL_ID
+
 ROOT = Path(__file__).resolve().parents[2]
 POSTPROCESS = ROOT / "port/scripts/postprocess-index-html.py"
 TEMPLATE = ROOT / "port/web/launcher/index.template.html"
@@ -68,14 +70,14 @@ def main() -> int:
             target.mkdir()
             (target / "index.html").write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
             (target / "classes.js").write_text("window.__gaiusSmokeClasses = true;\n", encoding="utf-8")
-        result = postprocess(plain_dir / "index.html", plain_dir / "classes.js", "26.2", "32")
+        result = postprocess(plain_dir / "index.html", plain_dir / "classes.js", CANONICAL_ID, "32")
         if result.returncode != 0:
             raise AssertionError(f"26.2 postprocess failed:\n{result.stderr}")
         plain = (plain_dir / "index.html").read_text(encoding="utf-8")
         original = module.patch_shader_toolchain_loader
         module.patch_shader_toolchain_loader = lambda text, classes_js, index, profile_id: text
         try:
-            module.patch_index(reference_dir / "index.html", reference_dir / "classes.js", "26.2", "32")
+            module.patch_index(reference_dir / "index.html", reference_dir / "classes.js", CANONICAL_ID, "32")
         finally:
             module.patch_shader_toolchain_loader = original
         if plain != (reference_dir / "index.html").read_text(encoding="utf-8"):
@@ -90,21 +92,21 @@ def main() -> int:
         classes = needs_dir / "classes.js"
         index.write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
         classes.write_text("function x(){return window.__gaiusShaderToolchain.shadercBegin();}\n", encoding="utf-8")
-        strict = postprocess(index, classes, "26.3", "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
+        strict = postprocess(index, classes, RENDERPEARL_ID, "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
         if strict.returncode == 0 or "gaius-shaderc.wasm" not in strict.stderr:
             raise AssertionError(f"strict mode accepted missing toolchain files:\n{strict.stderr}")
-        warned = postprocess(index, classes, "26.3", "34")
+        warned = postprocess(index, classes, RENDERPEARL_ID, "34")
         if warned.returncode != 0 or "warning:" not in warned.stderr:
             raise AssertionError(f"missing toolchain files were not a warning:\n{warned.stderr}")
         for name in FILES:
             (needs_dir / name).write_bytes(name.encode("ascii"))
         index.write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
-        first = postprocess(index, classes, "26.3", "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
+        first = postprocess(index, classes, RENDERPEARL_ID, "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
         if first.returncode != 0:
             raise AssertionError(f"26.3 postprocess failed:\n{first.stderr}")
         page = index.read_text(encoding="utf-8")
         token = module.content_token(*(needs_dir / name for name in FILES))
-        loader = (f'<script data-gaius-shader-toolchain data-profile="26.3" '
+        loader = (f'<script data-gaius-shader-toolchain data-profile="{RENDERPEARL_ID}" '
                   f'src="gaius-shader-toolchain.js?v={token}"></script>')
         head, body = page.split("</head>", 1)
         if head.count(loader) != 1 or page.count("gaius-shader-toolchain.js?v=") != 1:
@@ -119,11 +121,11 @@ def main() -> int:
         if not (gate < body.index("await window.__gaiusShaderToolchainReady;")
                 and "throw new Error(" in body[gate:body.index("await window.__gaiusShaderToolchainReady;")]):
             raise AssertionError("a missing toolchain loader does not stop the boot before main(args)")
-        second = postprocess(index, classes, "26.3", "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
+        second = postprocess(index, classes, RENDERPEARL_ID, "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
         if second.returncode != 0 or index.read_text(encoding="utf-8") != page:
-            raise AssertionError("a second postprocess changed the 26.3 page")
+            raise AssertionError(("a second postprocess changed the " + RENDERPEARL_ID + " page"))
         (needs_dir / "gaius-spvc.wasm").write_bytes(b"rebuilt")
-        third = postprocess(index, classes, "26.3", "34")
+        third = postprocess(index, classes, RENDERPEARL_ID, "34")
         rebuilt = index.read_text(encoding="utf-8")
         if third.returncode != 0 or rebuilt.count("gaius-shader-toolchain.js?v=") != 1 or loader in rebuilt:
             raise AssertionError("a rebuilt toolchain did not replace the loader token exactly once")

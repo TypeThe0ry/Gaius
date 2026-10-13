@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from verification_profiles import CANONICAL_ID, LEGACY_ID, RENDERPEARL_ID
+
 
 SCRIPT = Path(__file__).with_name("build-portable-html.py")
 SPEC = importlib.util.spec_from_file_location("build_portable_html", SCRIPT)
@@ -24,7 +26,7 @@ assert SPEC is not None and SPEC.loader is not None
 PORTABLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PORTABLE)
 
-QUICK_CHECK_SCRIPT = Path(__file__).with_name("quick-check.py")
+QUICK_CHECK_SCRIPT = Path(__file__).parent / "legacy" / "quick-check.py"
 QUICK_CHECK_SPEC = importlib.util.spec_from_file_location(
     "quick_check", QUICK_CHECK_SCRIPT
 )
@@ -112,7 +114,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         self,
         directory: str,
         *,
-        version: str = "26.2",
+        version: str = CANONICAL_ID,
         distribution: str = "named",
         profile_file: str | None = None,
         profile_id: str | None = None,
@@ -120,6 +122,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         launcher_asset_index: str | None = None,
         classes: bytes | None = None,
         classes_gzip: bytes | None = None,
+        boot: bool = False,
     ) -> tuple[Path, Path, Path]:
         root = Path(directory) / "project"
         dist = root / "port" / "web" / "dist"
@@ -129,7 +132,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         profile_file = profile_file or f"{version}.json"
         profile_id = profile_id or version
         launcher_version = launcher_version or version
-        launcher_asset_index = launcher_asset_index or ("32" if version == "26.2" else "29")
+        launcher_asset_index = launcher_asset_index or ("32" if version == CANONICAL_ID else "29")
         (root / "port" / "config.json").write_text(
             json.dumps(
                 {
@@ -145,8 +148,8 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                     "id": profile_id,
                     "releaseType": "release",
                     "clientDistribution": distribution,
-                    "protocolVersion": 776 if version == "26.2" else 774,
-                    "worldVersion": 4903 if version == "26.2" else 4671,
+                    "protocolVersion": 776 if version == CANONICAL_ID else 774,
+                    "worldVersion": 4903 if version == CANONICAL_ID else 4671,
                     "storage": {
                         "schema": 2,
                         "databaseName": f"gaius-fs-v2-{profile_id}",
@@ -165,13 +168,19 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             f'"--assetIndex", "{launcher_asset_index}"];</script>\n'
             f'<script data-gaius-storage-profile="v2">'
             f'window.__gaiusProfileId = "{profile_id}"; '
-            f'window.__gaiusWorldVersion = {4903 if version == "26.2" else 4671}; '
+            f'window.__gaiusWorldVersion = {4903 if version == CANONICAL_ID else 4671}; '
             'window.__gaiusStorageSchema = 2; '
             f'window.__gaiusStorageDatabaseName = "gaius-fs-v2-{profile_id}"; '
             f'window.__gaiusStoragePrefix = "gaius.fs.v2:{profile_id}:"; '
             f'window.__gaiusStorageOpfsDirectory = "regions-v2-{profile_id}";</script>\n'
             '  <script>\n    if (typeof Error === "function") {}\n  </script>\n'
         )
+        if boot:
+            # The launcher's boot script tag and its source (the page runtime picks the client).
+            index = index.replace("<!doctype html>\n", "<!doctype html>\n" + PORTABLE.BOOT_TAG, 1)
+            boot_source = root / PORTABLE.BOOT_SOURCE
+            boot_source.parent.mkdir(parents=True, exist_ok=True)
+            boot_source.write_text("window.__gaiusBoot = {fixture: true};\n", encoding="utf-8")
         (dist / "index.html").write_text(index, encoding="utf-8")
 
         classes = classes or (
@@ -397,7 +406,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         token = PORTABLE.shader_toolchain_token(dist)
         index = dist / "index.html"
         tag = (
-            f'  <script data-gaius-shader-toolchain data-profile="26.3" '
+            f'  <script data-gaius-shader-toolchain data-profile="{RENDERPEARL_ID}" '
             f'src="gaius-shader-toolchain.js?v={token}"></script>\n'
         )
         index.write_text(
@@ -409,7 +418,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
     def make_shader_toolchain_fixture(self, directory: str) -> tuple[Path, Path, Path, str]:
         root, dist, output = self.make_fixture(
             directory,
-            version="26.3",
+            version=RENDERPEARL_ID,
             launcher_asset_index="34",
             classes=self.SHADER_TOOLCHAIN_CLASSES,
         )
@@ -489,15 +498,15 @@ class PortableArtifactIdentityTest(unittest.TestCase):
 
             manifest_path = dist / "Gaius.manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["profile"], "26.2")
+            self.assertEqual(manifest["profile"], CANONICAL_ID)
             self.assertEqual(manifest["worldVersion"], 4903)
             self.assertEqual(
                 manifest["storage"],
                 {
                     "schema": 2,
-                    "databaseName": "gaius-fs-v2-26.2",
-                    "prefix": "gaius.fs.v2:26.2:",
-                    "opfsDirectory": "regions-v2-26.2",
+                    "databaseName": ("gaius-fs-v2-" + CANONICAL_ID + ""),
+                    "prefix": ("gaius.fs.v2:" + CANONICAL_ID + ":"),
+                    "opfsDirectory": ("regions-v2-" + CANONICAL_ID + ""),
                 },
             )
             self.assertEqual(manifest["buildIdentity"]["worldVersion"], 4903)
@@ -557,19 +566,19 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 "gaius-active-overlay-inputs-v1",
             )
             shared_overlays = root / "port" / "work" / "overlays"
-            isolated_overlays = root / "port" / "work" / "overlays" / "26.2"
+            isolated_overlays = root / "port" / "work" / "overlays" / CANONICAL_ID
             shutil.copytree(shared_overlays, isolated_overlays)
             external_shared_overlays = Path(directory) / "external-shared-overlays"
             external_isolated_overlays = Path(directory) / "external-isolated-overlays"
             shutil.copytree(shared_overlays, external_shared_overlays)
             shutil.copytree(isolated_overlays, external_isolated_overlays)
-            client_version = root / "port" / "work" / "26.2" / "client-version.json"
-            client_version.write_bytes(b'{"id":"26.2"}\n')
-            profile_path = root / "port" / "versions" / "26.2.json"
+            client_version = root / "port" / "work" / CANONICAL_ID / "client-version.json"
+            client_version.write_bytes((b'{"id":"' + CANONICAL_ID.encode("ascii") + b'"}\n'))
+            profile_path = root / "port" / "versions" / ("" + CANONICAL_ID + ".json")
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
             base_environment = {
-                "GAIUS_VERSION_PROFILE_PATH": "versions/26.2.json",
-                "GAIUS_BUILD_ROOT": str(root / "port" / "target" / "26.2"),
+                "GAIUS_VERSION_PROFILE_PATH": ("versions/" + CANONICAL_ID + ".json"),
+                "GAIUS_BUILD_ROOT": str(root / "port" / "target" / CANONICAL_ID),
             }
 
             cases: list[tuple[str, dict[str, str], Path, str]] = [
@@ -622,7 +631,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                     identity = PORTABLE.build_identity.current_build_identity(root)
                     quick_check = QUICK_CHECK.current_build_identity_for_quick_check(
                         profile,
-                        "versions/26.2.json",
+                        ("versions/" + CANONICAL_ID + ".json"),
                         profile_path,
                     )
                     self.assertIsNotNone(quick_check)
@@ -641,17 +650,17 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                     if scope == "isolated":
                         self.assertTrue(
                             all(
-                                name == "port/work/26.2/version.json"
-                                or name == "port/work/26.2/client-version.json"
-                                or name.startswith("port/work/overlays/26.2/")
+                                name == ("port/work/" + CANONICAL_ID + "/version.json")
+                                or name == ("port/work/" + CANONICAL_ID + "/client-version.json")
+                                or name.startswith(("port/work/overlays/" + CANONICAL_ID + "/"))
                                 for name, _path in overlay_inputs
                             )
                         )
                     else:
                         self.assertTrue(
                             all(
-                                name == "port/work/26.2/version.json"
-                                or name == "port/work/26.2/client-version.json"
+                                name == ("port/work/" + CANONICAL_ID + "/version.json")
+                                or name == ("port/work/" + CANONICAL_ID + "/client-version.json")
                                 or name.startswith("port/work/overlays/")
                                 for name, _path in overlay_inputs
                             )
@@ -694,15 +703,15 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 ancestor_quick_inputs = dict(
                     QUICK_CHECK.build_identity_overlay_inputs(root, profile)
                 )
-            self.assertIn("port/work/26.2/version.json", ancestor_inputs)
-            self.assertIn("port/work/26.2/client-version.json", ancestor_inputs)
-            self.assertNotIn("port/work/overlays/26.2/version.json", ancestor_inputs)
+            self.assertIn(("port/work/" + CANONICAL_ID + "/version.json"), ancestor_inputs)
+            self.assertIn(("port/work/" + CANONICAL_ID + "/client-version.json"), ancestor_inputs)
+            self.assertNotIn(("port/work/overlays/" + CANONICAL_ID + "/version.json"), ancestor_inputs)
             self.assertNotIn(
-                "port/work/overlays/26.2/client-version.json", ancestor_inputs
+                ("port/work/overlays/" + CANONICAL_ID + "/client-version.json"), ancestor_inputs
             )
             self.assertEqual(ancestor_quick_inputs.keys(), ancestor_inputs.keys())
-            self.assertIn("port/work/26.2/version.json", ancestor_quick_inputs)
-            self.assertIn("port/work/26.2/client-version.json", ancestor_quick_inputs)
+            self.assertIn(("port/work/" + CANONICAL_ID + "/version.json"), ancestor_quick_inputs)
+            self.assertIn(("port/work/" + CANONICAL_ID + "/client-version.json"), ancestor_quick_inputs)
 
     def test_client_compiler_profile_rejects_wrong_target_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -736,10 +745,10 @@ class PortableArtifactIdentityTest(unittest.TestCase):
 
     def test_old_gzip_with_new_js_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            old_classes = b"old-1.21.11-client"
+            old_classes = (b"old-" + LEGACY_ID.encode("ascii") + b"-client")
             root, dist, output = self.make_fixture(
                 directory,
-                classes=b"new-26.2-client",
+                classes=(b"new-" + CANONICAL_ID.encode("ascii") + b"-client"),
                 classes_gzip=compressed(old_classes),
             )
             output.write_text("previous portable release", encoding="utf-8")
@@ -752,7 +761,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(directory)
             self.run_build(root, dist, output)
-            (dist / "classes.js.gz").write_bytes(compressed(b"old-1.21.11-client"))
+            (dist / "classes.js.gz").write_bytes(compressed((b"old-" + LEGACY_ID.encode("ascii") + b"-client")))
 
             self.assertFalse(self.quick_check_identity(root, dist, output))
 
@@ -879,9 +888,9 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(
                 directory,
-                profile_file="26.2.json",
-                profile_id="1.21.11",
-                launcher_version="26.2",
+                profile_file=("" + CANONICAL_ID + ".json"),
+                profile_id=LEGACY_ID,
+                launcher_version=CANONICAL_ID,
                 launcher_asset_index="32",
             )
 
@@ -1015,9 +1024,9 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(
                 directory,
-                version="1.21.11",
+                version=LEGACY_ID,
                 distribution="obfuscated-with-mappings",
-                classes=b"legacy-1.21.11-client",
+                classes=(b"legacy-" + LEGACY_ID.encode("ascii") + b"-client"),
             )
 
             self.run_build(root, dist, output)
@@ -1025,7 +1034,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             manifest = json.loads(
                 (dist / "Gaius.manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["profile"], "1.21.11")
+            self.assertEqual(manifest["profile"], LEGACY_ID)
             self.assertEqual(manifest["signatures"], [])
 
     @staticmethod
@@ -1072,7 +1081,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             self.run_build(root, dist, output)
             self.assertNotIn(b"\r", output.read_bytes(), "the portable page is written with LF on every host")
             env = {key: value for key, value in os.environ.items() if not key.startswith("GAIUS_")}
-            env.update({"GAIUS_VERSION_PROFILE_PATH": "versions/26.2.json", "GAIUS_DIST_DIRECTORY": str(dist)})
+            env.update({"GAIUS_VERSION_PROFILE_PATH": ("versions/" + CANONICAL_ID + ".json"), "GAIUS_DIST_DIRECTORY": str(dist)})
             for label in ("lf", "crlf"):
                 if label == "crlf":
                     # A page that went through a CRLF checkout or editor still passes the gate.
@@ -1140,13 +1149,138 @@ const sha = (bytes) => crypto.createHash("sha256").update(Buffer.from(bytes)).di
             self.assertTrue(report["removed"], "every payload part leaves the DOM once decoded")
             self.assertTrue(report["portable"])
 
+    WASM_CLIENT = b"\0asm\1\0\0\0fixture-client-module"
+    WASM_SCRIPTS = {
+        "gaius-wasm-gc-runtime.js": "globalThis.TeaVM = {wasmGC: {}};\n",
+        "gaius-jspi.js": "globalThis.GaiusJspi = {};\n",
+        "gaius-wasm-boot.js": "window.main = function () {};\n",
+    }
+
+    def make_wasm_dist(self, directory: str) -> Path:
+        wasm_dist = Path(directory) / "wasm-dist"
+        wasm_dist.mkdir()
+        (wasm_dist / "classes.wasm").write_bytes(self.WASM_CLIENT)
+        for name, source in self.WASM_SCRIPTS.items():
+            (wasm_dist / name).write_text(source, encoding="utf-8")
+        return wasm_dist
+
+    def test_wasm_client_is_embedded_beside_the_javascript_client(self) -> None:
+        """--wasm-dist: one more payload, its runtime scripts as inert text, the manifest entry."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory, boot=True)
+            wasm_dist = self.make_wasm_dist(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                PORTABLE.build(dist, output, root=root, wasm_dist=wasm_dist)
+            html = output.read_text(encoding="utf-8")
+            decoded = PORTABLE.parse_portable_payload(html)
+            self.assertEqual(gzip.decompress(decoded[PORTABLE.WASM_CLIENT_ASSET]), self.WASM_CLIENT)
+            self.assertEqual(gzip.decompress(decoded["classes"]), (dist / "classes.js").read_bytes())
+            manifest = self.embedded_manifest(output)
+            self.assertEqual(manifest["wasmClient"]["rawSha256"], hashlib.sha256(self.WASM_CLIENT).hexdigest())
+            self.assertEqual(manifest["wasmClient"]["rawBytes"], len(self.WASM_CLIENT))
+            self.assertEqual(sorted(manifest["wasmClient"]["scripts"]), sorted(self.WASM_SCRIPTS))
+            self.assertEqual(json.loads((dist / "Gaius.manifest.json").read_text(encoding="utf-8")), manifest)
+            # The boot script reads the announcement before it picks the runtime.
+            announce = html.index('window.__gaiusPortableRuntimes = {"wasm":{"client":"classes.wasm"}};')
+            self.assertLess(announce, html.index("window.__gaiusBoot = {fixture: true};"))
+            for name, source in self.WASM_SCRIPTS.items():
+                self.assertIn(f'<script type="text/plain" data-gaius-wasm-script="{name}">\n{source}  </script>\n', html)
+            self.assertIn("portableWasmClient ? Promise.resolve(null) : decodeAsset(", html)
+
+            # Without --wasm-dist the page is the JavaScript one.
+            plain_output = dist / "Gaius-js.html"
+            with contextlib.redirect_stdout(io.StringIO()):
+                PORTABLE.build(dist, plain_output, root=root)
+            plain_html = plain_output.read_text(encoding="utf-8")
+            for marker in ("__gaiusPortableRuntimes", "data-gaius-wasm-script", PORTABLE.WASM_CLIENT_ASSET,
+                           "portableWasmClient"):
+                self.assertNotIn(marker, plain_html)
+            self.assertNotIn("wasmClient", self.embedded_manifest(plain_output))
+
+    def test_portable_bootstrap_starts_the_selected_client(self) -> None:
+        """Runs the bootstrap of a page with a wasm client in node, once per selected runtime."""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        script = r"""
+const fs = require("fs");
+const crypto = require("crypto");
+const vm = require("vm");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const selected = process.argv[3];
+const parts = new Map();
+for (const match of html.matchAll(/<script type="text\/x-gaius-b7" data-gaius-asset="([A-Za-z0-9_-]+)" data-part="(\d+)">([^<]*)<\/script>/g)) {
+  if (!parts.has(match[1])) parts.set(match[1], []);
+  parts.get(match[1]).push({textContent: match[3], parentNode: {removeChild() {}}});
+}
+const inert = new Map();
+for (const match of html.matchAll(/<script type="text\/plain" data-gaius-wasm-script="([^"]+)">\n([^<]*)  <\/script>/g)) {
+  inert.set(match[1], {textContent: match[2]});
+}
+const start = html.indexOf('<script data-gaius-portable="1">') + '<script data-gaius-portable="1">'.length;
+const bootstrap = html.slice(start, html.indexOf("</script>", start));
+const blobs = new Map();
+const window = {
+  document: {
+    querySelectorAll: (selector) => parts.get(/data-gaius-asset="([^"]+)"/.exec(selector)[1]) || [],
+    querySelector: (selector) => inert.get(/data-gaius-wasm-script="([^"]+)"/.exec(selector)[1]) || null,
+  },
+  Blob, Response, DecompressionStream, Uint8Array, ArrayBuffer, Promise, Map, Object, Array, JSON, String, Math, Error, Date,
+  setTimeout, setInterval: () => 0,
+  URL: {createObjectURL: (blob) => { const id = "blob:" + blobs.size; blobs.set(id, blob); return id; }},
+  __gaiusRuntimeSelection: {selected},
+};
+window.window = window;
+const context = vm.createContext(window);
+vm.runInContext(bootstrap, context);
+const sha = (bytes) => crypto.createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+(async () => {
+  await context.__gaiusPortableAssetsReady;
+  const report = {selected};
+  report.client = await blobs.get(context.__gaiusClassesUrl).text();
+  report.wasmClientRemoved = (parts.get("wasmclient") || []).every((element) => element.textContent === "");
+  report.classesUntouched = (parts.get("classes") || []).every((element) => element.textContent !== "");
+  if (selected === "wasm") {
+    report.module = sha(await context.__gaiusWasmSource);
+    report.runtime = await blobs.get(context.__gaiusWasmRuntimeUrl).text();
+    report.jspi = await blobs.get(context.__gaiusJspiUrl).text();
+    report.fallback = sha(await (await blobs.get(await context.__gaiusPortableLoadJsClient())).arrayBuffer());
+  }
+  process.stdout.write(JSON.stringify(report));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory, boot=True)
+            wasm_dist = self.make_wasm_dist(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                PORTABLE.build(dist, output, root=root, wasm_dist=wasm_dist)
+            script_path = Path(directory) / "bootstrap-runtime-check.js"
+            script_path.write_text(script, encoding="utf-8")
+            reports = {}
+            for selected in ("wasm", "js"):
+                result = subprocess.run([node, str(script_path), str(output), selected], text=True,
+                                        capture_output=True, timeout=60, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reports[selected] = json.loads(result.stdout)
+            sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
+            wasm = reports["wasm"]
+            self.assertEqual(wasm["module"], sha(self.WASM_CLIENT), "TeaVM gets the inflated module bytes")
+            self.assertEqual(wasm["client"], self.WASM_SCRIPTS["gaius-wasm-boot.js"])
+            self.assertEqual(wasm["runtime"], self.WASM_SCRIPTS["gaius-wasm-gc-runtime.js"])
+            self.assertEqual(wasm["jspi"], self.WASM_SCRIPTS["gaius-jspi.js"])
+            self.assertEqual(wasm["fallback"], sha((dist / "classes.js").read_bytes()))
+            js = reports["js"]
+            self.assertEqual(js["client"], (dist / "classes.js").read_text(encoding="utf-8"))
+            self.assertTrue(js["wasmClientRemoved"], "the JavaScript client leaves the module text unread")
+            self.assertFalse(js["classesUntouched"])
+
     def test_shader_toolchain_client_embeds_loader_and_modules(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output, token = self.make_shader_toolchain_fixture(directory)
             self.run_build(root, dist, output)
 
             manifest = json.loads((dist / "Gaius.manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["profile"], "26.3")
+            self.assertEqual(manifest["profile"], RENDERPEARL_ID)
             toolchain = manifest["shaderToolchain"]
             self.assertEqual(toolchain["version"], token)
             self.assertEqual(toolchain["build"]["role"], "shader-toolchain")
@@ -1173,7 +1307,7 @@ const sha = (bytes) => crypto.createHash("sha256").update(Buffer.from(bytes)).di
             # The page's own loader tag is gone; the loader runs inline after the
             # portable bootstrap and before the launcher scripts.
             self.assertNotIn("gaius-shader-toolchain.js?v=", html)
-            inline = ('  <script data-gaius-shader-toolchain data-profile="26.3" '
+            inline = (('  <script data-gaius-shader-toolchain data-profile="' + RENDERPEARL_ID + '" ') +
                       'data-gaius-portable-inline="1">\n')
             self.assertEqual(html.count(inline), 1)
             self.assertEqual(html.count("data-gaius-shader-toolchain"), 1)
@@ -1213,7 +1347,7 @@ const sha = (bytes) => crypto.createHash("sha256").update(Buffer.from(bytes)).di
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(
                 directory,
-                version="26.3",
+                version=RENDERPEARL_ID,
                 launcher_asset_index="34",
                 classes=self.SHADER_TOOLCHAIN_CLASSES,
             )
@@ -1288,7 +1422,7 @@ const sha = (bytes) => crypto.createHash("sha256").update(Buffer.from(bytes)).di
         index = dist / "index.html"
         text = PORTABLE.SHADER_TOOLCHAIN_TAG.sub("", index.read_text(encoding="utf-8"))
         tag = (
-            f'  <script data-gaius-shader-toolchain data-profile="26.3" '
+            f'  <script data-gaius-shader-toolchain data-profile="{RENDERPEARL_ID}" '
             f'src="gaius-shader-toolchain.js?v={PORTABLE.shader_toolchain_token(dist)}"></script>\n'
         )
         index.write_text(text.replace("<!doctype html>\n", "<!doctype html>\n" + tag, 1), encoding="utf-8")

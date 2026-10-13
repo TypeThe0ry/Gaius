@@ -181,6 +181,12 @@
       const budget = Number(params.get("gaiusKernelBudgetMB"));
       if (finite(budget) && budget > 0) switches.budgetBytes = budget * 1024 * 1024;
     }
+    // The memory tier is resolved before the kernel runtime is created.  Apply the low tier
+    // before any worker/wasm instance is allocated; shrinking after startup cannot reclaim a
+    // WebAssembly memory that has already grown.
+    const tier = global.__gaiusMemoryTier;
+    if (tier && tier.lowMemory && switches.size === null) switches.size = 1;
+    if (tier && tier.lowMemory && switches.budgetBytes === 0) switches.budgetBytes = 96 * 1024 * 1024;
     return switches;
   }
 
@@ -378,9 +384,10 @@
 
     available(name) {
       if (!this.enabled || this.terminated || this.halted) return false;
-      if (name === undefined) return true;
+      if (name === undefined) return [...this.kernels.keys()].some((kernelName) => this.available(kernelName));
       const kernel = this.kernels.get(name);
-      return !!kernel && !kernel.disabled;
+      return !!kernel && !kernel.disabled && !!global.GaiusKernelMirror
+        && global.GaiusKernelMirror.enabled(name, this.options.profileId);
     }
 
     // --- compilation ------------------------------------------------------------------------
@@ -472,7 +479,7 @@
       const list = names || Array.from(this.kernels.keys());
       return Promise.all(list.map((name) => {
         const kernel = this.kernels.get(name);
-        if (!kernel || kernel.disabled || !this.enabled) return null;
+        if (!kernel || !this.available(name)) return null;
         return this.compile(kernel).catch(() => null);
       }));
     }
@@ -482,9 +489,12 @@
     submit(kind, payload, opts) {
       const o = opts || {};
       if (this.terminated) return Promise.reject(new KernelRuntimeError("terminated", `kernel runtime ${this.name} is terminated`));
+      const name = o.kernel || this.kindToKernel.get(kind);
+      if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.allowed(kind, name, this.options.profileId)) {
+        return Promise.reject(new KernelRuntimeError("needs-vanilla", "NEEDS_VANILLA: kernel mirror is disabled", {kind, kernel: name}));
+      }
       if (!this.enabled) return Promise.reject(new KernelRuntimeError("runtime-disabled", "kernel runtime is disabled"));
       if (this.halted) return Promise.reject(this.halted);
-      const name = o.kernel || this.kindToKernel.get(kind);
       const kernel = name ? this.kernels.get(name) : null;
       if (!kernel) return Promise.reject(new KernelRuntimeError("unknown-kind", `no kernel provides ${kind}`, {kind}));
       if (kernel.disabled) {
@@ -658,6 +668,7 @@
     primeSlot(slot, kernel) {
       const primer = kernel.primer;
       if (!primer || slot.dead) return false;
+      if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.allowed(primer.kind, kernel.name, this.options.profileId)) return false;
       const id = this.nextJobId++;
       const payload = primer.payload.slice(0);
       try {
@@ -1223,6 +1234,7 @@
     // first, then spawns; when shrinking, idle workers go first and busy ones drain.
     reconcile(respawn) {
       if (this.terminated || !this.enabled) return;
+      if (!this.available()) return;
       const target = this.sizer.size;
       let active = this.activeSlots().length;
       for (const slot of this.slots) {
@@ -1574,6 +1586,9 @@
       submit(kind, payload, opts) {
         const o = opts || {};
         const kernel = o.kernel || null;
+        if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.allowed(kind, kernel)) {
+          return Promise.reject(new KernelRuntimeError("needs-vanilla", "NEEDS_VANILLA: kernel mirror is disabled", {kind, kernel}));
+        }
         if (!status.enabled || (kernel && !(status.kernels[kernel] && status.kernels[kernel].available))) {
           return Promise.reject(new KernelRuntimeError("runtime-disabled", "kernel runtime is not available"));
         }
@@ -1611,8 +1626,9 @@
       },
       available(kernel) {
         if (!status.enabled) return false;
-        if (kernel === undefined) return true;
-        return !!(status.kernels[kernel] && status.kernels[kernel].available);
+        const names = kernel === undefined ? Object.keys(status.kernels) : [kernel];
+        return names.some((name) => !!(status.kernels[name] && status.kernels[name].available)
+          && !!global.GaiusKernelMirror && global.GaiusKernelMirror.enabled(name));
       },
       status() {
         return status;

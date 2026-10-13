@@ -9,6 +9,7 @@
 //   PAGE_URL        alternative: a page that is already served (DIST is then ignored)
 //   DIST_PORT       static server port; must be an allowed RelayNode origin (default 8780)
 //   BRIDGE          RelayNode base URL passed as ?bridge= (default http://127.0.0.1:8080)
+//                   (Chrome refuses non-loopback requests: a remote BRIDGE needs GAIUS_HARNESS_NETWORK=allow)
 //   SERVER          host:port typed into Direct Connect (required)
 //   SERVER_LOG      optional vanilla server log; checked for "<name> joined the game"
 //   PROTOCOL        Minecraft protocol number the client speaks; selects the relay's
@@ -29,6 +30,7 @@ import {createReadStream, statSync, existsSync, readFileSync} from "node:fs";
 import {mkdtemp, mkdir, writeFile, rm, appendFile} from "node:fs/promises";
 import {createServer as netServer} from "node:net";
 import {createServer as httpServer} from "node:http";
+import {chromeIsolationArgs} from "./bench/harness-common.mjs";
 import {tmpdir} from "node:os";
 import {resolve, join, extname, normalize, dirname, relative, isAbsolute} from "node:path";
 import {fileURLToPath} from "node:url";
@@ -201,13 +203,19 @@ function serverLogLines() {
 }
 
 // Injected before any page script: WebGL instrumentation (same probe as the M3 title harness).
+// A context that the page loses on purpose through WEBGL_lose_context.loseContext() (the quality
+// layer's GPU benchmark probe, runtime/quality/gpu-caps.js) is not a WebGL failure: it is counted
+// apart (intentional*) and no longer drained, as in minecraft-title-screen-cdp.mjs.
 const glProbe = `(()=>{
-  const rec = window.__m3gl = {gls:[], drained:{}, drainCalls:0, contexts:0, shaderFailures:[], programFailures:[], getErrors:{}, getErrorCalls:0, shaders:[], programs:[], lost:0, created:[]};
+  const rec = window.__m3gl = {gls:[], drained:{}, drainCalls:0, contexts:0, shaderFailures:[], programFailures:[], getErrors:{}, getErrorCalls:0, shaders:[], programs:[], lost:0, created:[],
+    intentionalLossRequests:0, intentionalLost:0, intentionalErrors:{}};
+  const intentional = new WeakSet();
   const names = {1280:'INVALID_ENUM',1281:'INVALID_VALUE',1282:'INVALID_OPERATION',1285:'OUT_OF_MEMORY',1286:'INVALID_FRAMEBUFFER_OPERATION',37442:'CONTEXT_LOST_WEBGL'};
   let gse0 = null;
   const wrap = proto => {
     if (!proto || proto.__m3) return; proto.__m3 = true;
-    const gse = proto.getError; if (!gse0 && proto === (window.WebGL2RenderingContext && WebGL2RenderingContext.prototype)) gse0 = gse; proto.getError = function(){ const e = gse.call(this); rec.getErrorCalls++; if (e) { const k = names[e]||String(e); rec.getErrors[k]=(rec.getErrors[k]||0)+1; } return e; };
+    const gse = proto.getError; if (!gse0 && proto === (window.WebGL2RenderingContext && WebGL2RenderingContext.prototype)) gse0 = gse; proto.getError = function(){ const e = gse.call(this); rec.getErrorCalls++; if (e) { const k = names[e]||String(e); const into = intentional.has(this) ? rec.intentionalErrors : rec.getErrors; into[k]=(into[k]||0)+1; } return e; };
+    const gex = proto.getExtension; proto.getExtension = function(name){ const ext = gex.call(this, name); if (ext && String(name).toLowerCase() === 'webgl_lose_context' && !ext.__m3) { const gl = this; const lose = ext.loseContext; ext.loseContext = function(){ intentional.add(gl); rec.intentionalLossRequests++; return lose.apply(this, arguments); }; ext.__m3 = true; } return ext; };
     const cs = proto.createShader; proto.createShader = function(t){ const s = cs.call(this,t); if (s && rec.shaders.length < 4000) rec.shaders.push({gl:this, s, type:t}); return s; };
     const cp = proto.createProgram; proto.createProgram = function(){ const p = cp.call(this); if (p && rec.programs.length < 4000) rec.programs.push({gl:this, p}); return p; };
     const gsp = proto.getShaderParameter; proto.getShaderParameter = function(s,n){ const v = gsp.call(this,s,n); if (n===0x8B81 && v===false && rec.shaderFailures.length<50) rec.shaderFailures.push(String(this.getShaderInfoLog(s)).slice(0,2000)); return v; };
@@ -216,13 +224,13 @@ const glProbe = `(()=>{
   wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
   wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
   const gc = HTMLCanvasElement.prototype.getContext;
-  HTMLCanvasElement.prototype.getContext = function(kind, attrs){ const c = gc.call(this, kind, attrs); if (c && /webgl/.test(kind)) { rec.contexts++; if (!rec.gls.includes(c)) rec.gls.push(c); rec.created.push(kind); this.addEventListener('webglcontextlost', ()=>rec.lost++); } return c; };
-  window.__m3drain = () => { rec.drainCalls++; for (const gl of rec.gls) { for (let i = 0; i < 16; i++) { const e = gse0.call(gl); if (!e) break; const k = names[e]||String(e); rec.drained[k]=(rec.drained[k]||0)+1; } } return rec.drained; };
+  HTMLCanvasElement.prototype.getContext = function(kind, attrs){ const c = gc.call(this, kind, attrs); if (c && /webgl/.test(kind) && !rec.gls.includes(c)) { rec.contexts++; rec.gls.push(c); rec.created.push(kind); this.addEventListener('webglcontextlost', ()=>{ if (intentional.has(c)) rec.intentionalLost++; else rec.lost++; }); } return c; };
+  window.__m3drain = () => { rec.drainCalls++; for (const gl of rec.gls) { if (intentional.has(gl)) continue; for (let i = 0; i < 16; i++) { const e = gse0.call(gl); if (!e) break; const k = names[e]||String(e); rec.drained[k]=(rec.drained[k]||0)+1; } } return rec.drained; };
   window.__m3audit = () => {
     const bad = {shaders:[], programs:[]}; let shaders=0, programs=0;
     for (const {gl,s,type} of rec.shaders) { try { if (gl.isShader(s)) { shaders++; if (gl.getShaderParameter(s,0x8B81)===false) bad.shaders.push({type, log:String(gl.getShaderInfoLog(s)).slice(0,1500)}); } } catch(e){} }
     for (const {gl,p} of rec.programs) { try { if (gl.isProgram(p)) { programs++; if (gl.getProgramParameter(p,0x8B82)===false) bad.programs.push(String(gl.getProgramInfoLog(p)).slice(0,1500)); } } catch(e){} }
-    return {contexts:rec.contexts, created:rec.created, lost:rec.lost, liveShaders:shaders, livePrograms:programs, shadersCreated:rec.shaders.length, programsCreated:rec.programs.length,
+    return {contexts:rec.contexts, created:rec.created, lost:rec.lost, intentionalLossRequests:rec.intentionalLossRequests, intentionalLost:rec.intentionalLost, intentionalErrors:rec.intentionalErrors, liveShaders:shaders, livePrograms:programs, shadersCreated:rec.shaders.length, programsCreated:rec.programs.length,
       badShaders:bad.shaders.slice(0,20), badPrograms:bad.programs.slice(0,20), shaderFailures:rec.shaderFailures.slice(0,20), programFailures:rec.programFailures.slice(0,20), getErrors:rec.getErrors, getErrorCalls:rec.getErrorCalls, drained:(window.__m3drain(), rec.drained), drainCalls:rec.drainCalls};
   };
   try { localStorage.setItem('gaius.playerName', ${JSON.stringify(playerName)}); } catch (e) {}
@@ -243,9 +251,9 @@ const fail = (n, d) => { report.checks[n] = {ok: false, detail: d}; log("CHECK",
 const profileDir = await mkdtemp(join(tmpdir(), "gaius-m5-"));
 const port = await freePort();
 const chrome = spawn(chromeBin, ["--headless=new", `--remote-debugging-port=${port}`, "--remote-allow-origins=*",
-  `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check", "--window-size=1280,720",
-  "--disable-background-networking", "--disable-component-update", "--ignore-gpu-blocklist", "--enable-unsafe-swiftshader",
-  "about:blank"], {stdio: "ignore"});
+  `--user-data-dir=${profileDir}`, "--window-size=1280,720", "--ignore-gpu-blocklist", "--enable-unsafe-swiftshader",
+  // No background traffic; non-loopback requests are refused (the relay and bridge are local).
+  ...chromeIsolationArgs(), "about:blank"], {stdio: "ignore"});
 let cdp;
 const exceptions = [];
 const sockets = [];
@@ -474,7 +482,7 @@ try {
     g.badShaders.length + g.badPrograms.length + g.shaderFailures.length + g.programFailures.length === 0 && shaderConsole.length === 0
       ? pass("noShaderErrors", {live: g.liveShaders, programs: g.livePrograms}) : fail("noShaderErrors", {g: {badShaders: g.badShaders, badPrograms: g.badPrograms, shaderFailures: g.shaderFailures, programFailures: g.programFailures}, shaderConsole: shaderConsole.slice(0, 5)});
     const drained = Object.values(g.drained || {}).reduce((a, b) => a + b, 0);
-    errs === 0 && drained === 0 && glConsole.length === 0 && g.lost === 0 && g.drainCalls > 10 ? pass("noWebGLErrors", {getErrorCalls: g.getErrorCalls, drainCalls: g.drainCalls}) : fail("noWebGLErrors", {drained: g.drained, drainCalls: g.drainCalls, getErrors: g.getErrors, lost: g.lost, glConsole: glConsole.slice(0, 10)});
+    errs === 0 && drained === 0 && glConsole.length === 0 && g.lost === 0 && g.drainCalls > 10 ? pass("noWebGLErrors", {getErrorCalls: g.getErrorCalls, drainCalls: g.drainCalls}) : fail("noWebGLErrors", {drained: g.drained, drainCalls: g.drainCalls, getErrors: g.getErrors, lost: g.lost, intentionalLost: g.intentionalLost, glConsole: glConsole.slice(0, 10)});
   }
   exceptions.length === 0 ? pass("noUncaughtExceptions", {}) : fail("noUncaughtExceptions", exceptions.slice(0, 5));
   const failed = Object.entries(report.checks).filter(([, v]) => !v.ok).map(([k]) => k);

@@ -38,7 +38,7 @@ release commands are:
 GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
   bash port/scripts/build-version-release.sh 26.2
 GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
-  python3 port/scripts/quick-check.py
+  python3 port/scripts/legacy/quick-check.py
 ```
 
 The build produces the runnable package under `port/web/dist/<profile>/`. Do not
@@ -71,7 +71,7 @@ for profile in 1.21.11 26.2 26.3; do
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
     bash port/scripts/build-version-release.sh "$profile"
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
-    python3 port/scripts/quick-check.py
+    python3 port/scripts/legacy/quick-check.py
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
     node port/scripts/singleplayer-worker-runtime-smoke.mjs
 done
@@ -92,15 +92,19 @@ export GAIUS_VERSION_PROFILE_PATH=versions/26.3.json
 bash port/scripts/build-overlays.sh
 bash port/scripts/generate-pom.sh
 ./port/mvnw --file port/target/26.3/generated-pom.xml compile
-python3 port/scripts/quick-check.py --domain-modules
+python3 port/scripts/legacy/quick-check.py --domain-modules
 ```
 
 quick-check judges every profile by the rule set `PROFILE_RULES` names for it
-in `port/scripts/quick-check.py`: `1.21.11` has its own legacy-family rules,
+in `port/scripts/legacy/quick-check.py`: `1.21.11` has its own legacy-family rules,
 `26.2` and `26.3` share the named-family rules, a rule that does not hold for `26.3` is listed in `NOT_APPLICABLE_263`
 with the reason and the check that covers its replacement, and the `26.3`
-patch assertions live in `port/scripts/quickcheck/profile_263_<domain>.py`. A
+patch assertions live in `port/scripts/legacy/quickcheck/profile_263_<domain>.py`. A
 profile without rules fails quick-check.
+
+quick-check and the `*263*` one-off scripts are frozen in `port/scripts/legacy/`
+(maint/D14 3.1): keep them passing, but add no new file there and put new structural
+checks into the patch framework instead (`port/scripts/legacy/README.md`).
 
 For the Paper plugin (which targets the 1.21.11/JDK-21 profile):
 

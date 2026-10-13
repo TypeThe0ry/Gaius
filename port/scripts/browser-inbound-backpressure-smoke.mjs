@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {MessageChannel} from "node:worker_threads";
 import vm from "node:vm";
+import {patcherSource} from "./patcher-sources.mjs";
 
 const sourcePath = new URL(
   "../overrides/libraries/netty-transport/src/main/java/" +
@@ -11,10 +12,8 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = await readFile(sourcePath, "utf8");
-const clientPatcher = await readFile(new URL(
-  "../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
-  import.meta.url,
-), "utf8");
+// A patcher step with its domain classes (port/tools/patchkit/README.md, "Domains").
+const clientPatcher = patcherSource("MinecraftClientPatcher");
 const clientNetwork = await readFile(new URL(
   "../src/main/java/dev/gaius/browser/BrowserClientNetwork.java",
   import.meta.url,

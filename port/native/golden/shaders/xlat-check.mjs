@@ -1,19 +1,26 @@
 #!/usr/bin/env node
-// Shader translation corpus check (v0.4.0 spike S4): every Minecraft 26.3 render pipeline's
-// SPIR-V through gaius-shaderxlat to WGSL, then through Chrome's WebGPU compiler (Tint) and
-// pipeline creation with the pipeline's real layout.
+// Shader translation corpus check: every render pipeline of a Minecraft corpus (26.3, 26.2 or
+// 1.21.11, see run-corpus.sh) through gaius-shaderxlat to WGSL, then through Chrome's WebGPU
+// compiler (Tint) and pipeline creation with the pipeline's real layout. The translation options
+// (binding layout, y flip, GL depth remap) are those of the native run (results.json
+// summary.options).
 //
+//  link    (blaze3d corpora, needs --frontend) Runs the GLSL front-end's link of every pipeline
+//          of the dump in the wasm build in Node and requires the linked modules and entries of
+//          the native link (shaderxlat-link, the corpus); times the links.
 //  wasm    Loads the wasm build in Node, translates every corpus module and requires the WGSL to
 //          be byte-identical to the native run (shaderxlat-corpus results); times instantiate,
 //          first and warm translations.
 //  chrome  Headless Chrome over CDP on a local HTTP page: the same translations on a synchronous
 //          main-thread instance (the finishCompile path), createShaderModule + getCompilationInfo
 //          for every module, and createRenderPipelineAsync for every pipeline with the bind group
-//          layout from the translation's reflection, the vertex buffers, color targets, blending,
-//          depth state and topology of the vanilla CreateInfo.
+//          layouts from the translation's reflection (split layout: group 0 uniform buffers with
+//          dynamic offsets, group 1 textures, samplers and storage buffers), the vertex buffers,
+//          color targets, blending, depth state and topology of the vanilla CreateInfo, and the
+//          front face of the y convention.
 //
-// usage: node port/native/golden/shaders/xlat-check.mjs [--stages wasm,chrome] [--corpus DIR]
-//          [--native DIR] [--wasm FILE] [--iterations N] [--chrome PATH] [--report FILE]
+// usage: node port/native/golden/shaders/xlat-check.mjs [--stages link,wasm,chrome] [--corpus DIR]
+//          [--native DIR] [--frontend DIR] [--wasm FILE] [--iterations N] [--chrome PATH] [--report FILE]
 //          [--device-features LIST] [--chrome-args "FLAGS"] [--fallback-adapter true]
 //          [--profile-dir DIR]
 // --profile-dir keeps the Chrome profile (and with it Dawn's pipeline cache) between runs.
@@ -21,12 +28,14 @@
 // --chrome-args "--enable-unsafe-webgpu --use-webgpu-adapter=swiftshader".
 // --device-features: optional WebGPU features to request when the adapter has them (comma list,
 // "none" for a baseline device); default float32-blendable,float32-filterable.
+// Chrome runs with every non-loopback request sent to a dead proxy (no external network).
 // Defaults: corpus port/native/target/shader-corpus/webgpu (dump-corpus.sh), native
 // port/native/target/shaderxlat-out/webgpu (shaderxlat-corpus), wasm
 // port/native/target/shaderxlat-wasm-simd/wasm32-unknown-unknown/release-size/gaius_shaderxlat_wasm.wasm.
 // Exit status: 0 pass, 1 failure, 2 usage or environment error.
 
 import {spawn} from "node:child_process";
+import {createHash} from "node:crypto";
 import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs";
 import {createServer} from "node:http";
 import {tmpdir} from "node:os";
@@ -63,6 +72,9 @@ for (const [label, path] of [["corpus", join(corpusDir, "corpus.json")], ["nativ
 
 const corpus = JSON.parse(readFileSync(join(corpusDir, "corpus.json"), "utf8"));
 const nativeResults = JSON.parse(readFileSync(join(nativeDir, "results.json"), "utf8"));
+// A results.json without options is the S4 spike's (flat layout, no flip).
+const translateOptions = Object.assign({layout: "flat", flipVertexY: false, glDepthRemap: false},
+  nativeResults.summary && nativeResults.summary.options);
 const failures = [];
 const fail = (message) => {
   failures.push(message);
@@ -77,13 +89,13 @@ const texelKey = (texel) => texel.map(([b, f]) => `-t${b}${{R8_SINT: "R8Sint", R
 const jobs = new Map();
 for (const pipeline of corpus.pipelines) {
   const texel = texelBuffers(pipeline);
-  for (const shader of pipeline.shaders) {
+  for (const shader of pipeline.shaders || []) {
     const key = shader.spirv + texelKey(texel);
     if (!jobs.has(key)) jobs.set(key, {key, spirv: shader.spirv, texel});
   }
 }
 const nativeWgsl = (key) => readFileSync(join(nativeDir, "wgsl", `${key}.wgsl`), "utf8");
-const report = {corpus: corpus.summary, native: nativeResults.summary, jobs: jobs.size};
+const report = {corpus: corpus.summary, native: nativeResults.summary, translateOptions, jobs: jobs.size};
 
 const stats = (values) => {
   const sorted = [...values].sort((a, b) => a - b);
@@ -93,6 +105,60 @@ const stats = (values) => {
     mean: round(sorted.reduce((a, b) => a + b, 0) / sorted.length), p50: round(pick(0.5)), p95: round(pick(0.95)),
     max: round(pick(1))};
 };
+
+// ---------------------------------------------------------------------------------------------
+// The GLSL front-end's link in wasm (Node) against the native link.
+async function stageLink() {
+  const frontendDir = options.frontend && resolve(options.frontend);
+  if (!frontendDir || !existsSync(join(frontendDir, "frontend.json"))) {
+    console.error(`xlat-check: the link stage needs --frontend DIR with frontend.json`);
+    process.exit(2);
+  }
+  await import(pathToFileURL(join(here, "shaderxlat-job.js")).href);
+  const X = globalThis.GaiusShaderXlatJob;
+  const xlat = X.instantiateSync(await WebAssembly.compile(readFileSync(wasmFile)));
+  const frontend = JSON.parse(readFileSync(join(frontendDir, "frontend.json"), "utf8"));
+  const lenient = (corpus.summary && corpus.summary.mode) === "lenient";
+  const linkedByLocation = new Map(corpus.pipelines.map((p) => [p.location, p]));
+  const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const times = [];
+  let identical = 0, compared = 0;
+  for (const pipeline of frontend.pipelines) {
+    if (!pipeline.intermediate) continue;
+    const linked = linkedByLocation.get(pipeline.location);
+    const spirv = (hash) => readFileSync(join(frontendDir, "spirv", `${hash}.spv`));
+    const layout = {
+      uniforms: pipeline.layout.uniforms.map((u) => ({name: u.name, texelFormat: u.gpuFormat})),
+      samplers: pipeline.layout.samplers,
+      attributes: pipeline.layout.attributes,
+    };
+    compared++;
+    let result;
+    const t = performance.now();
+    try {
+      result = xlat.link(spirv(pipeline.intermediate.VERTEX), spirv(pipeline.intermediate.FRAGMENT), layout, {lenient});
+    } catch (e) {
+      if (linked && linked.error && String(linked.error) === String(e.message)) identical++;
+      else fail(`wasm link of ${pipeline.location}: ${e.message}`);
+      continue;
+    }
+    times.push(performance.now() - t);
+    if (!linked || !linked.shaders) {
+      fail(`wasm links ${pipeline.location}, the native link did not`);
+      continue;
+    }
+    const sameModules = sha(result.vertex) === linked.shaders[0].spirv && sha(result.fragment) === linked.shaders[1].spirv;
+    const sameEntries = JSON.stringify(result.entries) === JSON.stringify(linked.uniforms.map((u) =>
+      ({name: u.name, type: u.type, gpuFormat: u.gpuFormat, declared: u.declared})));
+    const sameFixes = JSON.stringify(result.fixes.map((f) => f.kind + ":" + f.name)) ===
+      JSON.stringify((linked.frontend?.fixes || []).map((f) => f.split(":").slice(0, 2).join(":")));
+    if (sameModules && sameEntries && sameFixes) identical++;
+    else fail(`wasm link of ${pipeline.location} differs from native (modules ${sameModules}, entries ${sameEntries}, fixes ${sameFixes})`);
+  }
+  report.link = {pipelines: compared, identical, linkMs: stats(times)};
+  console.log(`link (wasm, node): ${identical}/${compared} identical to native; ${stats(times).sum} ms total, ` +
+    `p50 ${stats(times).p50} ms`);
+}
 
 // ---------------------------------------------------------------------------------------------
 // wasm in Node
@@ -113,14 +179,14 @@ async function stageWasm() {
   for (const job of jobs.values()) {
     const spirv = readFileSync(join(corpusDir, "spirv", `${job.spirv}.spv`));
     t = performance.now();
-    const result = xlat.translate(spirv, job.texel);
+    const result = xlat.translate(spirv, job.texel, translateOptions);
     first.push(performance.now() - t);
     if (result.wgsl === nativeWgsl(job.key)) identical++;
     else fail(`wasm WGSL of ${job.key} differs from native`);
     const runs = [];
     for (let i = 0; i < iterations; i++) {
       t = performance.now();
-      xlat.translate(spirv, job.texel);
+      xlat.translate(spirv, job.texel, translateOptions);
       runs.push(performance.now() - t);
     }
     runs.sort((a, b) => a - b);
@@ -158,7 +224,7 @@ const ms = (t) => performance.now() - t;
 
 window.__check = (async () => {
   const R = {notes: []};
-  const {jobs, iterations, deviceFeatures, fallbackAdapter} = await (await fetch("jobs.json")).json();
+  const {jobs, iterations, deviceFeatures, fallbackAdapter, translateOptions} = await (await fetch("jobs.json")).json();
   const corpus = await (await fetch("corpus.json")).json();
   const spirv = new Map();
   await Promise.all(jobs.map(async (job) => {
@@ -181,14 +247,14 @@ window.__check = (async () => {
   for (const job of jobs) {
     try {
       t = performance.now();
-      const result = xlat.translate(spirv.get(job.spirv), job.texel);
+      const result = xlat.translate(spirv.get(job.spirv), job.texel, translateOptions);
       first.push(ms(t));
       translated.set(job.key, result);
       if (result.wgsl === nativeText.get(job.key)) identical++;
       const runs = [];
       for (let i = 0; i < iterations; i++) {
         t = performance.now();
-        xlat.translate(spirv.get(job.spirv), job.texel);
+        xlat.translate(spirv.get(job.spirv), job.texel, translateOptions);
         runs.push(ms(t));
       }
       runs.sort((a, b) => a - b);
@@ -243,35 +309,42 @@ window.__check = (async () => {
   let ok = 0;
   for (const pipeline of corpus.pipelines) {
     const texel = (pipeline.uniforms || []).flatMap((u, i) => u.type === "TEXEL_BUFFER" ? [[i, u.gpuFormat]] : []);
-    const stages = pipeline.shaders.map((s) => ({type: s.type, key: s.spirv + texelKey(texel), entryPoint: s.entryPoint}));
+    const stages = (pipeline.shaders || []).map((s) => ({type: s.type, key: s.spirv + texelKey(texel), entryPoint: s.entryPoint}));
     const vs = stages.find((s) => s.type === "VERTEX"), fs = stages.find((s) => s.type === "FRAGMENT");
     if (!vs || !shaderModules.has(vs.key) || (fs && !shaderModules.has(fs.key))) {
       pipelineFailures.push({location: pipeline.location, error: "shader module missing"});
       continue;
     }
-    // Bind group 0 from the union of both stages' reflection.
+    // The bind groups from the union of both stages' reflection, keyed "group:binding".
     const entries = new Map();
+    const slot = (group, binding) => group + ":" + binding;
     for (const s of [vs, fs].filter(Boolean)) {
       for (const b of translated.get(s.key).bindings) {
         const visibility = s.type === "VERTEX" ? GPUShaderStage.VERTEX : GPUShaderStage.FRAGMENT;
-        const old = entries.get(b.binding);
+        const old = entries.get(slot(b.group, b.binding));
         const sampled = (old && old.sampled) || b.sampled;
-        entries.set(b.binding, Object.assign({}, old || b, {visibility: (old ? old.visibility : 0) | visibility, sampled}));
+        entries.set(slot(b.group, b.binding),
+          Object.assign({}, old || b, {visibility: (old ? old.visibility : 0) | visibility, sampled}));
       }
     }
-    const layoutEntries = [...entries.values()].sort((a, b) => a.binding - b.binding).map((b) => {
+    const groups = [];
+    for (const b of [...entries.values()].sort((a, b) => a.group - b.group || a.binding - b.binding)) {
       const entry = {binding: b.binding, visibility: b.visibility};
-      if (b.type === "uniform") entry.buffer = {type: "uniform", minBindingSize: b.size};
-      else if (b.type === "storage") entry.buffer = {type: "read-only-storage"};
+      // The split layout binds every uniform buffer from the uniform ring with a dynamic offset.
+      if (b.type === "uniform") {
+        entry.buffer = {type: "uniform", minBindingSize: b.size, hasDynamicOffset: translateOptions.layout === "split"};
+      } else if (b.type === "storage") entry.buffer = {type: "read-only-storage"};
       else if (b.type === "texture") {
         entry.texture = {viewDimension: b.dim, multisampled: b.multisampled,
           sampleType: b.sampleKind === "float" ? (b.sampled ? "float" : "unfilterable-float") : b.sampleKind};
       } else {
-        const texture = entries.get(b.binding - 1);
+        const texture = entries.get(slot(b.group, b.binding - 1));
         entry.sampler = {type: b.comparison ? "comparison" : (texture && texture.sampled ? "filtering" : "non-filtering")};
       }
-      return entry;
-    });
+      (groups[b.group] ||= []).push(entry);
+    }
+    // A group without bindings (no uniform buffer, say) still needs a layout below a used one.
+    const bindGroupLayouts = Array.from(groups, (g) => device.createBindGroupLayout({entries: g || []}));
     const vertexBuffers = [];
     for (const vb of pipeline.vertexBuffers || []) {
       vertexBuffers[vb.bufferSlot] = {arrayStride: vb.stride, stepMode: vb.stepRate === 0 ? "vertex" : "instance",
@@ -290,10 +363,11 @@ window.__check = (async () => {
     const ds = pipeline.depthStencil;
     const descriptor = {
       label: pipeline.location,
-      layout: device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: layoutEntries})]}),
+      layout: device.createPipelineLayout({bindGroupLayouts}),
       vertex: {module: shaderModules.get(vs.key), entryPoint: "main", buffers: vertexBuffers},
       fragment: fs ? {module: shaderModules.get(fs.key), entryPoint: "main", targets} : undefined,
-      primitive: {topology, cullMode: pipeline.cull ? "back" : "none", frontFace: "ccw"},
+      // Rendering with y flipped (GL row order) mirrors the winding: front faces turn clockwise.
+      primitive: {topology, cullMode: pipeline.cull ? "back" : "none", frontFace: translateOptions.flipVertexY ? "cw" : "ccw"},
       depthStencil: ds ? {format: "depth32float", depthWriteEnabled: ds.writeDepth, depthCompare: COMPARE[ds.depthTest],
         depthBias: topology.startsWith("triangle") ? Math.round(ds.depthBiasConstant) : 0,
         depthBiasSlopeScale: topology.startsWith("triangle") ? ds.depthBiasScaleFactor : 0} : undefined,
@@ -324,7 +398,7 @@ async function stageChrome() {
     ["/shaderxlat.wasm", () => ({type: "application/wasm", body: readFileSync(wasmFile)})],
     ["/corpus.json", () => ({type: "application/json", body: readFileSync(join(corpusDir, "corpus.json"))})],
     ["/jobs.json", () => ({type: "application/json", body: JSON.stringify({jobs: [...jobs.values()], iterations, deviceFeatures,
-      fallbackAdapter: options["fallback-adapter"] === "true"})})],
+      fallbackAdapter: options["fallback-adapter"] === "true", translateOptions})})],
   ]);
   const server = createServer((request, response) => {
     const path = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
@@ -348,6 +422,8 @@ async function stageChrome() {
   const chrome = spawn(chromeBin, ["--headless=new", `--remote-debugging-port=${debugPort}`, "--remote-allow-origins=*",
     `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
     "--disable-component-update", "--ignore-gpu-blocklist",
+    // No external network: everything but loopback goes to a closed local port.
+    "--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=127.0.0.1;localhost",
     ...(options["chrome-args"] || "").split(" ").filter(Boolean), "about:blank"], {stdio: "ignore"});
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   try {
@@ -445,6 +521,7 @@ async function stageChrome() {
   }
 }
 
+if (stages.has("link")) await stageLink();
 if (stages.has("wasm")) await stageWasm();
 if (stages.has("chrome")) await stageChrome();
 report.failures = failures;

@@ -10,6 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from verification_profiles import CANONICAL_ID
+
 
 ROOT = Path(__file__).resolve().parents[2]
 POSTPROCESS = ROOT / "port/scripts/postprocess-index-html.py"
@@ -60,7 +62,7 @@ def main() -> int:
                 str(POSTPROCESS),
                 str(index),
                 str(classes),
-                "26.2",
+                CANONICAL_ID,
                 "32",
             ],
             text=True,
@@ -114,24 +116,24 @@ def main() -> int:
             'next.searchParams.set("retry", String(Date.now()))',
             'window.__gaiusShell = {',
             'data-gaius-shell="v2"',
-            '<title>Gaius Client 26.2</title>',
-            '"--version", "26.2"',
+            ('<title>Gaius Client ' + CANONICAL_ID + '</title>'),
+            ('"--version", "' + CANONICAL_ID + '"'),
             '"--assetIndex", "32"',
-            'const prefix = "gaius.fs.v2:26.2:"',
-            'const dbName = "gaius-fs-v2-26.2"',
+            ('const prefix = "gaius.fs.v2:' + CANONICAL_ID + ':"'),
+            ('const dbName = "gaius-fs-v2-' + CANONICAL_ID + '"'),
             'indexedDB.open(dbName, 2)',
-            'window.__gaiusProfileId = "26.2"',
+            ('window.__gaiusProfileId = "' + CANONICAL_ID + '"'),
             '  <script data-gaius-profile-early="v1">\n',
             "window.__gaiusApplyQualityPixelRatio = function applyGaiusQualityPixelRatio()",
             "try { GaiusQuality.caps.ensureTier(); } catch (e) {}",
             'window.__gaiusWorldVersion = 4903',
             'window.__gaiusStorageSchema = 2',
-            'window.__gaiusStorageDatabaseName = "gaius-fs-v2-26.2"',
-            'window.__gaiusStoragePrefix = "gaius.fs.v2:26.2:"',
-            'window.__gaiusStorageOpfsDirectory = "regions-v2-26.2"',
+            ('window.__gaiusStorageDatabaseName = "gaius-fs-v2-' + CANONICAL_ID + '"'),
+            ('window.__gaiusStoragePrefix = "gaius.fs.v2:' + CANONICAL_ID + ':"'),
+            ('window.__gaiusStorageOpfsDirectory = "regions-v2-' + CANONICAL_ID + '"'),
             'relative === "data/minecraft/world_gen_settings.dat"',
-            "Starting Gaius Client 26.2...",
-            "Loading the 26.2 client runtime...",
+            ("Starting Gaius Client " + CANONICAL_ID + "..."),
+            ("Loading the " + CANONICAL_ID + " client runtime..."),
         ):
             require(generated, contract)
 
@@ -217,7 +219,7 @@ def main() -> int:
                 str(POSTPROCESS),
                 str(index),
                 str(classes),
-                "26.2",
+                CANONICAL_ID,
                 "32",
             ],
             text=True,
@@ -237,7 +239,7 @@ def main() -> int:
             raise AssertionError("postprocess wrote CRLF line endings")
         index.write_bytes(index.read_bytes().replace(b"\n", b"\r\n"))
         third = subprocess.run(
-            [sys.executable, str(POSTPROCESS), str(index), str(classes), "26.2", "32"],
+            [sys.executable, str(POSTPROCESS), str(index), str(classes), CANONICAL_ID, "32"],
             text=True,
             capture_output=True,
             check=False,

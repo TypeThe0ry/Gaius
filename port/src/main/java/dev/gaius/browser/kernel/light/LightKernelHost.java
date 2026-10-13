@@ -57,7 +57,7 @@ public final class LightKernelHost {
 
     /** Whether jobs may be submitted now. Cheap enough to call per chunk. */
     public static boolean available() {
-        return availableNative();
+        return dev.gaius.browser.kernel.KernelMirror.enabled("light") && availableNative();
     }
 
     public static int maxInFlight() {
@@ -78,7 +78,7 @@ public final class LightKernelHost {
      */
     public static boolean submit(byte[] bytes, int length, byte[] table, int chunkX, int chunkZ, int jobId,
             ResultCallback done, FailureCallback fail) {
-        return submitNative(bytes, length, table, chunkX, chunkZ, jobId, timeoutMillis(), done, fail);
+        return available() && submitNative(bytes, length, table, chunkX, chunkZ, jobId, timeoutMillis(), done, fail);
     }
 
     /** Length of a result buffer delivered to {@link ResultCallback}. */
@@ -238,8 +238,31 @@ public final class LightKernelHost {
     private static native boolean submitNativeJs(Int8Array bytes, int length, Int8Array table, int chunkX, int chunkZ, int jobId, int timeoutMs, ResultCallback done, FailureCallback fail);
 
     private static boolean submitNative(byte[] bytes, int length, byte[] table, int chunkX, int chunkZ, int jobId, int timeoutMs, ResultCallback done, FailureCallback fail) {
+        if (JsArrays.LINEAR_MEMORY) {
+            // WebAssembly GC: a typed-array view is a copy here, so the job's bytes cross through
+            // the linear-memory scratch area (only the length used, not the whole job buffer;
+            // the script copies them before it returns), and the light table, which only the
+            // resend of a "table missing" job reads, is copied once per table instead of per job.
+            if (table != linearTableSource) {
+                linearTableView = JsArrays.int8(table);
+                linearTableSource = table;
+            }
+            int address = JsArrays.stageInt8(bytes, 0, length);
+            return submitNativeJs(linearBytes(address, length), length, linearTableView, chunkX, chunkZ, jobId,
+                    timeoutMs, done, fail);
+        }
         return submitNativeJs(JsArrays.int8(bytes), length, JsArrays.int8(table), chunkX, chunkZ, jobId, timeoutMs, done, fail);
     }
+
+    /** The light table {@link #linearTableView} copies (WebAssembly GC). */
+    private static byte[] linearTableSource;
+    private static Int8Array linearTableView;
+
+    /** A view of {@code length} bytes of linear memory at {@code address} (WebAssembly GC). */
+    @JSBody(params = {"address", "length"}, script = "var linear = globalThis.__gaiusLinear;"
+            + "if (!linear.u8.length) { linear.refresh(); }"
+            + "return new Int8Array(linear.buffer, address >>> 0, length);")
+    private static native Int8Array linearBytes(int address, int length);
 
     @JSBody(params = "result", script = "return result ? (result.byteLength | 0) : 0;")
     private static native int resultLengthNative(JSObject result);

@@ -87,8 +87,43 @@ public final class BrowserWorldgenScheduler {
     private static boolean yieldActive;
     private static boolean deferredYield;
     private static int lastDistanceManagerUpdateBudget = DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET;
+    /**
+     * {@link #isWorkerRuntime()} once known: 1 on the integrated server's Worker, -1 on the
+     * page, 0 before the first query (filled on first use, not by the class initializer).
+     */
+    private static int workerRuntimeState;
+    /**
+     * Whether the Worker counts Mob-AI pulses (the {@code __gaiusMobAiTelemetry} diagnostic
+     * opt-in, set before the server starts): 1 yes, -1 no, 0 not read yet. Read once, so a
+     * pulse without the opt-in makes no telemetry call into JavaScript.
+     */
+    private static int mobAiTelemetryState;
+    private static double taskTelemetryStartedAtMillis;
+    private static String taskTelemetryLabel = "";
 
     private BrowserWorldgenScheduler() {
+    }
+
+    /**
+     * True on the integrated server's browser Worker. The realm of a running program never
+     * changes, so the JavaScript check runs once.
+     */
+    private static boolean isWorkerRuntime() {
+        int state = workerRuntimeState;
+        if (state == 0) {
+            state = isWorkerRuntimeJs() ? 1 : -1;
+            workerRuntimeState = state;
+        }
+        return state > 0;
+    }
+
+    private static boolean mobAiTelemetryEnabled() {
+        int state = mobAiTelemetryState;
+        if (state == 0) {
+            state = mobAiTelemetryOptIn() ? 1 : -1;
+            mobAiTelemetryState = state;
+        }
+        return state > 0;
     }
 
     public static void checkpoint() {
@@ -422,6 +457,9 @@ public final class BrowserWorldgenScheduler {
             return TASK_SCOPE_NONE;
         }
         taskWorkDepth = 1;
+        taskTelemetryStartedAtMillis = nowMillis();
+        taskTelemetryLabel = taskLabel == null ? "unlabeled" : taskLabel;
+        recordWorldgenStatusStart(taskTelemetryLabel, taskTelemetryStartedAtMillis);
 
         double now = nowMillis();
         if (deadlineMillis == 0.0) {
@@ -548,6 +586,9 @@ public final class BrowserWorldgenScheduler {
         taskWorkDepth = 0;
 
         double now = nowMillis();
+        recordWorldgenStatusEnd(taskTelemetryLabel, taskTelemetryStartedAtMillis, now);
+        taskTelemetryLabel = "";
+        taskTelemetryStartedAtMillis = 0.0;
         activeWorkElapsedMillis += activeSegmentElapsedMillis(now);
         activeWorkStartedAtMillis = -1.0;
         recordSchedulerMarker(
@@ -666,9 +707,21 @@ public final class BrowserWorldgenScheduler {
      * stage.  Keeping the hook separate from the generic pulse gives the
      * diagnostics an opt-in, bounded counter while the release path remains a
      * single scheduler call when telemetry is disabled.
+     *
+     * <p>Only the server Worker yields here. The client page runs the same patched
+     * classes and reaches these hooks from its own entity tick (LivingEntity.tick,
+     * Mob.aiStep), where a yield would split a client frame: the browser commits a frame
+     * in the middle of the tick and the game loop drifts away from the display's animation
+     * frames. Vanilla's client tick never pauses there, so on the page the hook returns
+     * before any JavaScript call.
      */
     public static void mobAiPulse() {
-        recordMobAiPulse();
+        if (!isWorkerRuntime()) {
+            return;
+        }
+        if (mobAiTelemetryEnabled()) {
+            recordMobAiPulse();
+        }
         double now = nowMillis();
         if (now < mobAiNextYieldAtMillis) {
             return;
@@ -687,7 +740,7 @@ public final class BrowserWorldgenScheduler {
      * living entities out of the Mob-AI checkpoint path.
      */
     public static void mobEntityPulse(Object entity) {
-        if (entity instanceof net.minecraft.world.entity.Mob) {
+        if (isWorkerRuntime() && entity instanceof net.minecraft.world.entity.Mob) {
             mobAiPulse();
         }
     }
@@ -707,6 +760,9 @@ public final class BrowserWorldgenScheduler {
             }
             """)
     private static native void recordMobAiPulse();
+
+    @JSBody(script = "return globalThis.__gaiusMobAiTelemetry === true;")
+    private static native boolean mobAiTelemetryOptIn();
 
     private static void requestYield(int reason, int observedQueueDepth) {
         if (yieldActive) {
@@ -1064,6 +1120,45 @@ public final class BrowserWorldgenScheduler {
             """)
     private static native void recordSchedulerTaskLabel(String taskLabel);
 
+    @JSBody(params = {"label", "startedAt"}, script = """
+            try {
+              if (globalThis.__gaiusWorldgenTelemetry !== true) return;
+              const root = globalThis.__gaiusWorldgenStats ||
+                (globalThis.__gaiusWorldgenStats = {});
+              const name = String(label || 'unlabeled').toUpperCase();
+              const key = name.indexOf('BIOME') >= 0 ? 'BIOMES' :
+                name.indexOf('NOISE') >= 0 || name.indexOf('TERRAIN') >= 0 ? 'NOISE' :
+                name.indexOf('SURFACE') >= 0 ? 'SURFACE' :
+                name.indexOf('CARVER') >= 0 ? 'CARVERS' :
+                name.indexOf('FEATURE') >= 0 ? 'FEATURES' :
+                name.indexOf('STRUCTURE') >= 0 ? 'STRUCTURES' :
+                name.indexOf('LIGHT') >= 0 ? 'LIGHT' :
+                name.indexOf('FULL') >= 0 ? 'FULL' : 'OTHER';
+              const stages = root.chunkStatus || (root.chunkStatus = {});
+              const stat = stages[key] || (stages[key] = {count: 0, wallMs: 0, cpuMs: 0, maxWallMs: 0});
+              stat.__startedAt = Number(startedAt) || 0;
+            } catch (_) {}
+            """)
+    private static native void recordWorldgenStatusStart(String label, double startedAt);
+
+    @JSBody(params = {"label", "startedAt", "endedAt"}, script = """
+            try {
+              if (globalThis.__gaiusWorldgenTelemetry !== true) return;
+              const root = globalThis.__gaiusWorldgenStats;
+              if (!root || !root.chunkStatus) return;
+              const name = String(label || 'unlabeled').toUpperCase();
+              const key = name.indexOf('BIOME') >= 0 ? 'BIOMES' : name.indexOf('NOISE') >= 0 || name.indexOf('TERRAIN') >= 0 ? 'NOISE' : name.indexOf('SURFACE') >= 0 ? 'SURFACE' : name.indexOf('CARVER') >= 0 ? 'CARVERS' : name.indexOf('FEATURE') >= 0 ? 'FEATURES' : name.indexOf('STRUCTURE') >= 0 ? 'STRUCTURES' : name.indexOf('LIGHT') >= 0 ? 'LIGHT' : name.indexOf('FULL') >= 0 ? 'FULL' : 'OTHER';
+              const stat = root.chunkStatus[key];
+              const wall = Math.max(0, (Number(endedAt) || 0) - (Number(startedAt) || 0));
+              stat.count = (Number(stat.count) || 0) + 1;
+              stat.wallMs = (Number(stat.wallMs) || 0) + wall;
+              stat.cpuMs = (Number(stat.cpuMs) || 0) + wall;
+              stat.maxWallMs = Math.max(Number(stat.maxWallMs) || 0, wall);
+              delete stat.__startedAt;
+            } catch (_) {}
+            """)
+    private static native void recordWorldgenStatusEnd(String label, double startedAt, double endedAt);
+
     /**
      * Publishes fixed scalar task/turn markers only for the Node runtime smoke.
      * The browser release leaves the flag unset; malformed diagnostic state is
@@ -1253,7 +1348,7 @@ public final class BrowserWorldgenScheduler {
     private static native double networkInputEpoch();
 
     @JSBody(script = "return typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope;")
-    private static native boolean isWorkerRuntime();
+    private static native boolean isWorkerRuntimeJs();
 
     @JSBody(params = {
             "networkWaitPulses",

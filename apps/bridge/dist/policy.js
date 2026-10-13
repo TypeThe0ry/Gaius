@@ -1,4 +1,5 @@
 import { BlockList, isIP } from "node:net";
+import {MAXIMUM_CONNECT_CONTROL_BYTES, parseSessionProtocolDeclaration} from "./session-protocol.js";
 
 const privateNetworkBlockList = createPrivateNetworkBlockList();
 export function isOriginAllowed(origin, allowedOrigins) {
@@ -35,6 +36,9 @@ export function isPrivateNetworkAddress(value) {
         normalized, version === 4 ? "ipv4" : "ipv6");
 }
 export function parseConnectRequest(text) {
+    if (Buffer.byteLength(text, "utf8") > MAXIMUM_CONNECT_CONTROL_BYTES) {
+        throw new TypeError("Connect control message exceeds 64 KiB");
+    }
     const value = JSON.parse(text);
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
         throw new TypeError("Control message must be an object");
@@ -57,6 +61,7 @@ export function parseConnectRequest(text) {
         throw new TypeError("Connect token must be a string");
     }
     const skinDescriptor = parseSkinDescriptor(candidate.skinDescriptor);
+    const protocolTable = parseSessionProtocolDeclaration(candidate.protocolTable);
     const host = normalizeConnectHost(candidate.host, candidate.port);
     if (host.length === 0 || (isIP(host) === 0 && !isValidDnsName(host))) {
         throw new TypeError("Connect host is not a valid IP address or DNS name");
@@ -71,6 +76,7 @@ export function parseConnectRequest(text) {
         port: candidate.port,
         ...(candidate.token === undefined ? {} : { token: candidate.token }),
         ...(skinDescriptor === undefined ? {} : { skinDescriptor }),
+        ...(protocolTable === undefined ? {} : { protocolTable }),
     };
 }
 function parseSkinDescriptor(value) {

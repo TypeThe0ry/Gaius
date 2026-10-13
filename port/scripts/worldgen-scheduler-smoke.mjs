@@ -7,6 +7,7 @@ import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {patcherSource as stepSource} from "./patcher-sources.mjs";
 
 const nativePath = (value) => {
   if (!value) return value;
@@ -26,14 +27,15 @@ const [
   worldgen, packets, server, client, patcher262, clientPatcher,
   dispatcherScheduler, workerPatcher, workerBootstrap,
 ] = await Promise.all([
+  // The patcher steps are read with their domain classes (port/tools/patchkit/README.md, "Domains").
   readFile(schedulerSourcePath, "utf8"),
   source("port/src/main/java/dev/gaius/browser/BrowserPacketScheduler.java"),
   source("port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java"),
   source("port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java"),
-  source("port/tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java"),
-  source("port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
+  stepSource("Minecraft262BrowserPatcher"),
+  stepSource("MinecraftClientPatcher"),
   source("port/src/main/java/dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java"),
-  source("port/tools/src/main/java/dev/gaius/tools/MinecraftServerWorkerPatcher.java"),
+  stepSource("MinecraftServerWorkerPatcher"),
   source("port/web/singleplayer/server-worker-bootstrap.js"),
 ]);
 const schedulerSourceSha256 = createHash("sha256").update(worldgen).digest("hex");
@@ -90,6 +92,16 @@ assert.ok(mobPulse.includes("recordMobAiPulse();")
   "Mob AI pulse is missing its independent monotonic yield window");
 assert.doesNotMatch(mobPulse, /pulse\(\);/,
   "Mob AI pulse must not re-enter the worldgen pulse/network preemption path");
+// The client page reaches the same hooks from its own entity tick; only the server Worker may
+// yield there, and the page must return before any JavaScript call.
+assert.match(mobPulse, /public static void mobAiPulse\(\) \{\s*if \(!isWorkerRuntime\(\)\) \{\s*return;\s*\}/,
+  "Mob AI pulse must return on the client page before recording or yielding");
+assert.match(mobPulse, /if \(mobAiTelemetryEnabled\(\)\) \{\s*recordMobAiPulse\(\);/,
+  "Mob AI pulse telemetry must stay behind the cached opt-in");
+assert.match(worldgen, /if \(isWorkerRuntime\(\) && entity instanceof net\.minecraft\.world\.entity\.Mob\)/,
+  "Mob entity pulse must not run on the client page");
+assert.match(worldgen, /private static boolean isWorkerRuntime\(\) \{\s*int state = workerRuntimeState;/,
+  "the Worker realm check must be cached");
 
 
 assert.ok(worldgen.includes("TModernRuntimeSupport.yieldToEventLoop(0)"),
@@ -1804,9 +1816,9 @@ function schedulerSourceForJvmRegression() {
     );
   }
   replaceExactlyOnce(
-    /private static native boolean isWorkerRuntime\(\);/,
-    "private static boolean isWorkerRuntime() { return SchedulerHarnessRuntime.workerRuntime; }",
-    "isWorkerRuntime",
+    /private static native boolean isWorkerRuntimeJs\(\);/,
+    "private static boolean isWorkerRuntimeJs() { return SchedulerHarnessRuntime.workerRuntime; }",
+    "isWorkerRuntimeJs",
   );
   replaceExactlyOnce(
     /private static native void recordSchedulerMarker\([\s\S]*?double activeWorkMillis\);/,
@@ -2035,6 +2047,9 @@ public final class MobAiWindowHarness {
     private static final double DEFAULT_SLICE_MILLIS = 8.0;
     private static double nowMillis() { return clock; }
     private static int networkQueueDepth() { return 0; }
+    private static boolean workerRuntime = true;
+    private static boolean isWorkerRuntime() { return workerRuntime; }
+    private static boolean mobAiTelemetryEnabled() { return true; }
     private static void recordMobAiPulse() { records++; }
     private static void requestYield(int reason, int depth) {
         yields++;
@@ -2056,6 +2071,11 @@ ${mobPulse.replace("public static void mobAiPulse()", "static void mobAiPulse()"
         if (records != 5 || yields != 2) throw new AssertionError("window boundary");
         clock = 215.0; mobAiPulse();
         if (records != 6 || yields != 2) throw new AssertionError("post-resume window");
+        // The client page ticks the same mobs; its hook neither records nor yields.
+        workerRuntime = false;
+        clock = 400.0; mobAiPulse();
+        if (records != 6 || yields != 2) throw new AssertionError("client page pulse yielded");
+        workerRuntime = true;
         System.out.println("MOB_AI_WINDOW_OK records=" + records + " yields=" + yields);
     }
 }

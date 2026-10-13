@@ -451,7 +451,57 @@ assert.equal(resumableStream.scheduled.length, 1,
 stopSource(9);
 deleteSource(9);
 
+// An unchanged listener transform (vanilla sends it every frame) writes no AudioParam.
+listener3f(0x1004, 5, 6, 7);
+listenerOrientation(0, 0, -1, 0, 1, 0);
+const listenerParams = state.context.listener;
+const historyBefore = [listenerParams.positionX, listenerParams.forwardZ, listenerParams.upY,
+  listenerParams.velocityX].map(param => param.history.length);
+const skippedBefore = state.stats.audioParamWritesSkipped;
+for (let frame = 0; frame < 60; frame++) {
+  listener3f(0x1004, 5, 6, 7);
+  listenerOrientation(0, 0, -1, 0, 1, 0);
+}
+assert.deepEqual([listenerParams.positionX, listenerParams.forwardZ, listenerParams.upY,
+  listenerParams.velocityX].map(param => param.history.length), historyBefore,
+  "an unchanged listener transform scheduled AudioParam events");
+assert.ok(state.stats.audioParamWritesSkipped > skippedBefore, "skipped writes are not counted");
+listener3f(0x1004, 5, 6, 8);
+assert.equal(listenerParams.positionZ.value, 8, "a changed listener position was not written");
+assert.equal(listenerParams.positionX.history.length, historyBefore[0],
+  "an unchanged listener component was written again");
+
+// A deleted source's gain/panner pair serves the next source, with that source's parameters.
+const pooledFirst = state.freshSource();
+state.sources.set(90, pooledFirst);
+state.scheduleBuffer(pooledFirst, 7, 0, false);
+source3f(90, 0x1004, 8, 4, -2);
+sourcef(90, 0x1020, 2);
+sourcef(90, 0x100A, 0.25);
+const pooledPanner = pooledFirst.panner;
+const pooledGain = pooledFirst.gainNode;
+deleteSource(90);
+assert.equal(state.graphPool.at(-1).panner, pooledPanner, "a deleted source's pair was not pooled");
+const reusesBefore = state.stats.webAudioGraphReuses;
+setDirectionalAudio(false);
+const pooledNext = state.freshSource();
+state.sources.set(91, pooledNext);
+state.scheduleBuffer(pooledNext, 7, 0, false);
+assert.equal(pooledNext.panner, pooledPanner, "the next source did not reuse the pooled panner");
+assert.equal(pooledNext.gainNode, pooledGain, "the next source did not reuse the pooled gain");
+assert.equal(state.stats.webAudioGraphReuses, reusesBefore + 1);
+assert.deepEqual([pooledPanner.positionX.value, pooledPanner.positionY.value, pooledPanner.positionZ.value],
+  [0, 0, 0], "a reused panner kept the previous source's position");
+assert.equal(pooledPanner.refDistance, 1, "a reused panner kept the previous source's distance");
+assert.equal(pooledGain.gain.value, 1, "a reused gain kept the previous source's gain");
+assert.equal(pooledPanner.panningModel, "equalpower", "a reused panner kept an old panning model");
+assert.equal(pooledNext.scheduled[0].node.connections[0], pooledPanner,
+  "the new source's buffer is not routed through the reused panner");
+deleteSource(91);
+setDirectionalAudio(true);
+
 const lifecycleIterations = 20_000;
+const nodesBeforeLifecycle = state.stats.webAudioNodesCreated;
 for (let index = 0; index < lifecycleIterations; index++) {
   const id = 100 + index;
   const transient = state.freshSource();
@@ -463,11 +513,15 @@ for (let index = 0; index < lifecycleIterations; index++) {
   assert.equal(transient.gainNode, null);
 }
 assert.equal(state.sources.size, 4, "transient OpenAL sources leaked into the registry");
+assert.equal(state.stats.webAudioNodesCreated - nodesBeforeLifecycle, lifecycleIterations,
+  "transient sources created gain or panner nodes instead of reusing the pooled pair");
+assert.ok(state.graphPool.length >= 1 && state.graphPool.length <= 32, "the graph pool is unbounded");
 
 cleanup();
 assert.equal(state.sources.size, 0, "OpenAL source registry did not return to baseline");
 assert.equal(state.buffers.size, 0, "OpenAL buffer registry did not return to baseline");
 assert.equal(state.masterGainNode, null, "OpenAL master gain retained the audio graph");
+assert.equal(state.graphPool.length, 0, "cleanup kept pooled gain/panner pairs");
 assert.equal(
   state.stats.webAudioNodesCreated,
   state.stats.webAudioNodesDisposed,
@@ -502,6 +556,9 @@ console.log(JSON.stringify({
     connections: state.stats.webAudioConnections,
     disconnects: state.stats.webAudioDisconnects,
     naturalEnds: state.stats.webAudioNaturalEnds,
+    graphReuses: state.stats.webAudioGraphReuses,
+    audioParamWrites: state.stats.audioParamWrites,
+    audioParamWritesSkipped: state.stats.audioParamWritesSkipped,
     sources: state.sources.size,
     buffers: state.buffers.size
   }

@@ -619,7 +619,9 @@ pub fn mesh_section(table: &ModelTable, job: &SectionJob<'_>, scratch: &mut Scra
                 let x = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
                 let id = ids[start + x];
-                if table.states[id as usize].has(flags::UNSUPPORTED) {
+                if table.states[id as usize].has(flags::UNSUPPORTED)
+                    || !crate::VERTEX_LAYOUTS.contains(&(table.semantics, 28))
+                {
                     head.status = output::STATUS_NEEDS_VANILLA;
                     head.detail = id;
                     return Ok(output::encode_head_only(&head));

@@ -93,8 +93,10 @@ public final class GaiusTeaVMOptions {
      * instead (dev.gaius.browser.JspiHost), and every Java thread runs as one
      * WebAssembly.promising activation. The class library selects those primitives through
      * the {@link #JSPI_TAG} platform tag. A reachable {@code @Async} method fails the build,
-     * because nothing would suspend for it. Only for the WEBASSEMBLY_GC target; exclusive with
-     * the coroutine cutting options.
+     * because nothing would suspend for it. Only for the WEBASSEMBLY_GC target, which requires
+     * it ({@link #platformTags} fails a configured WebAssembly GC compile without it); exclusive
+     * with the coroutine cutting options. Class initializers get the JVM's initialization
+     * semantics in this mode ({@link #wasmWrapMethodBody}).
      */
     public static final String JSPI = PREFIX + "jspi";
 
@@ -109,6 +111,13 @@ public final class GaiusTeaVMOptions {
     public static final String ROLE_TAG_PREFIX = "gaius-role-";
     /** Platform tag of the JSPI mode ({@link #JSPI}), read by JspiHost.enabled(). */
     public static final String JSPI_TAG = "gaius-jspi";
+    /** Platform tag of TeaVM's WEBASSEMBLY_GC target ({@code WasmGCTarget.getPlatformTags}). */
+    static final String WASM_GC_TAG = "webassembly-gc";
+    /**
+     * The class (TeaVM name of TJspiThreadSupport) whose clinitEnter/clinitExit the class
+     * initialization guards of the JSPI mode call ({@link #wasmWrapMethodBody}).
+     */
+    static final String JSPI_SUPPORT_CLASS = "java.lang.JspiThreadSupport";
 
     /** JS counter of active frames that must not suspend (cut methods). */
     public static final String NO_SUSPEND_COUNTER = "globalThis.__gaiusNoSuspendDepth";
@@ -341,6 +350,12 @@ public final class GaiusTeaVMOptions {
         configure(properties);
         if (!configured) {
             return base;
+        }
+        if (!jspi && Arrays.asList(base).contains(WASM_GC_TAG)) {
+            // The coroutine (Fiber) mode of the WebAssembly GC target was removed (design D3,
+            // M0 S2: its output does not validate); GAIUS_TEAVM_JSPI=false no longer works.
+            throw new IllegalStateException("The WebAssembly GC target only runs in JSPI mode:"
+                    + " role " + role + " must set " + JSPI + "=true (design D3)");
         }
         List<String> tags = new ArrayList<>(Arrays.asList(base));
         tags.add(ROLE_TAG_PREFIX + role);
@@ -1013,6 +1028,211 @@ public final class GaiusTeaVMOptions {
             invoke(body, "add", unreachable.getConstructor().newInstance());
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("TeaVM API changed: WasmUnreachable", e);
+        }
+    }
+
+    /** Ids of the class initializers that {@link #wasmWrapMethodBody} guarded, by class name. */
+    private static final Map<String, Integer> wasmClinitIds = new HashMap<>();
+    private static final Map<String, Method> privateMethods = new HashMap<>();
+
+    /**
+     * Patched {@code WasmGCMethodGenerator.generateRegularMethodBody} (WebAssembly GC only):
+     * takes the place of its {@code wrapSynchronizedMethod(method, visitor, function, node)}
+     * call, which every other method still goes through unchanged.
+     *
+     * <p>In JSPI mode a class initializer that TeaVM compiles with an initializer pointer (a
+     * dynamic initializer: call sites call it through a global, and its body starts with the
+     * "erase" that points the global at an empty function, added by
+     * {@code addInitializerErase}) gets the JVM's class initialization semantics (design D3).
+     * The stock erase at the start lets every other thread that requests the class while the
+     * initializer is suspended see it half-initialized. The guard keeps the pointer on the
+     * initializer until the body ends and asks TJspiThreadSupport who may run it:
+     * <pre>
+     *   if (!JspiThreadSupport.clinitEnter(id)) return;   // recursive, or waited for another thread
+     *   block $done
+     *     block $exn (result exnref)
+     *       try_table (catch_all_ref $exn)  body (its returns break to $done)  br $done  end
+     *       unreachable
+     *     end
+     *     erase; JspiThreadSupport.clinitExit(id); throw_ref
+     *   end
+     *   erase; JspiThreadSupport.clinitExit(id)
+     * </pre>
+     * {@code id} numbers the guarded classes of the compile. The two erase copies are the stock
+     * one, moved, and a second one from addInitializerErase; on an exception the class stays
+     * erased, as in the stock code, instead of running its initializer again. JspiThreadSupport's
+     * own initializer is left as it is: the guard's callees are exported, and TeaVM starts an
+     * exported method with the initialization of its class, so a guarded JspiThreadSupport
+     * initializer would call itself (it runs before any thread exists).
+     */
+    public static synchronized void wasmWrapMethodBody(Object generator, Object method,
+            Object visitor, Object function, Object node) {
+        if (jspi && "<clinit>".equals(invoke(method, "getName"))
+                && !JSPI_SUPPORT_CLASS.equals(invoke(method, "getOwnerName"))
+                && Boolean.TRUE.equals(invoke(fieldValue(generator, "classInitInfo"),
+                        "isDynamicInitializer", invoke(method, "getOwnerName")))) {
+            wasmClinitGuard(generator, method, visitor, function, node);
+            return;
+        }
+        invokePrivate(generator, "wrapSynchronizedMethod", method, visitor, function, node);
+    }
+
+    private static void wasmClinitGuard(Object generator, Object method, Object visitor,
+            Object function, Object node) {
+        String owner = (String) invoke(method, "getOwnerName");
+        Integer known = wasmClinitIds.get(owner);
+        int id = known != null ? known : wasmClinitIds.size();
+        wasmClinitIds.put(owner, id);
+        if (wasmClinitIds.size() == 1 && known == null) {
+            System.out.println("[gaius-teavm] jspi: class initializers wait for their initializing"
+                    + " thread (JVM semantics)");
+        }
+        ClassLoader loader = function.getClass().getClassLoader();
+        String instruction = "org.teavm.backend.wasm.model.instruction.";
+        Object body = invoke(function, "getBody");
+        if (invoke(body, "isEmpty").equals(Boolean.TRUE)) {
+            throw new IllegalStateException("TeaVM API changed: the initializer erase of " + owner
+                    + " is not at the start of its body");
+        }
+        Object normalErase = construct(loader, instruction + "WasmInstructionList");
+        invoke(normalErase, "transferFrom", body);
+        invokePrivate(generator, "addInitializerErase", method, function);
+        Object exceptionalErase = construct(loader, instruction + "WasmInstructionList");
+        invoke(exceptionalErase, "transferFrom", body);
+        Object enter = invoke(generator, "forStaticMethod",
+                supportMethod(loader, "clinitEnter", "BOOLEAN"));
+        Object exit = invoke(generator, "forStaticMethod", supportMethod(loader, "clinitExit", "VOID"));
+
+        Object builder = invoke(body, "builder");
+        i32Const(builder, id);
+        invoke(builder, "call", enter);
+        invoke(builder, "intUnary", enumConstant(loader, instruction + "WasmIntType", "INT32"),
+                enumConstant(loader, instruction + "WasmIntUnaryOperation", "EQZ"));
+        Object skip = invoke(builder, "conditional");
+        invoke(invoke(skip, "getThenBlock"), "add", construct(loader, instruction + "WasmReturn"));
+
+        Object done = invoke(builder, "block");
+        Object exn = invoke(done, "block", staticValue(loader, "org.teavm.backend.wasm.model.WasmType", "EXN"));
+        Object tryTable = invoke(exn, "try_");
+        Object doneList = publicField(done, "list");
+        Object exnList = publicField(exn, "list");
+        try {
+            Class<?> clause = Class.forName(instruction + "WasmCatchClause", true, loader);
+            @SuppressWarnings("unchecked")
+            List<Object> catches = (List<Object>) invoke(tryTable, "getCatches");
+            catches.add(clause.getConstructor(Class.forName("org.teavm.backend.wasm.model.WasmTag",
+                    true, loader), boolean.class, exnList.getClass()).newInstance(null, true, exnList));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: WasmCatchClause", e);
+        }
+        invoke(visitor, "setReturnBlock", doneList);
+        Object tryBody = invoke(tryTable, "getBody");
+        invoke(visitor, "generate", invoke(node, "getBody"), tryBody);
+        try {
+            invoke(tryBody, "add", Class.forName(instruction + "WasmBreak", true, loader)
+                    .getConstructor(doneList.getClass()).newInstance(doneList));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: WasmBreak", e);
+        }
+        invoke(exn, "unreachable");
+        invoke(done, "transferFrom", exceptionalErase);
+        i32Const(done, id);
+        invoke(done, "call", exit);
+        invoke(done, "throw_", (Object) null);
+        invoke(builder, "transferFrom", normalErase);
+        i32Const(builder, id);
+        invoke(builder, "call", exit);
+    }
+
+    /** {@code JspiThreadSupport.<name>(int)} returning {@code returnType} (a ValueType constant). */
+    private static Object supportMethod(ClassLoader loader, String name, String returnType) {
+        try {
+            Class<?> valueType = Class.forName("org.teavm.model.ValueType", true, loader);
+            Object signature = java.lang.reflect.Array.newInstance(valueType, 2);
+            java.lang.reflect.Array.set(signature, 0, valueType.getField("INTEGER").get(null));
+            java.lang.reflect.Array.set(signature, 1, valueType.getField(returnType).get(null));
+            return Class.forName("org.teavm.model.MethodReference", true, loader)
+                    .getConstructor(String.class, String.class, signature.getClass())
+                    .newInstance(JSPI_SUPPORT_CLASS, name, signature);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: MethodReference", e);
+        }
+    }
+
+    private static void i32Const(Object builder, int value) {
+        try {
+            builder.getClass().getMethod("i32Const", int.class).invoke(builder, value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: WasmInstructionBuilder.i32Const", e);
+        }
+    }
+
+    private static Object construct(ClassLoader loader, String className) {
+        try {
+            return Class.forName(className, true, loader).getConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: " + className, e);
+        }
+    }
+
+    private static Object staticValue(ClassLoader loader, String className, String field) {
+        try {
+            return Class.forName(className, true, loader).getField(field).get(null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: " + className + "." + field, e);
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Object enumConstant(ClassLoader loader, String className, String name) {
+        try {
+            return Enum.valueOf((Class<? extends Enum>) Class.forName(className, true, loader), name);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: " + className, e);
+        }
+    }
+
+    private static Object publicField(Object target, String name) {
+        try {
+            return target.getClass().getField(name).get(target);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("TeaVM API changed: " + target.getClass().getName()
+                    + "." + name, e);
+        }
+    }
+
+    /** Calls a private method of a TeaVM class, found by name and parameter count. */
+    private static Object invokePrivate(Object target, String name, Object... arguments) {
+        String key = target.getClass().getName() + "#" + name + "/" + arguments.length;
+        Method method = privateMethods.get(key);
+        if (method == null) {
+            for (Method candidate : target.getClass().getDeclaredMethods()) {
+                if (candidate.getName().equals(name) && candidate.getParameterCount() == arguments.length) {
+                    if (method != null) {
+                        throw new IllegalStateException("TeaVM API changed: " + key + " is overloaded");
+                    }
+                    method = candidate;
+                }
+            }
+            if (method == null) {
+                throw new IllegalStateException("TeaVM API changed: no method " + key);
+            }
+            method.setAccessible(true);
+            privateMethods.put(key, method);
+        }
+        try {
+            return method.invoke(target, arguments);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot call " + key, e);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException(key + " failed", cause);
         }
     }
 

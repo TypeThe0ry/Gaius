@@ -6,9 +6,7 @@ import { request as httpsRequest } from "node:https";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 import {
-    MINECRAFT_1_21_11,
-    MINECRAFT_26_2,
-    MINECRAFT_26_3,
+    MINECRAFT_PROFILES,
 } from "./dist/protocol.js";
 
 const registryPath = new URL("../../relay-nodes.json", import.meta.url);
@@ -22,7 +20,7 @@ const handshakeHost = process.env.GAIUS_PUBLIC_RELAY_HANDSHAKE_HOST ?? target.ho
 const minecraftProfile = resolveSmokeMinecraftProfile(
     process.env.GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION ??
     process.env.GAIUS_PUBLIC_RELAY_PROTOCOL_VERSION ??
-    MINECRAFT_1_21_11.name);
+    MINECRAFT_PROFILES[0]?.name);
 const origin = process.env.GAIUS_PUBLIC_RELAY_ORIGIN ?? "null";
 const timeoutMs = parsePositiveInteger(
     process.env.GAIUS_PUBLIC_RELAY_TIMEOUT_MS ?? "15000",
@@ -188,13 +186,13 @@ console.log(JSON.stringify({
 
 function resolveSmokeMinecraftProfile(value) {
     const key = String(value ?? "").trim();
-    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3]
+    const profile = MINECRAFT_PROFILES
         .find((candidate) => candidate.name === key ||
             String(candidate.protocolVersion) === key);
     if (profile === undefined) {
         throw new Error(
             `Unsupported public smoke Minecraft version ${value}; ` +
-            "expected 1.21.11/774, 26.2/776 or 26.3/777");
+            `expected ${MINECRAFT_PROFILES.map(profile => `${profile.name}/${profile.protocolVersion}`).join(", ")}`);
     }
     return profile;
 }

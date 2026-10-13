@@ -3,26 +3,65 @@
 //   DIST=port/target/26.3/<dist> node port/scripts/minecraft-title-screen-cdp.mjs   (served on 127.0.0.1)
 //   ARTIFACT=path/to/Gaius-26.2.html node port/scripts/minecraft-title-screen-cdp.mjs (portable, file://)
 //   M3_SELFTEST=1 PAGE_URL=about:blank node port/scripts/minecraft-title-screen-cdp.mjs  (harness self-test)
+//   ... --runtime js|wasm   (or GAIUS_RUNTIME) the runtime the page must run: with DIST it picks that
+//       runtime's page (index-wasm.html or index.html?runtime=wasm), with ARTIFACT_DIST=<dir> that
+//       runtime's portable page; the run fails when the page reports another runtime.
+//   ... --gpu webgpu|webgl2   (or GAIUS_GPU) the graphics backend: adds ?gpu= to the page and fails
+//       unless the game renders with it (window.__gaiusGpuBackend); GAIUS_GPU_EXPECT names another
+//       expected backend (the fallback tests: ?gpuInject=after-configure must end on webgl2), and
+//       PAGE_QUERY appends more switches (gpuInject=..., gpuPipelines=eager, ...). With webgpu the
+//       WebGPU glue's errors, translation and pipeline failures fail the run (noWebGpuErrors) and
+//       its startup and pipeline telemetry goes to report.gpu.
 //
-// Checks, in order: boot to the first screen (the first-run Edit Profile screen or TitleScreen),
-// TitleScreen widgets, frame pacing, Options, Multiplayer -> Direct Connect typing (the Join
-// Server button turns active), Edit Profile from the title button, no shader compile/link
-// failures and no WebGL errors (getError is drained at ~1 Hz). Evidence goes to OUT
+// Checks, in order: boot to the first screen (the first-run Edit Profile screen or TitleScreen,
+// once the resource LoadingOverlay is gone), TitleScreen widgets, frame pacing, Options,
+// Multiplayer -> Direct Connect typing (the Join Server button turns active), Edit Profile from
+// the title button (26.2 and later; 1.21.11 has no such button), no shader compile/link failures,
+// no WebGL errors (getError is drained at ~1 Hz; contexts the page loses on purpose through
+// WEBGL_lose_context, such as the quality benchmark's probe, are left out), the requested runtime
+// and no runtime failure (bench/harness-common.mjs: TeaVM suspension guards on js, failed Java
+// threads on wasm, boot errors on both). Chrome runs isolated (bench/harness-common.mjs: no
+// background traffic, non-loopback requests refused). Evidence goes to OUT
 // (report.json, console.log with page and Worker console, screenshots). Exit 0 only on PASS.
 // Validated on the released 26.2 client (all checks PASS) and by M3_SELFTEST (a bad GL enum and
 // a broken shader are both reported).
+import {LEGACY_PROFILE} from "./verification-profiles.mjs";
 import {spawn} from "node:child_process";
 import {createReadStream, statSync, existsSync} from "node:fs";
 import {mkdtemp, mkdir, writeFile, rm, appendFile} from "node:fs/promises";
 import {createServer as netServer} from "node:net";
 import {createServer as httpServer} from "node:http";
 import {tmpdir} from "node:os";
-import {resolve, join, extname, normalize, relative, isAbsolute} from "node:path";
+import {basename, resolve, join, extname, normalize, relative, isAbsolute} from "node:path";
 import {pathToFileURL} from "node:url";
+import {chromeIsolationArgs, fileArtifactForRuntime, pageForRuntime, RUNTIME_TELEMETRY_EXPRESSION, runtimeArgument,
+  runtimeTelemetryFailures} from "./bench/harness-common.mjs";
+import {GL_FRAME_GUARD_SOURCE, GL_FRAME_GUARD_WINDOW_EXPRESSION, glFrameGuardFailures} from "../../tools/gl-frame-guard.mjs";
 
 const out = resolve(process.env.OUT || "m3-out");
 const chromeBin = process.env.GAIUS_CHROME_BIN || "C:/Program Files/Google/Chrome/Application/chrome.exe";
 const bootTimeout = Number(process.env.BOOT_TIMEOUT_MS || 900000);
+const requestedRuntime = runtimeArgument();
+// --gpu webgpu|webgl2 (or GAIUS_GPU); null when neither is given.
+function gpuArgument(argv = process.argv, env = process.env) {
+  const index = argv.indexOf("--gpu");
+  const inline = argv.find(value => value.startsWith("--gpu="));
+  const value = index >= 0 ? argv[index + 1] : inline ? inline.slice("--gpu=".length) : env.GAIUS_GPU || null;
+  if (value == null || value === "") return null;
+  if (value !== "webgpu" && value !== "webgl2") throw new Error(`--gpu must be webgpu or webgl2, not ${value}`);
+  return value;
+}
+const requestedGpu = gpuArgument();
+const expectedGpu = process.env.GAIUS_GPU_EXPECT || requestedGpu;
+// The page URL with the graphics switches: ?gpu= and PAGE_QUERY ("a=1&b=2").
+function withPageSwitches(url) {
+  const extra = new URLSearchParams(process.env.PAGE_QUERY || "");
+  if (requestedGpu) extra.set("gpu", requestedGpu);
+  if ([...extra.keys()].length === 0) return url;
+  const parsed = new URL(url);
+  for (const [key, value] of extra) parsed.searchParams.set(key, value);
+  return parsed.href;
+}
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 await mkdir(out, {recursive: true});
 const logFile = join(out, "console.log");
@@ -81,9 +120,13 @@ if (!pageUrl && process.env.DIST) {
     createReadStream(p).pipe(res);
   });
   await new Promise(ok => server.listen(0, "127.0.0.1", ok));
-  pageUrl = `http://127.0.0.1:${server.address().port}/index.html`;
+  pageUrl = `http://127.0.0.1:${server.address().port}/${pageForRuntime(root, requestedRuntime)}`;
 }
-if (!pageUrl) pageUrl = pathToFileURL(resolve(process.env.ARTIFACT)).href;
+if (!pageUrl) {
+  const artifact = process.env.ARTIFACT || fileArtifactForRuntime(resolve(process.env.ARTIFACT_DIST), requestedRuntime || "js");
+  pageUrl = pathToFileURL(resolve(artifact)).href;
+}
+if (!process.env.M3_SELFTEST) pageUrl = withPageSwitches(pageUrl);
 
 class Cdp {
   constructor(url) {
@@ -105,8 +148,23 @@ class Cdp {
     return new Promise((ok, bad) => { this.pending.set(id, {ok, bad}); this.ws.send(JSON.stringify({id, method, params, ...(sessionId ? {sessionId} : {})})); });
   }
 }
+// A page whose main thread never yields again (a crashed client that keeps it busy) never answers
+// Runtime.evaluate: give up after this long instead of hanging the harness (every expression here
+// is a state read or a few seconds of frames).
+const EVALUATE_TIMEOUT_MS = Number(process.env.GAIUS_CDP_EVALUATE_TIMEOUT_MS) || 60_000;
 async function evaluate(cdp, expression, sessionId) {
-  const r = await cdp.send("Runtime.evaluate", {expression, awaitPromise: true, returnByValue: true}, sessionId);
+  let timer;
+  const timeout = new Promise((_, bad) => {
+    timer = setTimeout(() => bad(new Error(`Runtime.evaluate gave no answer within ${EVALUATE_TIMEOUT_MS} ms `
+      + "(page main thread busy)")), EVALUATE_TIMEOUT_MS);
+  });
+  let r;
+  try {
+    r = await Promise.race([
+      cdp.send("Runtime.evaluate", {expression, awaitPromise: true, returnByValue: true}, sessionId), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
   if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text || "evaluate failed");
   return r.result?.value;
 }
@@ -159,14 +217,20 @@ async function screenshot(cdp, name) {
   } catch (e) { await log("shot-fail", name + " " + e); return null; }
 }
 
-// Injected before any page script: WebGL instrumentation.
+// Injected before any page script: WebGL instrumentation. A context that the page loses on
+// purpose through WEBGL_lose_context.loseContext() (the quality layer's GPU benchmark probe,
+// runtime/quality/gpu-caps.js) is not a WebGL failure: its loss, its CONTEXT_LOST_WEBGL error and
+// its later getError results are counted apart (intentional*) and it is no longer drained.
 const glProbe = `(()=>{
-  const rec = window.__m3gl = {gls:[], drained:{}, drainCalls:0, contexts:0, shaderFailures:[], programFailures:[], getErrors:{}, getErrorCalls:0, shaders:[], programs:[], lost:0, created:[]};
+  const rec = window.__m3gl = {gls:[], drained:{}, drainCalls:0, contexts:0, shaderFailures:[], programFailures:[], getErrors:{}, getErrorCalls:0, shaders:[], programs:[], lost:0, created:[],
+    intentionalLossRequests:0, intentionalLost:0, intentionalErrors:{}};
+  const intentional = new WeakSet();
   const names = {1280:'INVALID_ENUM',1281:'INVALID_VALUE',1282:'INVALID_OPERATION',1285:'OUT_OF_MEMORY',1286:'INVALID_FRAMEBUFFER_OPERATION',37442:'CONTEXT_LOST_WEBGL'};
   let gse0 = null;
   const wrap = proto => {
     if (!proto || proto.__m3) return; proto.__m3 = true;
-    const gse = proto.getError; if (!gse0 && proto === (window.WebGL2RenderingContext && WebGL2RenderingContext.prototype)) gse0 = gse; proto.getError = function(){ const e = gse.call(this); rec.getErrorCalls++; if (e) { const k = names[e]||String(e); rec.getErrors[k]=(rec.getErrors[k]||0)+1; } return e; };
+    const gse = proto.getError; if (!gse0 && proto === (window.WebGL2RenderingContext && WebGL2RenderingContext.prototype)) gse0 = gse; proto.getError = function(){ const e = gse.call(this); rec.getErrorCalls++; if (e) { const k = names[e]||String(e); const into = intentional.has(this) ? rec.intentionalErrors : rec.getErrors; into[k]=(into[k]||0)+1; } return e; };
+    const gex = proto.getExtension; proto.getExtension = function(name){ const ext = gex.call(this, name); if (ext && String(name).toLowerCase() === 'webgl_lose_context' && !ext.__m3) { const gl = this; const lose = ext.loseContext; ext.loseContext = function(){ intentional.add(gl); rec.intentionalLossRequests++; return lose.apply(this, arguments); }; ext.__m3 = true; } return ext; };
     const cs = proto.createShader; proto.createShader = function(t){ const s = cs.call(this,t); if (s && rec.shaders.length < 4000) rec.shaders.push({gl:this, s, type:t}); return s; };
     const cp = proto.createProgram; proto.createProgram = function(){ const p = cp.call(this); if (p && rec.programs.length < 4000) rec.programs.push({gl:this, p}); return p; };
     const gsp = proto.getShaderParameter; proto.getShaderParameter = function(s,n){ const v = gsp.call(this,s,n); if (n===0x8B81 && v===false && rec.shaderFailures.length<50) rec.shaderFailures.push(String(this.getShaderInfoLog(s)).slice(0,2000)); return v; };
@@ -175,35 +239,45 @@ const glProbe = `(()=>{
   wrap(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
   wrap(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
   const gc = HTMLCanvasElement.prototype.getContext;
-  HTMLCanvasElement.prototype.getContext = function(kind, attrs){ const c = gc.call(this, kind, attrs); if (c && /webgl/.test(kind)) { rec.contexts++; if (!rec.gls.includes(c)) rec.gls.push(c); rec.created.push(kind); this.addEventListener('webglcontextlost', ()=>rec.lost++); } return c; };
+  HTMLCanvasElement.prototype.getContext = function(kind, attrs){ const c = gc.call(this, kind, attrs); if (c && /webgl/.test(kind) && !rec.gls.includes(c)) { rec.contexts++; rec.gls.push(c); rec.created.push(kind); this.addEventListener('webglcontextlost', ()=>{ if (intentional.has(c)) rec.intentionalLost++; else rec.lost++; }); } return c; };
   // Active WebGL error sampling: GL error flags are sticky until getError reads them, so
   // draining at ~1 Hz observes every error code raised since the previous drain.
-  window.__m3drain = () => { rec.drainCalls++; for (const gl of rec.gls) { for (let i = 0; i < 16; i++) { const e = gse0.call(gl); if (!e) break; const k = names[e]||String(e); rec.drained[k]=(rec.drained[k]||0)+1; } } return rec.drained; };
+  window.__m3drain = () => { rec.drainCalls++; for (const gl of rec.gls) { if (intentional.has(gl)) continue; for (let i = 0; i < 16; i++) { const e = gse0.call(gl); if (!e) break; const k = names[e]||String(e); rec.drained[k]=(rec.drained[k]||0)+1; } } return rec.drained; };
   window.__m3audit = () => {
     const bad = {shaders:[], programs:[]}; let shaders=0, programs=0;
     for (const {gl,s,type} of rec.shaders) { try { if (gl.isShader(s)) { shaders++; if (gl.getShaderParameter(s,0x8B81)===false) bad.shaders.push({type, log:String(gl.getShaderInfoLog(s)).slice(0,1500)}); } } catch(e){} }
     for (const {gl,p} of rec.programs) { try { if (gl.isProgram(p)) { programs++; if (gl.getProgramParameter(p,0x8B82)===false) bad.programs.push(String(gl.getProgramInfoLog(p)).slice(0,1500)); } } catch(e){} }
-    return {contexts:rec.contexts, created:rec.created, lost:rec.lost, liveShaders:shaders, livePrograms:programs, shadersCreated:rec.shaders.length, programsCreated:rec.programs.length,
+    return {contexts:rec.contexts, created:rec.created, lost:rec.lost, intentionalLossRequests:rec.intentionalLossRequests, intentionalLost:rec.intentionalLost, intentionalErrors:rec.intentionalErrors, liveShaders:shaders, livePrograms:programs, shadersCreated:rec.shaders.length, programsCreated:rec.programs.length,
       badShaders:bad.shaders.slice(0,20), badPrograms:bad.programs.slice(0,20), shaderFailures:rec.shaderFailures.slice(0,20), programFailures:rec.programFailures.slice(0,20), getErrors:rec.getErrors, getErrorCalls:rec.getErrorCalls, drained:(window.__m3drain(), rec.drained), drainCalls:rec.drainCalls};
   };
 })();`;
 
 const stateExpr = `(()=>{const s=window.__gaiusMinecraftState||null;const st=document.querySelector('[data-state]');
   const bp=[...document.querySelectorAll('#boot-screen,[id*=boot],[id*=status]')].filter(e=>!e.hidden).map(e=>({id:e.id,text:String(e.textContent||'').trim().slice(0,400)})).filter(e=>e.text);
-  return {screen:s?String(s.screen||''):null,screenTitle:s?s.screenTitle:null,screenSize:s?s.screenSize:null,widgets:s&&Array.isArray(s.screenWidgets)?s.screenWidgets.map(w=>({type:String(w.type||'').split('.').pop(),text:w.text,active:w.active,visible:w.visible,focused:w.focused})):null,
+  return {screen:s?String(s.screen||''):null,overlay:s?String(s.overlay||''):null,profile:typeof window.__gaiusProfileId==='string'?window.__gaiusProfileId:null,
+    failure:(window.__gaiusThreadError||window.__gaiusBootError)?String((window.__gaiusThreadError||window.__gaiusBootError).stack||window.__gaiusThreadError||window.__gaiusBootError).slice(0,2000):null,screenTitle:s?s.screenTitle:null,screenSize:s?s.screenSize:null,widgets:s&&Array.isArray(s.screenWidgets)?s.screenWidgets.map(w=>({type:String(w.type||'').split('.').pop(),text:w.text,active:w.active,visible:w.visible,focused:w.focused})):null,
     statusState:st?st.dataset.state:null,boot:bp,fps:window.__gaiusFps?{fps:window.__gaiusFps.fps,rafFps:window.__gaiusFps.rafFps,gameFps:window.__gaiusFps.gameFps,frames:window.__gaiusFps.frames,gameFrames:window.__gaiusFps.gameFrames}:null,
     keys:s?Object.keys(s).slice(0,60):null};})()`;
 const screenExpr = "String(window.__gaiusMinecraftState?.screen||'')";
 
-const report = {pageUrl, startedAt: new Date().toISOString(), checks: {}, timeline: []};
+const report = {pageUrl, requestedRuntime, requestedGpu, expectedGpu, startedAt: new Date().toISOString(), checks: {}, timeline: []};
+// What the page offered (__gaiusGpuSelection), what the game renders with (__gaiusGpuBackend), the
+// canvas host's replacements and the WebGPU glue's state, errors and startup/pipeline telemetry.
+const GPU_EXPRESSION = `(()=>{const g=globalThis;const s=g.__gaiusGpuSelection||null;const w=g.GaiusWebGpu||null;const h=g.__gaiusCanvasHost||null;
+  const pick=o=>o?JSON.parse(JSON.stringify(o)):null;
+  return {selection:s?{requested:s.requested,source:s.source,selected:s.selected,fallback:s.fallback,reason:s.reason,inject:s.inject,initMs:s.initMs}:null,
+    backend:typeof g.__gaiusGpuBackend==='string'?g.__gaiusGpuBackend:null,
+    canvas:h?{replacements:h.replacements,lastReason:h.lastReason,kind:(h.current()&&h.current().__gaiusContextKind)||null}:null,
+    webgpu:w?{status:w.status,failure:w.failure||'',lost:w.lostReason||'',active:w.active===true,adapter:pick(w.adapterInfo),canvasFormat:w.canvasFormat||null,
+      stats:pick(w.stats),pipelines:typeof w.pipelineTelemetry==='function'?pick(w.pipelineTelemetry()):null,messages:(w.messages||[]).slice(0,40)}:null};})()`;
 const pass = (n, d) => { report.checks[n] = {ok: true, detail: d}; log("CHECK", `PASS ${n} ${JSON.stringify(d).slice(0, 300)}`); };
+const skip = (n, why) => { report.checks[n] = {ok: true, skipped: true, detail: why}; log("CHECK", `SKIP ${n} ${why}`); };
 const fail = (n, d) => { report.checks[n] = {ok: false, detail: d}; log("CHECK", `FAIL ${n} ${JSON.stringify(d).slice(0, 300)}`); };
 const profileDir = await mkdtemp(join(tmpdir(), "gaius-m3-"));
 const port = await freePort();
 const chrome = spawn(chromeBin, ["--headless=new", `--remote-debugging-port=${port}`, "--remote-allow-origins=*",
-  `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check", "--window-size=1280,720",
-  "--disable-background-networking", "--disable-component-update", "--ignore-gpu-blocklist", "--enable-unsafe-swiftshader",
-  "about:blank"], {stdio: "ignore"});
+  `--user-data-dir=${profileDir}`, "--window-size=1280,720", "--ignore-gpu-blocklist", "--enable-unsafe-swiftshader",
+  ...chromeIsolationArgs(), "about:blank"], {stdio: "ignore"});
 let cdp;
 const exceptions = [];
 try {
@@ -223,14 +297,19 @@ try {
   await cdp.send("Runtime.enable"); await cdp.send("Page.enable"); await cdp.send("Log.enable");
   await cdp.send("Target.setAutoAttach", {autoAttach: true, waitForDebuggerOnStart: false, flatten: true});
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", {source: glProbe});
+  // After glProbe, so its ~1 Hz getError drain (which calls the unwrapped method) is not counted.
+  if (!process.env.M3_SELFTEST) await cdp.send("Page.addScriptToEvaluateOnNewDocument", {source: GL_FRAME_GUARD_SOURCE});
   if (process.env.M3_SELFTEST) {
-    // Harness self-test: a WebGL2 page with one bad call and one broken shader must be caught.
-    const html = "<canvas id=c></canvas><script>const gl=document.getElementById('c').getContext('webgl2');gl.bindBuffer(0x1234,null);const s=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(s,'#version 300 es'+String.fromCharCode(10)+'void main(){ nope; }');gl.compileShader(s);</script>";
+    // Harness self-test: a WebGL2 page with one bad call and one broken shader must be caught, and
+    // a second context lost on purpose (as the quality benchmark probe does) must not count.
+    const html = "<canvas id=c></canvas><canvas id=p></canvas><script>const gl=document.getElementById('c').getContext('webgl2');gl.bindBuffer(0x1234,null);const s=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(s,'#version 300 es'+String.fromCharCode(10)+'void main(){ nope; }');gl.compileShader(s);const probe=document.getElementById('p').getContext('webgl2');probe.getExtension('WEBGL_lose_context').loseContext();</script>";
     await cdp.send("Page.navigate", {url: "data:text/html," + encodeURIComponent(html)});
     await sleep(1500);
     const a = await evaluate(cdp, "window.__m3audit()");
-    const ok = (a.drained.INVALID_ENUM || 0) >= 1 && a.badShaders.length === 1;
-    console.log(JSON.stringify({selftest: ok ? "PASS" : "FAIL", drained: a.drained, badShaders: a.badShaders.map(b => b.log.slice(0, 80))}));
+    const ok = (a.drained.INVALID_ENUM || 0) >= 1 && a.badShaders.length === 1 && a.lost === 0 && a.intentionalLost === 1
+      && !a.drained.CONTEXT_LOST_WEBGL;
+    console.log(JSON.stringify({selftest: ok ? "PASS" : "FAIL", drained: a.drained, lost: a.lost, intentionalLost: a.intentionalLost,
+      badShaders: a.badShaders.map(b => b.log.slice(0, 80))}));
     try { chrome.kill(); } catch {}
     if (server) server.close();
     process.exit(ok ? 0 : 1);
@@ -247,10 +326,18 @@ try {
     const sig = JSON.stringify([s?.screen, s?.statusState, s?.boot?.map(b => b.text.slice(0, 120)), s?.widgets?.length]);
     if (sig !== last) { last = sig; report.timeline.push({t: stamp(), ...s}); await log("state", JSON.stringify({screen: s?.screen, statusState: s?.statusState, boot: s?.boot, widgets: s?.widgets?.length}).slice(0, 1500)); }
     if (Date.now() - lastShot > 45000) { lastShot = Date.now(); await screenshot(cdp, `boot-${String(++shotN).padStart(2, "0")}.png`); }
-    if (s?.screen && /TitleScreen|BrowserProfileScreen/.test(s.screen)) { reached = s.screen; break; }
+    // The first-run Edit Profile screen opens on the first title tick, which only runs once the
+    // resource LoadingOverlay is gone; until then the title screen is not interactive.
+    if (s?.screen && /TitleScreen|BrowserProfileScreen/.test(s.screen) && !/LoadingOverlay/.test(s.overlay || "")) {
+      reached = s.screen;
+      // Page time of the first interactive screen (polled every 250 ms), comparable across runtimes.
+      report.firstScreenMillis = await evaluate(cdp, "performance.now()").catch(() => null);
+      break;
+    }
+    if (s?.failure) { report.bootError = s; await log("runtime-failure", s.failure.slice(0, 1500)); break; }
     if (logLines.some(l => l.includes("Game crashed!"))) { await sleep(3000); report.crashed = true; report.bootError = await evaluate(cdp, stateExpr).catch(() => null); break; }
     if (s?.statusState === "error") { await sleep(5000); report.bootError = await evaluate(cdp, stateExpr).catch(() => null); break; }
-    await sleep(1000);
+    await sleep(250);
   }
   report.bootSeconds = Math.round((Date.now() - t0) / 1000);
   report.reached = reached;
@@ -284,6 +371,10 @@ try {
   const secs = (f1.t - f0.t) / 1000;
   report.pacing = {raf, seconds: secs, gameFramesPerSec: (f1.g - f0.g) / secs, framesPerSec: (f1.f - f0.f) / secs, reported: f1};
   raf.p50 < 34 && raf.p95 < 50 && (f1.fps || 0) >= 30 ? pass("framePacing", report.pacing) : fail("framePacing", report.pacing);
+  // Synchronous GL calls and unique presented frames on the title screen (tools/gl-frame-guard.mjs);
+  // judged in the summary once the runtime is known.
+  report.glFrames = await evaluate(cdp, GL_FRAME_GUARD_WINDOW_EXPRESSION(3000)).catch(e => ({installed: false, error: String(e)}));
+  await log("gl-frames", JSON.stringify(report.glFrames).slice(0, 600));
 
   // Options.
   await clickWidget(cdp, "Options...", 10000).catch(() => clickWidget(cdp, "Options", 10000));
@@ -331,9 +422,13 @@ try {
   await clickWidget(cdp, "Back", 5000).catch(() => key(cdp, "Escape", "Escape", 27));
   end = Date.now() + 15000; while (Date.now() < end && !(await evaluate(cdp, screenExpr)).endsWith("TitleScreen")) await sleep(250);
 
-  // Edit Profile from the title button.
-  const btn = await findWidget(cdp, {text: "Edit Profile"}, 10000);
-  if (btn) {
+  // Edit Profile from the title button. MinecraftClientPatcher adds the button to the 26.2 and
+  // later title screens only.
+  const profileId = title.profile || basename(process.env.GAIUS_VERSION_PROFILE_PATH || "").replace(/[.]json$/, "");
+  const btn = profileId === LEGACY_PROFILE.id ? null : await findWidget(cdp, {text: "Edit Profile"}, 10000);
+  if (profileId === LEGACY_PROFILE.id) {
+    skip("editProfileOpens", "" + LEGACY_PROFILE.id + " has no Edit Profile button on the title screen");
+  } else if (btn) {
     await clickAt(cdp, btn.x, btn.y);
     end = Date.now() + 15000; while (Date.now() < end && !/BrowserProfileScreen/.test(sc = await evaluate(cdp, screenExpr))) await sleep(250);
     await sleep(1200); await screenshot(cdp, "16-edit-profile.png");
@@ -348,6 +443,20 @@ try {
   try { await screenshot(cdp, "error.png"); report.errorState = await evaluate(cdp, stateExpr); } catch {}
 } finally {
   try { report.gl = await evaluate(cdp, "window.__m3audit ? window.__m3audit() : null"); } catch (e) { report.gl = String(e); }
+  // Runtime-neutral telemetry (bench/harness-common.mjs): which runtime ran, its boot phases and
+  // memory, and the failures either runtime can report.
+  try { report.runtimeTelemetry = await evaluate(cdp, RUNTIME_TELEMETRY_EXPRESSION); } catch (e) { report.runtimeTelemetry = {error: String(e)}; }
+  try { report.gpu = await evaluate(cdp, GPU_EXPRESSION); } catch (e) { report.gpu = {error: String(e)}; }
+  if (report.runtimeTelemetry && !report.runtimeTelemetry.error) {
+    const runtimeFailures = runtimeTelemetryFailures(report.runtimeTelemetry, "page");
+    runtimeFailures.length === 0 ? pass("noRuntimeFailures", {runtime: report.runtimeTelemetry.runtime}) : fail("noRuntimeFailures", runtimeFailures);
+    if (requestedRuntime) {
+      report.runtimeTelemetry.runtime === requestedRuntime ? pass("runtimeMatches", {requested: requestedRuntime})
+        : fail("runtimeMatches", {requested: requestedRuntime, observed: report.runtimeTelemetry.runtime});
+    }
+  } else if (requestedRuntime) {
+    fail("runtimeMatches", {requested: requestedRuntime, observed: null, error: report.runtimeTelemetry?.error});
+  }
   const glConsole = logLines.filter(l => /GL_INVALID|WebGL: |INVALID_OPERATION|INVALID_ENUM|INVALID_VALUE|INVALID_FRAMEBUFFER|CONTEXT_LOST|GL ERROR|GL error/.test(l));
   // Pipelines vanilla rejects because the device reports no wireframe fill mode
   // (RenderPatches263.patchWireframeUnavailable) are a capability decision, not a compile error.
@@ -355,7 +464,9 @@ try {
     || (/Failed to load optional shader programs/.test(l)
         && (l.match(/ - \S+/g) || []).every(x => /^ - minecraft:pipeline\/wireframe(_multidraw)?$/.test(x)));
   report.expectedPipelineRejections = logLines.filter(l => wireframeOnly(l));
-  const shaderConsole = logLines.filter(l => !wireframeOnly(l) && ((/shader|glsl|spir|pipeline|program/i.test(l) && /error|fail|couldn't|could not|invalid/i.test(l)) || /compil\w* (error|fail)/i.test(l)));
+  const shaderConsole = logLines.filter(l => !wireframeOnly(l)
+    && !(/\[Gaius reload\]\s+listener=Shader Loader\b/i.test(l) && /\bfailed=false\b/i.test(l))
+    && ((/shader|glsl|spir|pipeline|program/i.test(l) && /error|fail|couldn't|could not|invalid/i.test(l)) || /compil\w* (error|fail)/i.test(l)));
   report.glConsole = glConsole.slice(0, 50); report.shaderConsole = shaderConsole.slice(0, 50);
   report.exceptions = exceptions.slice(0, 50);
   const g = report.gl && typeof report.gl === "object" ? report.gl : null;
@@ -364,7 +475,37 @@ try {
     g.badShaders.length + g.badPrograms.length + g.shaderFailures.length + g.programFailures.length === 0 && shaderConsole.length === 0
       ? pass("noShaderErrors", {live: g.liveShaders, programs: g.livePrograms}) : fail("noShaderErrors", {g, shaderConsole: shaderConsole.slice(0, 5)});
     const drained = Object.values(g.drained || {}).reduce((a, b) => a + b, 0);
-    errs === 0 && drained === 0 && glConsole.length === 0 && g.lost === 0 && g.drainCalls > 10 ? pass("noWebGLErrors", {getErrorCalls: g.getErrorCalls, drainCalls: g.drainCalls}) : fail("noWebGLErrors", {drained: g.drained, drainCalls: g.drainCalls, getErrors: g.getErrors, lost: g.lost, glConsole: glConsole.slice(0, 10)});
+    errs === 0 && drained === 0 && glConsole.length === 0 && g.lost === 0 && g.drainCalls > 10
+      ? pass("noWebGLErrors", {getErrorCalls: g.getErrorCalls, drainCalls: g.drainCalls, intentionalLost: g.intentionalLost})
+      : fail("noWebGLErrors", {drained: g.drained, drainCalls: g.drainCalls, getErrors: g.getErrors, lost: g.lost, intentionalLost: g.intentionalLost, glConsole: glConsole.slice(0, 10)});
+  }
+  // Synchronous GL calls per presented frame = 0: enforced on the WebAssembly GC runtime; the
+  // frozen JavaScript fallback is reported only (it predates the GL emulation fixes).
+  if (report.glFrames) {
+    const syncFailures = glFrameGuardFailures(report.glFrames, "title");
+    const detail = {uniqueFps: report.glFrames.uniqueFps, rafFps: report.glFrames.rafFps, gameFps: report.glFrames.gameFps,
+      syncPerFrame: report.glFrames.syncPerFrame, syncByName: report.glFrames.syncByName};
+    if (report.runtimeTelemetry?.runtime !== "wasm") skip("noSyncGlCalls", "reported only on the js runtime: " + JSON.stringify(detail));
+    else syncFailures.length === 0 ? pass("noSyncGlCalls", detail) : fail("noSyncGlCalls", {failures: syncFailures, ...detail});
+  }
+  // After the console scans above: these checks log the glue's pipeline telemetry.
+  if (expectedGpu) {
+    const backend = report.gpu && report.gpu.backend;
+    backend === expectedGpu ? pass("gpuMatches", {requested: requestedGpu, expected: expectedGpu, backend, selection: report.gpu.selection, canvas: report.gpu.canvas})
+      : fail("gpuMatches", {requested: requestedGpu, expected: expectedGpu, backend, selection: report.gpu && report.gpu.selection, webgpu: report.gpu && report.gpu.webgpu && {status: report.gpu.webgpu.status, failure: report.gpu.webgpu.failure}});
+  }
+  if (expectedGpu === "webgpu") {
+    const w = report.gpu && report.gpu.webgpu;
+    const st = (w && w.stats) || {};
+    const problems = !w ? ["no WebGPU glue"] : [
+      w.lost ? "device lost: " + w.lost : null,
+      st.errors ? st.errors + " WebGPU errors" : null,
+      st.translateErrors ? st.translateErrors + " translation errors" : null,
+      st.pipelineFailures ? st.pipelineFailures + " pipeline failures" : null,
+      st.skippedDraws ? st.skippedDraws + " draws skipped on invalid pipelines" : null,
+    ].filter(Boolean);
+    problems.length === 0 ? pass("noWebGpuErrors", {draws: st.draws, submits: st.submits, pipelines: w.pipelines})
+      : fail("noWebGpuErrors", {problems, messages: w && w.messages});
   }
   const failed = Object.entries(report.checks).filter(([, v]) => !v.ok).map(([k]) => k);
   report.failed = failed;
@@ -373,7 +514,9 @@ try {
   try { chrome.kill(); } catch {}
   if (server) server.close();
   await sleep(1500); await rm(profileDir, {recursive: true, force: true}).catch(() => {});
-  console.log(JSON.stringify({verdict: report.verdict, reached: report.reached, bootSeconds: report.bootSeconds, failed, error: report.error?.split("\n")[0],
-    checks: Object.fromEntries(Object.entries(report.checks).map(([k, v]) => [k, v.ok]))}));
+  console.log(JSON.stringify({verdict: report.verdict, runtime: report.runtimeTelemetry?.runtime || null, requestedRuntime,
+    gpu: report.gpu?.backend || null, requestedGpu,
+    reached: report.reached, bootSeconds: report.bootSeconds, firstScreenMillis: report.firstScreenMillis, failed, error: report.error?.split("\n")[0],
+    checks: Object.fromEntries(Object.entries(report.checks).map(([k, v]) => [k, v.skipped ? "skipped" : v.ok]))}));
   process.exit(report.verdict === "PASS" ? 0 : 1);
 }

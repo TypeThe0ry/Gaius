@@ -110,9 +110,23 @@ public final class TLockSupport {
             if (!takePermit(thread)) {
                 thread.interrupt();
             }
+        } catch (RuntimeException e) {
+            // A JavaScript callback without a TeaVM thread cannot suspend, and TeaVM refuses
+            // before it schedules anything. Park may return spuriously, so it returns at once:
+            // a frame rendered inside the network inbound pump (the 26.x login packet:
+            // setScreenAndShow -> renderFrame -> FramerateLimiter.limitDisplayFPS) otherwise
+            // fails the packet and disconnects the client.
+            if (!isNonThreadingSuspension(e)) {
+                throw e;
+            }
         } finally {
             parkedThreads.remove(thread);
         }
+    }
+
+    private static boolean isNonThreadingSuspension(RuntimeException error) {
+        String message = error.getMessage();
+        return message != null && message.contains("Suspension point reached from non-threading context");
     }
 
     private static boolean takePermit(Thread thread) {

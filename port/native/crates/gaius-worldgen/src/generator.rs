@@ -9,7 +9,7 @@
 use crate::aquifer::{disabled_substance, Aquifer, AquiferNoises, Picker};
 use crate::arena::Arena;
 use crate::beard::Beard;
-use crate::biome::{zoom, BiomeGrid, RING_COLUMNS};
+use crate::biome::{zoom, BiomeGrid, RING_COLUMNS, STORED_COLUMNS};
 use crate::chunk::{ChunkData, HeightmapKind};
 use crate::climate::{quantize, RTree, Searcher};
 use crate::df32::{Ctx32, Program32, Sid};
@@ -19,7 +19,7 @@ use crate::java::{floor_div, pack_xz};
 use crate::noises::{instantiate, positional_factory};
 use crate::surface::{SurfaceEnv, SurfaceHost, SurfaceProgram, SurfaceRun};
 use crate::volume::Volume;
-use gaius_noise::{PositionalRandomFactory, Profile};
+use gaius_noise::{PositionalRandomFactory, Semantics};
 use std::collections::HashMap;
 
 /// Default cap on pooled scratch elements kept between jobs (8 MB of `f32`).
@@ -110,12 +110,13 @@ pub struct Footprint {
 }
 
 pub struct Generator {
-    pub profile: Profile,
+    pub semantics: Semantics,
     pub settings: ir::Settings,
     pub states: ir::States,
     pub biomes: Vec<BiomeInfo>,
     state_lookup: HashMap<u32, u16>,
     biome_lookup: HashMap<u32, u16>,
+    biome_fallback: bool,
     source: Source,
     aquifer_random: PositionalRandomFactory,
     ore_random: PositionalRandomFactory,
@@ -138,10 +139,10 @@ impl Generator {
     pub fn from_ir(ir: &Ir) -> Result<Generator, IrError> {
         let s = &ir.settings;
         let factory = positional_factory(s.seed, s.legacy_random);
-        let noises = instantiate(ir.profile, s.seed, &factory, &ir.noises)?;
+        let noises = instantiate(ir.semantics, s.seed, &factory, &ir.noises)?;
         let root = |role: Role| ir.roots.require(role);
         let opt = |role: Role| ir.roots.get(role);
-        let kernel = if ir.profile.uses_synth32() {
+        let kernel = if ir.semantics.uses_sampler32() {
             let mut program = Program32::new(noises, ir.nodes.len());
             let mut c = |node: u32| program.compile_root(ir, &factory, node);
             let climate = [
@@ -202,7 +203,7 @@ impl Generator {
                 },
             }
         } else {
-            let mut program = Program64::new(noises, ir.nodes.len(), ir.profile.floor_mode());
+            let mut program = Program64::new(noises, ir.nodes.len(), ir.semantics.floor_mode);
             let mut c = |node: u32| program.compile_root(ir, &factory, node);
             let climate = [
                 c(root(Role::Temperature)?)?,
@@ -243,7 +244,7 @@ impl Generator {
                 },
             }
         };
-        if !ir.profile.uses_synth32() && s.ore_veins_enabled && ir.veins.is_none() {
+        if !ir.semantics.uses_sampler32() && s.ore_veins_enabled && ir.veins.is_none() {
             return Err(IrError::new("ore veins are enabled but the VEIN section is missing"));
         }
         let source = match &ir.biomes.source {
@@ -282,12 +283,13 @@ impl Generator {
             .as_ref()
             .map(|def| SurfaceProgram::new(def, &ir.states, ir.biomes.biomes.len(), factory));
         Ok(Generator {
-            profile: ir.profile,
+            semantics: ir.semantics,
             settings: ir.settings.clone(),
             states: ir.states.clone(),
             biomes: ir.biomes.biomes.clone(),
             state_lookup,
             biome_lookup,
+            biome_fallback: false,
             source,
             aquifer_random: factory.from_hash_of("minecraft:aquifer").fork_positional(),
             ore_random: factory.from_hash_of("minecraft:ore").fork_positional(),
@@ -313,10 +315,22 @@ impl Generator {
         RING_COLUMNS * (self.settings.level_height >> 2) as usize
     }
 
+    pub fn stored_biomes_len(&self) -> usize {
+        STORED_COLUMNS * (self.settings.level_height >> 2) as usize
+    }
+
+    pub fn biome_fallback_required(&self) -> bool {
+        self.biome_fallback
+    }
+
+    pub fn biome_context_requires_vanilla(&self) -> bool {
+        matches!(self.source, Source::MultiNoise(_))
+    }
+
     /// Maps a ring of global biome ids (see [`BiomeGrid::seed_ring`] for the order) to local
     /// biome indices.
     pub fn ring_biomes(&self, ring: &[u32]) -> Result<Vec<u16>, RingError> {
-        if ring.len() != self.ring_len() {
+        if ring.len() != self.ring_len() && ring.len() != self.stored_biomes_len() {
             return Err(RingError::Length(ring.len()));
         }
         let mut out = Vec::with_capacity(ring.len());
@@ -333,7 +347,7 @@ impl Generator {
 
     fn seed_ring(&self, grid: &mut BiomeGrid, ring: Option<&[u16]>) {
         if let Some(ring) = ring {
-            if ring.len() == self.ring_len() {
+            if ring.len() == self.ring_len() || ring.len() == self.stored_biomes_len() {
                 grid.seed_ring(ring);
             }
         }
@@ -369,6 +383,7 @@ impl Generator {
 
     /// Global biome ids of the chunk's sections (`createBiomes` / `fillBiomesFromNoise`).
     pub fn run_biomes(&mut self, chunk_x: i32, chunk_z: i32) -> Vec<u32> {
+        self.biome_fallback = false;
         let s = &self.settings;
         let mut grid = BiomeGrid::new(chunk_x, chunk_z, s.level_min_y, s.level_height);
         match &self.kernel {
@@ -387,6 +402,7 @@ impl Generator {
                     ctx,
                 };
                 b.fill_chunk(&mut grid, chunk_x, chunk_z);
+                self.biome_fallback = b.searcher.as_ref().is_some_and(Searcher::is_ambiguous);
                 self.biome_arena = b.ctx.into_arena();
             }
             Kernel::V64 { program, roots } => {
@@ -405,6 +421,7 @@ impl Generator {
                     searcher: searcher(&self.source),
                 };
                 b.fill_chunk(&mut ctx, &mut grid, chunk_x, chunk_z);
+                self.biome_fallback = b.searcher.as_ref().is_some_and(Searcher::is_ambiguous);
                 self.arena64 = ctx.into_arena();
             }
         }
@@ -416,11 +433,16 @@ impl Generator {
     /// The terrain step: density fill with aquifers (and pre-26.3 ore veins), then
     /// optionally the surface rules in the same sampler context, like vanilla.
     pub fn run_terrain(&mut self, request: &TerrainRequest) -> TerrainResult {
+        self.biome_fallback = false;
         let s = &self.settings;
         let mut chunk = ChunkData::new(request.chunk_x, request.chunk_z, s.level_min_y, s.level_height);
         let mut grid = BiomeGrid::new(request.chunk_x, request.chunk_z, s.level_min_y, s.level_height);
         self.seed_ring(&mut grid, request.ring_biomes.as_deref());
-        let want_biomes = request.biomes;
+        let want_biomes = request.biomes
+            && request
+                .ring_biomes
+                .as_ref()
+                .is_none_or(|biomes| biomes.len() != self.stored_biomes_len());
         match &self.kernel {
             Kernel::V32 { program, roots } => {
                 let mut ctx = Ctx32::new(
@@ -459,10 +481,11 @@ impl Generator {
                             chunk_x: request.chunk_x,
                             chunk_z: request.chunk_z,
                         };
-                        let env = surface_env(self.profile, &self.settings, &self.states, &self.biomes);
+                        let env = surface_env(self.semantics, &self.settings, &self.states, &self.biomes);
                         SurfaceRun::new(surface, env, host, &chunk, self.settings.noise_min_y).run(&mut chunk);
                     }
                 }
+                self.biome_fallback = biomes.searcher.as_ref().is_some_and(Searcher::is_ambiguous);
                 self.biome_arena = biomes.ctx.into_arena();
                 self.arena32 = ctx.into_arena();
             }
@@ -498,14 +521,17 @@ impl Generator {
                             corner_origin: None,
                             corners: [0; 4],
                         };
-                        let env = surface_env(self.profile, &self.settings, &self.states, &self.biomes);
+                        let env = surface_env(self.semantics, &self.settings, &self.states, &self.biomes);
                         SurfaceRun::new(surface, env, host, &chunk, self.settings.noise_min_y).run(&mut chunk);
                     }
                 }
+                self.biome_fallback = biomes.searcher.as_ref().is_some_and(Searcher::is_ambiguous);
                 self.arena64 = ctx.into_arena();
             }
         }
-        let biomes = want_biomes.then(|| self.chunk_biomes(&grid, request.chunk_x, request.chunk_z));
+        let biomes = request
+            .biomes
+            .then(|| self.chunk_biomes(&grid, request.chunk_x, request.chunk_z));
         self.trim();
         TerrainResult { chunk, biomes }
     }
@@ -518,6 +544,7 @@ impl Generator {
     /// [`Generator::run_surface`] with the biomes the neighbouring chunks store (see
     /// [`TerrainRequest::ring_biomes`]).
     pub fn run_surface_with(&mut self, chunk: &mut ChunkData, beard: Beard, ring_biomes: Option<&[u16]>) {
+        self.biome_fallback = false;
         if self.surface.is_none() {
             return;
         }
@@ -532,7 +559,7 @@ impl Generator {
             return;
         };
         let s = &self.settings;
-        let env = surface_env(self.profile, &self.settings, &self.states, &self.biomes);
+        let env = surface_env(self.semantics, &self.settings, &self.states, &self.biomes);
         match &self.kernel {
             Kernel::V32 { program, roots } => {
                 let mut ctx = Ctx32::new(program.cache_count, true, core::mem::take(&mut self.arena32), beard);
@@ -561,6 +588,7 @@ impl Generator {
                     chunk_z: chunk.chunk_z,
                 };
                 SurfaceRun::new(surface, env, host, chunk, s.noise_min_y).run(chunk);
+                self.biome_fallback = biomes.searcher.as_ref().is_some_and(Searcher::is_ambiguous);
                 self.biome_arena = biomes.ctx.into_arena();
                 self.arena32 = ctx.into_arena();
             }
@@ -591,6 +619,7 @@ impl Generator {
                     corners: [0; 4],
                 };
                 SurfaceRun::new(surface, env, host, chunk, s.noise_min_y).run(chunk);
+                self.biome_fallback = biomes.searcher.as_ref().is_some_and(Searcher::is_ambiguous);
                 self.arena64 = ctx.into_arena();
             }
         }
@@ -681,7 +710,7 @@ fn searcher(source: &Source) -> Option<Searcher<'_>> {
 }
 
 fn surface_env<'a>(
-    profile: Profile,
+    semantics: Semantics,
     s: &ir::Settings,
     states: &'a ir::States,
     biomes: &'a [BiomeInfo],
@@ -689,11 +718,11 @@ fn surface_env<'a>(
     SurfaceEnv {
         states,
         biomes,
-        synth32: profile.uses_synth32(),
-        floor: profile.floor_mode(),
+        synth32: semantics.uses_synth32(),
+        floor: semantics.floor_mode,
         sea_level: s.sea_level,
         default_block: s.default_block as u16,
-        legacy_surface_biome_y: !profile.uses_synth32() && s.legacy_random_source,
+        legacy_surface_biome_y: !semantics.uses_synth32() && s.legacy_random_source,
     }
 }
 

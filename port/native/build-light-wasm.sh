@@ -9,7 +9,8 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/../.." && pwd)"
 TARGET=wasm32-unknown-unknown
-OUT="$HERE/target/light"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$HERE/target}"
+OUT="$TARGET_ROOT/light"
 
 check=0
 case "${1:-}" in
@@ -32,12 +33,12 @@ mkdir -p "$OUT"
 # Separate target dirs: the two builds differ only in RUSTFLAGS, which would otherwise make
 # cargo rebuild everything on every switch.
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128" \
-    cargo build --release --locked --target "$TARGET" -p gaius-light-wasm
-cp "$HERE/target/$TARGET/release/gaius_light_wasm.wasm" "$OUT/gaius_light_wasm.simd.wasm"
+    cargo build --release --offline --locked --target "$TARGET" -p gaius-light-wasm
+cp "$TARGET_ROOT/$TARGET/release/gaius_light_wasm.wasm" "$OUT/gaius_light_wasm.simd.wasm"
 
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=-simd128" \
-    cargo build --release --locked --target "$TARGET" -p gaius-light-wasm --target-dir "$HERE/target/baseline"
-cp "$HERE/target/baseline/$TARGET/release/gaius_light_wasm.wasm" "$OUT/gaius_light_wasm.baseline.wasm"
+    cargo build --release --offline --locked --target "$TARGET" -p gaius-light-wasm --target-dir "$TARGET_ROOT/baseline"
+cp "$TARGET_ROOT/baseline/$TARGET/release/gaius_light_wasm.wasm" "$OUT/gaius_light_wasm.baseline.wasm"
 
 for wasm in "$OUT"/gaius_light_wasm.*.wasm; do
     printf '%-32s %8d bytes\n' "$(basename "$wasm")" "$(wc -c < "$wasm")"

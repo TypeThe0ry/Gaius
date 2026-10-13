@@ -84,19 +84,29 @@ client_log4j_exclusions="org/apache/logging/log4j/log4j-core/,org/apache/logging
 export GAIUS_EXCLUDED_LIBRARY_PREFIXES="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:+$GAIUS_EXCLUDED_LIBRARY_PREFIXES,}$client_log4j_exclusions"
 
 # TeaVM keeps dependency JARs open throughout whole-program analysis. Hold the
-# overlay writer lock from before regeneration until every consumer has closed.
-overlay_lock="$root/port/work/.build-overlays.lock"
+# writer lock of the overlay directory (overlay-lock.sh) from before regeneration
+# until every consumer has closed.
+source "$root/port/scripts/overlay-lock.sh"
+overlay_lock=""
 release_overlay_lock() {
   if [[ -n "${overlay_lock_owner:-}" ]]; then
-    gaius_teavm_lock_release "$overlay_lock" "$overlay_lock_owner"
+    gaius_overlay_lock_release "$overlay_lock" "$overlay_lock_owner"
   fi
 }
-gaius_teavm_lock_acquire "$overlay_lock"
-overlay_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+gaius_overlay_lock_acquire "$root" "$overlay_directory"
+overlay_lock="$GAIUS_OVERLAY_LOCK_PATH"
+overlay_lock_owner="$GAIUS_OVERLAY_LOCK_OWNER_TOKEN"
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
     GAIUS_OVERLAY_DIRECTORY="$overlay_directory" \
-      GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
+      GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" \
+      >"$build_root/overlays.log" 2>&1 \
+      || { tail -n 60 "$build_root/overlays.log" >&2; exit 1; }
+    # WP1 rule f: the js patch set must match the checked-in baseline.  A bring-up
+    # build skips listed patches on purpose and is not compared.
+    if ! gaius_bringup_active; then
+      gaius_js_patch_summary_gate "$root" "$version" "$build_root/overlays.log"
+    fi
 else
   echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
   # A resumed build may reuse an overlay JAR that an earlier pass already
@@ -105,9 +115,12 @@ else
   # patcher class can reject that valid, already-rewritten JAR.
   tool_classes="$overlay_directory/tool-classes"
   asm_version="9.8"
+  teavm_version="$(jq -er '.teaVMVersion' "$root/port/config.json")"
   tool_compile_classpath="$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar:$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
   if command -v cygpath >/dev/null 2>&1; then
-    tool_compile_classpath="$maven_repository_for_java/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar;$maven_repository_for_java/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
+    tool_compile_classpath="$maven_repository_for_java/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar;$maven_repository_for_java/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar;$maven_repository_for_java/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
+  else
+    tool_compile_classpath="$tool_compile_classpath:$maven_repository/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
   fi
   mkdir -p "$tool_classes"
   find "$tool_classes" -type f -delete
@@ -329,6 +342,12 @@ echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') en
 echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
 echo "Mapped browser Unicode font assets: $copied_font_assets"
+# WP1 rule g: the js POMs that generate-pom.sh writes for these overlays (the
+# canonical client and Worker option sets, development and release) must match
+# the checked-in baselines.
+if ! gaius_bringup_active; then
+  gaius_js_pom_gate "$root" "$version" "$overlay_directory"
+fi
 # The client role's TeaVM compiler options (maxTopLevelNames, syncClinits,
 # syncMonitors, async barrier, runtime name pinning, telemetry tag) come from
 # the role table in generate-pom.sh and end up in the POM <properties>.
@@ -488,7 +507,18 @@ if [[ "$build_status" -eq 0 && "$teavm_publish_allowed" == true ]]; then
     # Never leave a previous build's modules behind a kernels.json that no longer lists them.
     rm -rf "$target_directory/kernels"
   fi
-  stage_arguments=("$target_directory")
+  if [[ -z "${GAIUS_SHADERXLAT_WASM:-}" && "${GAIUS_SKIP_KERNELS:-}" != "1" ]]; then
+    if translator_module="$(bash "$root/port/web/runtime/webgpu/build-translator.sh" | tail -n 1)" \
+        && [[ -s "$translator_module" ]]; then
+      export GAIUS_SHADERXLAT_WASM="$translator_module"
+    elif [[ "${GAIUS_KERNELS_STRICT:-}" == "1" ]]; then
+      echo "The WebGPU shader translator could not be built" >&2
+      exit 1
+    else
+      echo "WARNING: no WebGPU shader translator; ?gpu=webgpu falls back to WebGL 2" >&2
+    fi
+  fi
+  stage_arguments=("$target_directory" --profile "$GAIUS_MINECRAFT_VERSION")
   if [[ "${GAIUS_SKIP_KERNELS:-}" != "1" && -f "$kernel_directory/kernels.json" ]]; then
     stage_arguments+=(--kernels "$kernel_directory")
   fi

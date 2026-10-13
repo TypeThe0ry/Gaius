@@ -48,9 +48,9 @@ fn parity(name: &str, first_octave: i32, amplitudes: &[f64]) -> NoiseDef {
     }
 }
 
-/// A simplified overworld for `profile` (1.21.11 / 26.2 or 26.3) and `seed`.
-pub fn overworld(profile: gaius_noise::Profile, seed: i64) -> Ir {
-    let synth32 = profile.uses_synth32();
+/// A simplified overworld for `semantics` (router or compiled samplers) and `seed`.
+pub fn overworld(semantics: gaius_noise::Semantics, seed: i64) -> Ir {
+    let synth32 = semantics.uses_synth32();
     let noises = vec![
         parity("minecraft:temperature", -10, &[1.5, 0.0, 1.0, 0.0, 0.0, 0.0]),
         parity("minecraft:vegetation", -8, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
@@ -330,7 +330,7 @@ pub fn overworld(profile: gaius_noise::Profile, seed: i64) -> Ir {
     };
 
     Ir {
-        profile,
+        semantics,
         settings: Settings {
             seed,
             legacy_random: false,

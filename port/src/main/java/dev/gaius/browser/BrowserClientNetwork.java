@@ -247,17 +247,25 @@ public final class BrowserClientNetwork {
      * without spinning while all channels are idle or exact-queue paused.</p>
      */
     private static boolean pumpInbound() {
-        if (pumping) {
-            recordJavaPumpSkipped();
-            return false;
-        }
-        pumping = true;
-        try {
-            boolean continuationHint = BrowserWebSocketChannel.pumpAllAndReportProgress();
-            return continuationHint && BrowserWebSocketChannel.hasPumpableInput();
-        } finally {
-            pumping = false;
-        }
+        // MessageChannel/timer callbacks are synchronous JS -> Java calls on WasmGC.  The
+        // Netty decode path can contend on vanilla connection/packet locks, so it must run in a
+        // real JSPI activation rather than on the callback stack.
+        HostLoop.startThread(() -> {
+            if (pumping) {
+                recordJavaPumpSkipped();
+                return;
+            }
+            pumping = true;
+            try {
+                boolean continuationHint = BrowserWebSocketChannel.pumpAllAndReportProgress();
+                if (continuationHint && BrowserWebSocketChannel.hasPumpableInput()) {
+                    requestInboundPumpContinuation();
+                }
+            } finally {
+                pumping = false;
+            }
+        });
+        return false;
     }
 
     /**

@@ -48,6 +48,7 @@ const physicalBindings = new Map();
 const gpuBytes = new Map();
 const frameCallbacks = [];
 let failNextBufferUpload = false;
+let getBufferSubDataCalls = 0;
 
 function copyBytes(value) {
   if (typeof value === "number") return new Uint8Array(value);
@@ -80,6 +81,7 @@ const gl = {
     gpuBytes.set(object, copyBytes(data));
   },
   getBufferSubData(target, offset, destination) {
+    getBufferSubDataCalls++;
     const object = physicalBindings.get(target);
     const bytes = object ? gpuBytes.get(object) : null;
     assert.ok(bytes, `getBufferSubData target ${target} has no storage`);
@@ -270,6 +272,22 @@ assert.equal(secondaryVao.shiftedIndexFastCache.size, 0);
 assert.equal(secondaryVao.shiftedIndexLast, null);
 deleteBuffer(sourceId);
 assertBaseVertexBaseline();
+
+// A missing upload shadow must select attribute-offset emulation without reading GPU storage.
+state.elementShadowAlways = false;
+state.bakedIndexEnabled = false;
+sourceId = 3;
+vao = bindElementSource(sourceId, new Uint8Array([1, 2, 3, 4]));
+assert.equal(state.bufferBytes.has(sourceId), false, "test buffer unexpectedly retained a CPU shadow");
+const readbacksBeforeFallback = getBufferSubDataCalls;
+state.drawElementsWithBaseVertex(vao, 4, 1, gl.UNSIGNED_BYTE, 0, 1, 1);
+assert.equal(getBufferSubDataCalls, readbacksBeforeFallback,
+  "base-vertex attribute fallback issued getBufferSubData");
+assert.equal(stats.baseVertexIndexFallbacks, 1,
+  "missing shadow did not use withBaseVertexAttribs fallback");
+deleteBuffer(sourceId);
+assertBaseVertexBaseline();
+state.elementShadowAlways = true;
 
 // A usable extension avoids the CPU copy entirely.
 state.baseVertexExtensionChecked = true;

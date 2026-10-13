@@ -1,6 +1,8 @@
 package dev.gaius.tools;
 
 import dev.gaius.tools.runtime.GaiusTeaVMOptions;
+import dev.gaius.tools.runtime.GaiusWasmMath;
+import dev.gaius.tools.runtime.GaiusWasmResourceChunks;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -46,7 +48,9 @@ import org.objectweb.asm.tree.VarInsnNode;
  * <li>thread.js: a suspension inside a method that those options compiled synchronously
  * throws instead of corrupting the coroutine stack.</li>
  * <li>JSPI mode (gaius.teavm.jspi, WebAssembly GC only): AsyncMethodFinder.find stops with
- * an empty async set, so no method is compiled as a coroutine.</li>
+ * an empty async set, so no method is compiled as a coroutine, and each dynamic class
+ * initializer gets a guard with the JVM's class initialization semantics (another thread
+ * waits while the initializing one is suspended in it).</li>
  * <li>WebAssembly GC code generation (TeaVM 0.15 emits invalid wasm otherwise): catch clauses
  * of classes the dependency analysis never reached are removed from the program, and a value-returning body that
  * ends with a block without a result gets a closing {@code unreachable}; class-path resource
@@ -54,6 +58,12 @@ import org.objectweb.asm.tree.VarInsnNode;
  * the range and for an empty read (ResourceInputStream.read).</li>
  * <li>Heap.alloc (Wasm GC off-heap memory) also grows by the record header when the last
  * record is allocated (TeaVM 0.16 fix; skipped when the TeaVM version already has it).</li>
+ * <li>TypeSet (WebAssembly GC only): the dependency nodes of a shared type set iterate in
+ * insertion order instead of identity-hash order, so two compiles of the same sources write
+ * the same module.</li>
+ * <li>WasmGCIntrinsics (WebAssembly GC only): Math and StrictMath floor, ceil, sqrt, rint, abs,
+ * min and max become single WebAssembly instructions ({@link GaiusWasmMath}) instead of calls
+ * into JavaScript's Math or branchy Java formulas.</li>
  * <li>Async census (gaius.teavm.asyncDump, reporting only): AsyncMethodFinder records why each
  * method became async and writes the census when the analysis ends; it is shared by the
  * JavaScript and WebAssembly GC backends.</li>
@@ -76,6 +86,8 @@ public final class TeaVMCoreBrowserPatcher {
     private static final String WASM_GC_METHOD_GENERATOR =
             "org/teavm/backend/wasm/generate/methods/WasmGCMethodGenerator";
     private static final String WASM_GC_RESOURCES = "org/teavm/backend/wasm/runtime/WasmGCResources";
+    private static final String WASM_GC_RESOURCES_INTRINSIC =
+            "org/teavm/backend/wasm/intrinsics/WasmGCResourcesIntrinsic";
     private static final String WASM_GC_RESOURCE_STREAM = WASM_GC_RESOURCES + "$ResourceInputStream";
     private static final String SOURCE_WRITER = "org/teavm/backend/javascript/codegen/SourceWriter";
     private static final String TEAVM_CLASS = "org/teavm/vm/TeaVM";
@@ -91,8 +103,14 @@ public final class TeaVMCoreBrowserPatcher {
     private static final String HEAP_CLASS = "org/teavm/runtime/heap/Heap";
     private static final String HEAP_RECORD = "org/teavm/runtime/heap/HeapRecord";
     private static final String STRUCTURE = "org/teavm/interop/Structure";
+    private static final String TYPE_SET = "org/teavm/dependency/TypeSet";
+    private static final String WASM_GC_INTRINSICS = "org/teavm/backend/wasm/intrinsics/WasmGCIntrinsics";
+    private static final String WASM_MATH = "dev/gaius/tools/runtime/GaiusWasmMath";
     /** Helper classes the patched TeaVM classes call; copied into the patched jar. */
     private static final List<String> RUNTIME_HELPERS = List.of(OPTIONS);
+    /** Helpers only the WebAssembly GC patches call (the JavaScript jar stays without them). */
+    private static final List<String> WASM_GC_RUNTIME_HELPERS =
+            List.of(WASM_MATH, GaiusWasmResourceChunks.class.getName().replace('.', '/'));
     private static final String PINNED_NAME_METHOD = "gaiusPinnedTopLevelName";
     private static final String PINNED_SUFFIX_FIELD = "gaiusPinnedSuffix";
 
@@ -291,14 +309,31 @@ public final class TeaVMCoreBrowserPatcher {
         writePatchedKeepFrames(patchRoot, WASM_GC_VISITOR,
                 patchWasmGcCatchBranch(readClass(jarPath, WASM_GC_VISITOR)));
         writePatchedKeepFrames(patchRoot, WASM_GC_METHOD_GENERATOR,
-                patchWasmGcFunctionSeal(readClass(jarPath, WASM_GC_METHOD_GENERATOR)));
-        writePatchedKeepFrames(patchRoot, WASM_GC_RESOURCES,
-                patchWasmGcResourceRead(readClass(jarPath, WASM_GC_RESOURCES)));
+                patchWasmGcClinitGuard(patchWasmGcFunctionSeal(readClass(jarPath, WASM_GC_METHOD_GENERATOR))));
+        ClassNode resources = patchWasmGcResourceRead(readClass(jarPath, WASM_GC_RESOURCES));
+        if (BuildTarget.wasmGc()) {
+            writeResourcePatch(jarPath, patchRoot, WASM_GC_RESOURCES, patchWasmGcResourceRuntime(resources));
+        } else {
+            writePatchedKeepFrames(patchRoot, WASM_GC_RESOURCES, resources);
+        }
         writePatchedKeepFrames(patchRoot, WASM_GC_RESOURCE_STREAM,
                 patchWasmGcResourceStreamRead(readClass(jarPath, WASM_GC_RESOURCE_STREAM)));
         ClassNode heap = readClass(jarPath, HEAP_CLASS);
         if (patchHeapAllocGrowth(heap)) {
             writePatched(patchRoot, HEAP_CLASS, heap);
+        }
+        if (BuildTarget.wasmGc()) {
+            writeResourcePatch(jarPath, patchRoot, WASM_GC_RESOURCES_INTRINSIC,
+                    patchWasmGcResourceIntrinsic(readClass(jarPath, WASM_GC_RESOURCES_INTRINSIC)));
+            String dependency = "org/teavm/backend/wasm/dependencies/WasmGCResourceDependency";
+            writeResourcePatch(jarPath, patchRoot, dependency,
+                    patchWasmGcResourceDependency(readClass(jarPath, dependency)));
+            ClassNode typeSet = readClass(jarPath, TYPE_SET);
+            if (patchTypeSetDomainOrder(typeSet)) {
+                writePatched(patchRoot, TYPE_SET, typeSet);
+            }
+            writePatchedKeepFrames(patchRoot, WASM_GC_INTRINSICS,
+                    patchWasmGcMathIntrinsics(readClass(jarPath, WASM_GC_INTRINSICS)));
         }
         copyRuntimeHelpers(patchRoot);
     }
@@ -336,6 +371,43 @@ public final class TeaVMCoreBrowserPatcher {
         Path output = patchRoot.resolve(internalName + ".class");
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());
+    }
+
+    /** Rewritten control flow needs fresh frames resolved against the input TeaVM jar. */
+    private static void writeResourcePatch(Path jarPath, Path patchRoot, String name, ClassNode node)
+            throws IOException {
+        try (var loader = new java.net.URLClassLoader(new java.net.URL[] {jarPath.toUri().toURL()},
+                TeaVMCoreBrowserPatcher.class.getClassLoader())) {
+            ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                @Override
+                protected String getCommonSuperClass(String left, String right) {
+                    try {
+                        Class<?> a = Class.forName(left.replace('/', '.'), false, loader);
+                        Class<?> b = Class.forName(right.replace('/', '.'), false, loader);
+                        if (a.isAssignableFrom(b)) return left;
+                        if (b.isAssignableFrom(a)) return right;
+                        if (a.isInterface() || b.isInterface()) return "java/lang/Object";
+                        do {
+                            a = a.getSuperclass();
+                        } while (!a.isAssignableFrom(b));
+                        return a.getName().replace('.', '/');
+                    } catch (ClassNotFoundException e) {
+                        throw new IllegalStateException("Cannot resolve TeaVM frame types " + left + ", " + right, e);
+                    }
+                }
+            };
+            node.accept(writer);
+            Path output = patchRoot.resolve(name + ".class");
+            Files.createDirectories(output.getParent());
+            Files.write(output, writer.toByteArray());
+        }
+    }
+
+    private static void clearRewrittenMetadata(MethodNode method) {
+        method.tryCatchBlocks.clear();
+        if (method.localVariables != null) method.localVariables.clear();
+        method.visibleLocalVariableAnnotations = null;
+        method.invisibleLocalVariableAnnotations = null;
     }
 
     /**
@@ -474,12 +546,196 @@ public final class TeaVMCoreBrowserPatcher {
     }
 
     /**
-     * WebAssembly GC runtime (TeaVM 0.15): {@code WasmGCResources.readBytes} stores byte
-     * {@code i} at {@code bytes[i]} instead of {@code bytes[off + i]}, so every
-     * {@code read(byte[], off, len)} with {@code off > 0} on a class-path resource overwrote the
-     * start of the buffer (ICU data files: "Not an ICU data file"). The array index gets
-     * {@code + off}.
+     * WebAssembly GC (TeaVM 0.15), {@code generateRegularMethodBody}: its
+     * {@code wrapSynchronizedMethod(method, visitor, function, node)} call goes through
+     * {@link GaiusTeaVMOptions#wasmWrapMethodBody} instead, which runs the stock method for
+     * every method but the dynamic class initializers of a JSPI build: those get the guard of
+     * the JVM's class initialization semantics (design D3). The static call takes the receiver
+     * and the four arguments as Objects, so the stack shape and the frames stay as they are.
+     * Applied after {@link #patchWasmGcFunctionSeal}, which anchors on the same call.
      */
+    static ClassNode patchWasmGcClinitGuard(ClassNode node) {
+        MethodNode generate = method(node, "generateRegularMethodBody",
+                "(Lorg/teavm/model/MethodHolder;Lorg/teavm/backend/wasm/model/WasmFunction;)V");
+        String desc = "(Lorg/teavm/model/MethodHolder;"
+                + "Lorg/teavm/backend/wasm/generate/methods/WasmGCInstructionGenerationVisitor;"
+                + "Lorg/teavm/backend/wasm/model/WasmFunction;Lorg/teavm/ast/RegularMethodNode;)V";
+        AbstractInsnNode wrap = single(generate, "wrapSynchronizedMethod call",
+                insn -> insn instanceof MethodInsnNode call && call.owner.equals(WASM_GC_METHOD_GENERATOR)
+                        && call.name.equals("wrapSynchronizedMethod") && call.desc.equals(desc));
+        if (wrap.getOpcode() != Opcodes.INVOKESPECIAL && wrap.getOpcode() != Opcodes.INVOKEVIRTUAL) {
+            throw new IllegalStateException("TeaVM wrapSynchronizedMethod is not an instance call");
+        }
+        method(node, "addInitializerErase",
+                "(Lorg/teavm/model/MethodReader;Lorg/teavm/backend/wasm/model/WasmFunction;)V");
+        requireField(node, "classInitInfo", "Lorg/teavm/model/analysis/ClassInitializerInfo;");
+        generate.instructions.set(wrap, options("wasmWrapMethodBody",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;"
+                        + "Ljava/lang/Object;)V"));
+        return node;
+    }
+
+    /** Populate the original resource map from bounded descriptor arrays. */
+    static ClassNode patchWasmGcResourceRuntime(ClassNode node) {
+        MethodNode acquire = method(node, "acquireResources", "()[L"
+                + WASM_GC_RESOURCES + "$Resource;");
+        acquire.desc = "()[[L" + WASM_GC_RESOURCES + "$Resource;";
+        MethodNode clinit = method(node, "<clinit>", "()V");
+        String resource = WASM_GC_RESOURCES + "$Resource";
+        String map = "Ljava/util/Map;";
+        InsnList code = new InsnList();
+        code.add(new TypeInsnNode(Opcodes.NEW, "java/util/HashMap"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/util/HashMap", "<init>", "()V", false));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, WASM_GC_RESOURCES, "resources", map));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, WASM_GC_RESOURCES, "acquireResources",
+                "()[[L" + resource + ";", false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        LabelNode outerTest = new LabelNode();
+        LabelNode outerEnd = new LabelNode();
+        LabelNode innerTest = new LabelNode();
+        LabelNode innerEnd = new LabelNode();
+        code.add(outerTest);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, outerEnd));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new InsnNode(Opcodes.AALOAD));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 5));
+        code.add(innerTest);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, innerEnd));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        code.add(new InsnNode(Opcodes.AALOAD));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 6));
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC, WASM_GC_RESOURCES, "resources", map));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, resource, "name", "Ljava/lang/String;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/util/Map", "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", true));
+        code.add(new InsnNode(Opcodes.POP));
+        code.add(new IincInsnNode(5, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, innerTest));
+        code.add(innerEnd);
+        code.add(new IincInsnNode(2, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, outerTest));
+        code.add(outerEnd);
+        code.add(new InsnNode(Opcodes.RETURN));
+        clearRewrittenMetadata(clinit);
+        clinit.instructions = code;
+        return node;
+    }
+
+    static ClassNode patchWasmGcResourceIntrinsic(ClassNode node) {
+        String resource = "L" + WASM_GC_RESOURCES + "$Resource;";
+        MethodNode acquire = method(node, "acquireResources", "(Lorg/teavm/backend/wasm/model/instruction/WasmInstructionBuilder;)V");
+        int patchedTypes = 0;
+        for (AbstractInsnNode insn = acquire.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof org.objectweb.asm.Type type
+                    && type.getDescriptor().equals(resource)
+                    && nextReal(ldc) instanceof MethodInsnNode call
+                    && call.owner.equals("org/teavm/model/ValueType") && call.name.equals("parse")) {
+                // allocateArray takes the element type; create(String, int, int) still returns Resource.
+                ldc.cst = org.objectweb.asm.Type.getType("[" + resource);
+                patchedTypes++;
+            }
+        }
+        if (patchedTypes != 1) {
+            throw new IllegalStateException("TeaVM resource array element type patch point count: " + patchedTypes);
+        }
+        MethodNode lambda = method(node, "lambda$acquireResources$0",
+                "(Ljava/util/ArrayList;Lorg/teavm/backend/wasm/model/WasmFunction;"
+                        + "Lorg/teavm/backend/wasm/model/WasmArray;"
+                        + "Lorg/teavm/backend/wasm/model/instruction/WasmInstructionBuilder;)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, "genContext",
+                "Lorg/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext;"));
+        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                "org/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext", "classInfoProvider",
+                "()Lorg/teavm/backend/wasm/generate/classes/WasmGCClassInfoProvider;", true));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, "genContext",
+                "Lorg/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext;"));
+        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                "org/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext", "strings",
+                "()Lorg/teavm/backend/wasm/generate/strings/WasmGCStringProvider;", true));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, "baseGlobal",
+                "Lorg/teavm/backend/wasm/model/WasmGlobal;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/tools/runtime/GaiusWasmResourceChunks", "emit",
+                "(Lorg/teavm/backend/wasm/generate/classes/WasmGCClassInfoProvider;"
+                        + "Lorg/teavm/backend/wasm/generate/strings/WasmGCStringProvider;"
+                        + "Lorg/teavm/backend/wasm/model/WasmGlobal;Ljava/util/ArrayList;"
+                        + "Lorg/teavm/backend/wasm/model/WasmFunction;Lorg/teavm/backend/wasm/model/WasmArray;"
+                        + "Lorg/teavm/backend/wasm/model/instruction/WasmInstructionBuilder;)V", false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        clearRewrittenMetadata(lambda);
+        lambda.instructions = code;
+        return node;
+    }
+
+    /** Keep create reachable and propagate both dimensions of the chunked resource table. */
+    static ClassNode patchWasmGcResourceDependency(ClassNode node) {
+        String resource = "L" + WASM_GC_RESOURCES + "$Resource;";
+        MethodNode clinit = method(node, "<clinit>", "()V");
+        int signatures = 0;
+        for (AbstractInsnNode insn : clinit.instructions) {
+            if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof org.objectweb.asm.Type type
+                    && type.getDescriptor().equals("[" + resource)) {
+                ldc.cst = org.objectweb.asm.Type.getType("[[" + resource);
+                signatures++;
+            }
+        }
+        MethodNode reached = method(node, "methodReached", "(Lorg/teavm/dependency/DependencyAgent;"
+                + "Lorg/teavm/dependency/MethodDependency;)V");
+        AbstractInsnNode arrayOf = single(reached, "resource array type",
+                insn -> insn instanceof MethodInsnNode call && call.owner.equals("org/teavm/model/ValueType")
+                        && call.name.equals("arrayOf"));
+        reached.instructions.insert(arrayOf, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "org/teavm/model/ValueType", "arrayOf", "(Lorg/teavm/model/ValueType;)"
+                        + "Lorg/teavm/model/ValueType$Array;", false));
+        AbstractInsnNode item = single(reached, "resource array item",
+                insn -> insn instanceof MethodInsnNode call && call.name.equals("getArrayItem"));
+        InsnList inner = new InsnList();
+        inner.add(new InsnNode(Opcodes.DUP));
+        inner.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        inner.add(new LdcInsnNode(WASM_GC_RESOURCES.replace('/', '.') + "$Resource"));
+        inner.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "org/teavm/model/ValueType", "object",
+                "(Ljava/lang/String;)Lorg/teavm/model/ValueType$Object;", false));
+        inner.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "org/teavm/model/ValueType", "arrayOf",
+                "(Lorg/teavm/model/ValueType;)Lorg/teavm/model/ValueType$Array;", false));
+        inner.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "org/teavm/dependency/DependencyAgent", "getType",
+                "(Lorg/teavm/model/ValueType;)Lorg/teavm/dependency/DependencyType;", false));
+        inner.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "org/teavm/dependency/DependencyNode", "propagate",
+                "(Lorg/teavm/dependency/DependencyType;)V", false));
+        inner.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "org/teavm/dependency/DependencyNode", "getArrayItem",
+                "()Lorg/teavm/dependency/DependencyNode;", false));
+        reached.instructions.insert(item, inner);
+        if (signatures != 1) throw new IllegalStateException("TeaVM resource dependency signature count: " + signatures);
+        return node;
+    }
+
+    /** Correct TeaVM's resource read destination index from i to off + i. */
     static ClassNode patchWasmGcResourceRead(ClassNode node) {
         MethodNode read = method(node, "readBytes", "([BIII)V");
         for (AbstractInsnNode instruction : read.instructions) {
@@ -549,7 +805,17 @@ public final class TeaVMCoreBrowserPatcher {
         if (GaiusTeaVMOptions.class.getClassLoader() != loader) {
             throw new IllegalStateException("GaiusTeaVMOptions is not on the patcher classpath");
         }
-        for (String helper : RUNTIME_HELPERS) {
+        if (GaiusWasmMath.class.getClassLoader() != loader) {
+            throw new IllegalStateException("GaiusWasmMath is not on the patcher classpath");
+        }
+        if (GaiusWasmResourceChunks.class.getClassLoader() != loader) {
+            throw new IllegalStateException("GaiusWasmResourceChunks is not on the patcher classpath");
+        }
+        List<String> helpers = new ArrayList<>(RUNTIME_HELPERS);
+        if (BuildTarget.wasmGc()) {
+            helpers.addAll(WASM_GC_RUNTIME_HELPERS);
+        }
+        for (String helper : helpers) {
             try (InputStream stream = loader.getResourceAsStream(helper + ".class")) {
                 if (stream == null) {
                     throw new IllegalStateException(helper + ".class is not on the patcher classpath");
@@ -1022,6 +1288,91 @@ public final class TeaVMCoreBrowserPatcher {
         redirect.add(new InsnNode(Opcodes.ARETURN));
         redirect.add(regular);
         functionAlias.instructions.insert(redirect);
+        return node;
+    }
+
+    /**
+     * WebAssembly GC only (reproducible output): a TypeSet that several dependency nodes share
+     * keeps them in its {@code domain}, a {@code java.util.HashSet} of DependencyNode, whose
+     * hash is the identity hash. getTransitions and getConsumers iterate that set, so the order
+     * in which the dependency analysis propagates types, and with it the order in which it
+     * reaches classes and methods, followed the identity hashes of the nodes. That order is the
+     * class list of the link step, and the WebAssembly GC backend derives the class tags, the
+     * type, function and global order and the string constant numbering from it: two compiles
+     * of the same sources differed whenever the JVM handed out other identity hashes (another
+     * heap size, anything the build hashed before TeaVM started). Both HashSet allocations of
+     * TypeSet ({@code addDomain} of one node and of a collection) become LinkedHashSet, so the
+     * domain iterates in insertion order, which the analysis itself makes deterministic. The set
+     * is only used as a set and through {@code Set} methods; the field is an Object. TeaVM 0.16
+     * has the same code; the JavaScript build keeps the stock class (its output stays as it
+     * is).
+     *
+     * @return false when the class allocates no HashSet (a TeaVM version that changed it)
+     */
+    static boolean patchTypeSetDomainOrder(ClassNode node) {
+        if (node.fields.stream().noneMatch(field -> field.name.equals("domain")
+                && field.desc.equals("Ljava/lang/Object;"))) {
+            throw new IllegalStateException("TeaVM TypeSet.domain (Object) not found");
+        }
+        int allocations = 0;
+        int constructors = 0;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null;
+                    insn = insn.getNext()) {
+                if (insn instanceof TypeInsnNode type && type.getOpcode() == Opcodes.NEW
+                        && type.desc.equals("java/util/HashSet")) {
+                    type.desc = "java/util/LinkedHashSet";
+                    allocations++;
+                } else if (insn instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESPECIAL
+                        && call.owner.equals("java/util/HashSet") && call.name.equals("<init>")) {
+                    call.owner = "java/util/LinkedHashSet";
+                    constructors++;
+                }
+            }
+        }
+        if (allocations != constructors) {
+            throw new IllegalStateException("TeaVM TypeSet: " + allocations
+                    + " HashSet allocations but " + constructors + " constructor calls");
+        }
+        return allocations > 0;
+    }
+
+    /**
+     * WebAssembly GC only: {@code WasmGCIntrinsics.apply}, which fills the inline intrinsic
+     * registry of the code generation, first calls {@code GaiusWasmMath.register(inline)}, so
+     * Math and StrictMath floor, ceil, sqrt, rint, abs, min and max compile to single
+     * WebAssembly instructions (see {@link GaiusWasmMath} for why each one equals Java's
+     * result). TeaVM 0.15 registers no intrinsic of either class; the patch fails when a TeaVM
+     * version does, instead of silently shadowing or being shadowed by it. The call is
+     * stack-neutral at the method entry, so the stack map frames stay valid.
+     */
+    static ClassNode patchWasmGcMathIntrinsics(ClassNode node) {
+        MethodNode apply = method(node, "apply", "(Lorg/teavm/reflection/ReflectionDependencyListener;"
+                + "Lorg/teavm/backend/wasm/intrinsics/WasmGCCodeGenContext;"
+                + "Lorg/teavm/vm/intrinsic/IntrinsicRegistry;Lorg/teavm/vm/intrinsic/IntrinsicRegistry;)V");
+        if ((apply.access & Opcodes.ACC_STATIC) == 0) {
+            throw new IllegalStateException("TeaVM WasmGCIntrinsics.apply is not static");
+        }
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+                if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof org.objectweb.asm.Type type
+                        && (type.getInternalName().equals("java/lang/Math")
+                        || type.getInternalName().equals("java/lang/StrictMath"))) {
+                    throw new IllegalStateException("TeaVM WasmGCIntrinsics registers "
+                            + type.getClassName() + " intrinsics itself");
+                }
+                if (insn instanceof MethodInsnNode call && call.owner.equals(WASM_MATH)) {
+                    throw new IllegalStateException("TeaVM WasmGCIntrinsics is already patched");
+                }
+            }
+        }
+        InsnList register = new InsnList();
+        // apply(listener, context, inline, body): local 2 is the inline intrinsic registry.
+        register.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        register.add(new MethodInsnNode(Opcodes.INVOKESTATIC, WASM_MATH, "register",
+                "(Ljava/lang/Object;)V", false));
+        apply.instructions.insert(register);
         return node;
     }
 

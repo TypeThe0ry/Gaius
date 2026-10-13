@@ -17,7 +17,7 @@ import org.teavm.jso.JSBody;
  *       byte and time budget ({@link #drain}); stale results are discarded there.</li>
  * </ol>
  *
- * <p>A result is current only while its sequence is still the newest request for its section
+ * <p>A result is current only while its sequence is still the newest revision for its section
  * and both epochs are unchanged. LevelRenderer.resetLevelRenderData and LevelExtractor.setLevel
  * bump the level epoch, LevelExtractor.onResourceManagerReload the resource epoch (patched by
  * TerrainBatchPatches).</p>
@@ -60,6 +60,26 @@ public final class BrowserMeshInstallQueue {
         PENDING_REQUEST.put(sectionNode, sequence);
         requested++;
         return sequence;
+    }
+
+    /** Records the revision when vanilla creates a task and copies its block region. */
+    public static int snapshotSequence(long sectionNode) {
+        if (!LATEST_REQUEST.containsKey(sectionNode)) {
+            LATEST_REQUEST.put(sectionNode, 1);
+        }
+        return LATEST_REQUEST.get(sectionNode);
+    }
+
+    /** A block, light or neighbor update invalidates snapshots, even before a replacement task exists. */
+    public static void invalidateSection(int x, int y, int z) {
+        long node = ((long) x << 42) | (((long) z & 0x3fffffL) << 20) | ((long) y & 0xfffffL);
+        if (!LATEST_REQUEST.containsKey(node)) {
+            return;
+        }
+        int sequence = LATEST_REQUEST.get(node) + 1;
+        LATEST_REQUEST.put(node, sequence <= 0 ? 1 : sequence);
+        // Keep the outstanding slot until its answer is discarded. A replacement task can
+        // still choose vanilla when updates arrive faster than the Worker round trip.
     }
 
     /** The producer gave up on a request (Worker failure); the section is no longer pending. */
@@ -121,8 +141,8 @@ public final class BrowserMeshInstallQueue {
     /** Models, tints or atlases changed: every outstanding result is stale. */
     public static void bumpResourceEpoch() {
         resourceEpoch = resourceEpoch == Integer.MAX_VALUE ? 1 : resourceEpoch + 1;
-        discardReady(DISCARD_RESOURCES);
         PENDING_REQUEST.clear();
+        discardReady(DISCARD_RESOURCES);
         runEpochBumpHook();
     }
 
@@ -226,6 +246,9 @@ public final class BrowserMeshInstallQueue {
 
     private static void discard(BrowserMeshInstall result, int reason) {
         discardedStale++;
+        if (PENDING_REQUEST.get(result.sectionNode()) == result.requestSeq()) {
+            PENDING_REQUEST.remove(result.sectionNode());
+        }
         try {
             result.discard(reason);
         } catch (RuntimeException ignored) {

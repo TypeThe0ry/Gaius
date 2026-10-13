@@ -14,6 +14,7 @@ import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
@@ -334,6 +335,7 @@ public final class TeaVMClasslibPatcher {
         for (Map.Entry<String, MethodSpec[]> patch : patches.entrySet()) {
             patchClass(jar, root, patch.getKey(), patch.getValue());
         }
+        patchFilesCreateDirectories(root);
         patchThrowableGetSuppressed(jar, root);
         patchDefaultFileSystemProviderStreams(jar, root);
         patchZipFileRawInflaterPadding(jar, root);
@@ -342,6 +344,66 @@ public final class TeaVMClasslibPatcher {
         if (BuildTarget.wasmGc()) {
             patchDateToStringWasmGC(root);
         }
+    }
+
+    private static void patchFilesCreateDirectories(Path root) throws IOException {
+        String files = "org/teavm/classlib/java/nio/file/TFiles";
+        String path = "org/teavm/classlib/java/nio/file/TPath";
+        ClassNode node = new ClassNode();
+        new ClassReader(Files.readAllBytes(root.resolve(files + ".class"))).accept(node, 0);
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("createDirectories")
+                        && candidate.desc.equals("(L" + path
+                                + ";[Lorg/teavm/classlib/java/nio/file/attribute/TFileAttribute;)L" + path + ";"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(files + ".createDirectories not found"));
+        AbstractInsnNode first = method.instructions.getFirst();
+        while (first != null && first.getOpcode() < 0) {
+            if (first instanceof FrameNode) {
+                throw new IllegalStateException(node.name + ".createDirectories starts at a branch target");
+            }
+            first = first.getNext();
+        }
+        boolean callsIsDirectory = false;
+        for (AbstractInsnNode insn : method.instructions) {
+            if (insn instanceof MethodInsnNode call && call.owner.equals(files) && call.name.equals("isDirectory")) {
+                callsIsDirectory = true;
+            }
+        }
+        if (!callsIsDirectory) {
+            throw new IllegalStateException(node.name + ".createDirectories no longer checks isDirectory");
+        }
+        InsnList prologue = new InsnList();
+        LabelNode create = new LabelNode();
+        prologue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prologue.add(new InsnNode(Opcodes.ICONST_0));
+        prologue.add(new TypeInsnNode(Opcodes.ANEWARRAY, "org/teavm/classlib/java/nio/file/TLinkOption"));
+        prologue.add(new MethodInsnNode(Opcodes.INVOKESTATIC, files, "isDirectory",
+                "(L" + path + ";[Lorg/teavm/classlib/java/nio/file/TLinkOption;)Z", false));
+        prologue.add(new JumpInsnNode(Opcodes.IFEQ, create));
+        prologue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prologue.add(new InsnNode(Opcodes.ARETURN));
+        prologue.add(create);
+        prologue.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        LabelNode missing = new LabelNode();
+        prologue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prologue.add(new InsnNode(Opcodes.ICONST_0));
+        prologue.add(new TypeInsnNode(Opcodes.ANEWARRAY, "org/teavm/classlib/java/nio/file/TLinkOption"));
+        prologue.add(new MethodInsnNode(Opcodes.INVOKESTATIC, files, "exists",
+                "(L" + path + ";[Lorg/teavm/classlib/java/nio/file/TLinkOption;)Z", false));
+        prologue.add(new JumpInsnNode(Opcodes.IFEQ, missing));
+        prologue.add(new TypeInsnNode(Opcodes.NEW, "java/nio/file/FileAlreadyExistsException"));
+        prologue.add(new InsnNode(Opcodes.DUP));
+        prologue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prologue.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, path, "toString", "()Ljava/lang/String;", true));
+        prologue.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/nio/file/FileAlreadyExistsException", "<init>",
+                "(Ljava/lang/String;)V", false));
+        prologue.add(new InsnNode(Opcodes.ATHROW));
+        prologue.add(missing);
+        prologue.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        method.instructions.insert(prologue);
+        method.maxStack = Math.max(method.maxStack, 3);
+        writeClass(root, files, node);
     }
 
     /**

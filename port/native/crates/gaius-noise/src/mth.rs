@@ -3,7 +3,7 @@
 use crate::java;
 
 /// How `Mth.floor` / `Mth.lfloor` are implemented by a profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloorMode {
     /// 1.21.11: `int i = (int) d; return d < i ? i - 1 : i;`
     CastAdjust,

@@ -4,43 +4,45 @@ import org.teavm.interop.AsyncCallback;
 import org.teavm.interop.Import;
 import org.teavm.interop.PlatformMarker;
 import org.teavm.runtime.EventQueue;
-import org.teavm.runtime.Fiber;
 
 /**
  * WebAssembly GC implementation of the host event-loop entry points (the JavaScript one in
  * {@code src/main/java} delegates to TeaVM's {@code Platform}, which this backend does not
  * support).
  *
- * <p>TeaVM's WebAssembly GC runtime keeps no queue of its own: {@link EventQueue#offer} hands
- * the event to the {@code teavmAsync.offer} import of the runtime JS, which Gaius patches to
- * run zero-delay events from a MessageChannel ready queue instead of a clamped
- * {@code setTimeout} (port/web/runtime/wasmgc).
+ * <p>The WebAssembly GC build always runs in JSPI mode (gaius.teavm.jspi, design D3; the
+ * coroutine mode was removed in M1): every Java thread is a {@code WebAssembly.promising}
+ * activation (JspiHost), new threads start as activations and a thread waits for host work by
+ * parking its activation ({@link #awaitHost}).
  *
- * <p>In JSPI mode (gaius.teavm.jspi, the default of the wasmgc roles) every Java thread is a
- * {@code WebAssembly.promising} activation (JspiHost): new threads start as activations and
- * a thread waits for host work by parking its activation ({@link #awaitHost}). Without JSPI
- * the fiber paths below remain for comparison builds.
+ * <p>TeaVM's WebAssembly GC runtime keeps no queue of its own: {@link EventQueue#offer} hands
+ * the event to the {@code teavmAsync.offer} import of the runtime JS, which gaius-jspi.js
+ * routes into the same run queue as the thread resumptions (port/web/runtime/wasmgc).
+ *
+ * <p>The frame loop (design D4): the patched {@code Minecraft.run} calls
+ * {@link #awaitAnimationFrame} at the head of its while loop, so the browser gets its turn
+ * (compositing, input, timers) between two frames and nowhere inside one. A present only
+ * records its swap interval ({@link #framePresented}); see port/web/runtime/host-abi.md.
  */
 public final class HostLoop {
+    /** Swap interval of the last present: 0 uncapped, otherwise synchronized to the display. */
+    private static int presentInterval = 1;
+
     private HostLoop() {
     }
 
     /**
-     * Runs {@code task} later on a new daemon fiber, which may suspend. Like
-     * {@code Platform.startThread} of the JavaScript build it does not switch
-     * {@code Thread.currentThread()}.
+     * Runs {@code task} later in a new activation with the identity of the current thread
+     * (JspiHost.startTask); the task may block. Like {@code Platform.startThread} of the
+     * JavaScript build it does not switch {@code Thread.currentThread()}.
      */
     public static void startThread(Runnable task) {
-        if (JspiHost.enabled()) {
-            JspiHost.startTask(task);
-            return;
-        }
-        EventQueue.offer(() -> Fiber.start(task::run, true));
+        JspiHost.startTask(task);
     }
 
     /**
-     * Runs {@code task} from a host callback after {@code delayMillis}; the task has no fiber
-     * and must not suspend. Returns an id for {@link #killSchedule}.
+     * Runs {@code task} from a host callback after {@code delayMillis}; the task has no
+     * activation and must not block. Returns an id for {@link #killSchedule}.
      */
     public static int schedule(Runnable task, int delayMillis) {
         return EventQueue.offer(task::run, System.currentTimeMillis() + Math.max(0, delayMillis));
@@ -59,12 +61,12 @@ public final class HostLoop {
     @Import(module = "teavmAsync", name = "kill")
     private static native int killHost(int id);
 
-    /** False when the caller runs from a plain host callback that has no fiber to suspend. */
+    /**
+     * False in a JS callback into Java (outside any activation, or a synchronous JS-to-Java
+     * call inside one), where nothing can suspend.
+     */
     public static boolean canSuspend() {
-        if (JspiHost.enabled()) {
-            return JspiHost.inActivation();
-        }
-        return Fiber.current() != null;
+        return JspiHost.inActivation();
     }
 
     /** True in the WebAssembly GC build (a platform marker, folded by TeaVM). */
@@ -86,26 +88,23 @@ public final class HostLoop {
     }
 
     /**
-     * JSPI only: suspends the current Java thread (its whole wasm stack) until the host work
-     * started by {@code call} resumes it. {@code resume} may run from a JS callback.
+     * Suspends the current Java thread (its whole wasm stack) until the host work started by
+     * {@code call} resumes it. {@code resume} may run from a JS callback.
      */
     public static void awaitHost(HostCall call) {
-        if (!JspiHost.enabled()) {
-            throw new UnsupportedOperationException("HostLoop.awaitHost needs the JSPI build");
-        }
         AsyncCallback<Object> result = JspiHost.newResult();
         call.start(() -> result.complete(null));
         JspiHost.awaitResult(result);
     }
 
     /**
-     * JSPI only: suspends the current Java thread for at least {@code delayMillis}, or for one
-     * pass of the run queue when it is 0 or less (the queue yields to the browser every few
+     * Suspends the current Java thread for at least {@code delayMillis}, or for one pass of
+     * the run queue when it is 0 or less (the queue yields to the browser every few
      * milliseconds). Returns at once from a JS callback, which has no thread to suspend; the
      * yield is optional there (TModernRuntimeSupport.yieldToEventLoop).
      */
     public static void yieldToEventLoop(int delayMillis) {
-        if (!JspiHost.enabled() || !JspiHost.inActivation()) {
+        if (!JspiHost.inActivation()) {
             return;
         }
         awaitHost(resume -> {
@@ -117,9 +116,49 @@ public final class HostLoop {
         });
     }
 
+    /** Yields only after a busy managed-block loop has consumed a two millisecond slice. */
+    public static long managedBlockYield(boolean predicate, long lastYieldNanos) {
+        if (!predicate) {
+            long now = System.nanoTime();
+            if (now - lastYieldNanos >= 2_000_000L) {
+                yieldToEventLoop(0);
+                return now;
+            }
+        }
+        return lastYieldNanos;
+    }
+
+    /** A false pollTask result means the queue is empty; let worker replies and timers run. */
+    public static long managedBlockIdle(long lastYieldNanos) {
+        yieldToEventLoop(0);
+        return System.nanoTime();
+    }
+
+    /**
+     * Records a present (SDL_GL_SwapWindow, glfwSwapBuffers): its swap interval decides how
+     * the next {@link #awaitAnimationFrame} waits. {@code hidden} is not kept: the frame wait
+     * reads the page visibility itself when it starts.
+     */
+    public static void framePresented(boolean hidden, int interval) {
+        presentInterval = interval;
+    }
+
+    /**
+     * The frame boundary at the head of the {@code Minecraft.run} loop (design D4, the
+     * WebAssembly GC replacement of the per-present yield): suspends the main thread until the
+     * browser is ready for the next frame. With the last present synchronized to the display
+     * the wait ends after the next animation frame; uncapped presents wait for one macrotask
+     * in a world and for the next animation frame in menus; a hidden page waits 50 ms
+     * (gaius-jspi.js, awaitFrame: the pacing of the JavaScript build's per-present yield,
+     * BrowserGlfw/BrowserSdlDom scheduleFrameYield). Returns at once from a JS callback.
+     */
+    public static void awaitAnimationFrame() {
+        JspiHost.awaitFrame(presentInterval);
+    }
+
     /**
      * Runs {@code task} from a host macrotask as soon as the browser is ready; the task has no
-     * fiber. Zero-delay events go through the runtime's MessageChannel ready queue.
+     * activation. Zero-delay events go through the run queue of gaius-jspi.js.
      */
     public static void postMacrotask(Runnable task) {
         EventQueue.offer(task::run);

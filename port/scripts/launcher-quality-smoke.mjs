@@ -27,29 +27,40 @@ const governorGate = slice("    function gaiusRenderScaleGovernsFps()", "    fun
 
 function page({dpr = 2, search = "", quality = null, canvasWidth = 0, cssWidth = 1000} = {}) {
   const written = [];
-  const canvas = {
-    width: canvasWidth,
+  const makeCanvas = (width) => ({
+    width,
     clientWidth: cssWidth,
     style: {
       set imageRendering(value) {
         written.push(value);
       },
     },
-  };
+  });
+  const canvas = makeCanvas(canvasWidth);
+  const listeners = {};
+  const observed = [];
   const window = {
     devicePixelRatio: dpr, innerWidth: cssWidth, innerHeight: 600,
     urlParams: new URLSearchParams(search),
     document: {getElementById: () => canvas},
-    addEventListener() {},
+    addEventListener(type, listener) {
+      (listeners[type] ??= []).push(listener);
+    },
     MutationObserver: class {
-      observe() {}
+      observe(target) {
+        observed.push(target);
+      }
+      disconnect() {
+        observed.length = 0;
+      }
     },
     GaiusQuality: quality, Number, Math,
   };
   window.window = window;
   vm.createContext(window);
   vm.runInContext(`${ratioBlock}${governorGate}\nthis.governs = gaiusRenderScaleGovernsFps;`, window);
-  return {window, canvas, written};
+  const dispatch = (type, event) => (listeners[type] ?? []).forEach((listener) => listener(event));
+  return {window, canvas, written, makeCanvas, dispatch, observed};
 }
 
 function quality(tierCap, {mode = "fixed", stats = {}} = {}) {
@@ -98,6 +109,15 @@ current.window.__gaiusUpdateCanvasSampling();
 current.window.__gaiusUpdateCanvasSampling();
 assert.deepEqual(current.written, ["pixelated", ""]);
 assert.deepEqual(page({canvasWidth: 1000, search: "?gaiusPixelated=0"}).written, []);
+// A replaced game canvas (gaius:canvas-replaced from the canvas host) is observed and sampled.
+current = page({canvasWidth: 2000});
+assert.deepEqual(current.written, [""]);
+const replacement = current.makeCanvas(1000);
+current.dispatch("gaius:canvas-replaced", {detail: {canvas: replacement, previous: current.canvas}});
+assert.deepEqual(current.observed, [replacement]);
+assert.deepEqual(current.written, ["", "pixelated"]);
+current.dispatch("gaius:canvas-replaced", {detail: {canvas: replacement}});
+assert.deepEqual(current.written, ["", "pixelated"], "the same canvas again changes nothing");
 
 // The governor yields only to an automatic world render scale on a live, enabled level hook.
 assert.equal(page({quality: quality(1.5, {mode: "auto"})}).window.governs(), false, "no level frames yet");

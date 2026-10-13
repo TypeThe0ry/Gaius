@@ -9,6 +9,7 @@ import java.util.Arrays;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
+import org.lwjgl.system.BrowserMemory;
 import org.lwjgl.system.MemoryUtil;
 
 /**
@@ -34,6 +35,13 @@ public final class STBImage {
 
     public static ByteBuffer stbi_load_from_memory(ByteBuffer input, IntBuffer x, IntBuffer y, IntBuffer channels, int desiredChannels) {
         try {
+            if (BrowserPng.AVAILABLE) {
+                ByteBuffer accelerated = BrowserPng.tryDecode(input, x, y, channels, desiredChannels, flipVertically);
+                if (accelerated != null) {
+                    failureReason = "";
+                    return accelerated;
+                }
+            }
             DecodedPng image = decodePng(input);
             int outputChannels = desiredChannels == STBI_default ? image.components : desiredChannels;
             if (outputChannels < STBI_grey || outputChannels > STBI_rgb_alpha) {
@@ -46,6 +54,7 @@ public final class STBImage {
             set(channels, image.components);
 
             ByteBuffer output = MemoryUtil.memAlloc(Math.multiplyExact(Math.multiplyExact(image.width, image.height), outputChannels));
+            BrowserMemory.claimOwner(MemoryUtil.memAddress(output), 3);
             writePixels(image, output, outputChannels);
             output.flip();
             failureReason = "";

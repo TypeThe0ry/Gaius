@@ -32,9 +32,10 @@ function extractJsBodies(text) {
     if (at < 0) break;
     let cursor = at + "@JSBody(".length;
     let params = [];
-    const paramsMatch = /^params = \{([^}]*)\},\s*/.exec(text.slice(cursor));
+    // params is an array initializer or, for a single parameter, one string literal.
+    const paramsMatch = /^params = (?:\{([^}]*)\}|("[^"]*")),\s*/.exec(text.slice(cursor));
     if (paramsMatch) {
-      params = paramsMatch[1].split(",").map((value) => value.trim().replace(/^"|"$/g, "")).filter(Boolean);
+      params = (paramsMatch[1] ?? paramsMatch[2]).split(",").map((value) => value.trim().replace(/^"|"$/g, "")).filter(Boolean);
       cursor += paramsMatch[0].length;
     }
     const scriptPrefix = /^script = /.exec(text.slice(cursor));

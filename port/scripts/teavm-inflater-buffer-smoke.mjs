@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 
 const supportSource = await readFile(new URL(
-  "../overrides/classlib/src/main/java/org/teavm/classlib/java/util/zip/" +
+  "../overrides/jdk/21/src/main/java/org/teavm/classlib/java/util/zip/" +
     "TZipModernSupport.java",
   import.meta.url,
 ), "utf8");

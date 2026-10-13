@@ -58,6 +58,7 @@ public final class WorldgenIr {
     public static final int OP_CACHE_ONCE = 29;
     public static final int OP_CACHE_ALL_IN_CELL = 30;
     public static final int OP_BLEND_DENSITY = 31;
+    public static final int OP_SCALED_NOISE = 32;
 
     // Unary / binary / round argument codes.
     public static final int UNARY_ABS = 0;

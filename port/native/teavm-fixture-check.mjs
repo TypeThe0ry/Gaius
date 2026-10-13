@@ -7,6 +7,7 @@
 // main checkout). The random-source lines must always match. Every noise line must match bit for
 // bit; a build from before the StrictMath263 rewrite runs float math in double precision, so it
 // is measured and fails unless --report is given. Volume lines are not evaluated.
+import {RENDERPEARL_PROFILE} from "../scripts/verification-profiles.mjs";
 import {execFileSync, spawnSync} from "node:child_process";
 import {existsSync, readFileSync, readdirSync} from "node:fs";
 import {dirname, join} from "node:path";
@@ -31,7 +32,7 @@ const positional = args.filter((arg, index) => !arg.startsWith("--") && args[ind
 function defaultArtifact() {
   const common = execFileSync("git", ["-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"],
     {encoding: "utf8"}).trim();
-  return join(dirname(common), "port", "target", "26.3", "boot-dist", "classes.js");
+  return join(dirname(common), "port", "target", RENDERPEARL_PROFILE.id, "boot-dist", "classes.js");
 }
 
 const artifactPath = positional[0] ?? defaultArtifact();
@@ -78,9 +79,9 @@ const group = (key) => {
   return entry;
 };
 
-const files = readdirSync(join(fixturesDir, "26.3")).filter((name) => name.endsWith(".jsonl")).sort();
+const files = readdirSync(join(fixturesDir, RENDERPEARL_PROFILE.id)).filter((name) => name.endsWith(".jsonl")).sort();
 for (const file of files) {
-  for (const text of readFileSync(join(fixturesDir, "26.3", file), "utf8").split("\n")) {
+  for (const text of readFileSync(join(fixturesDir, RENDERPEARL_PROFILE.id, file), "utf8").split("\n")) {
     if (!text) continue;
     const line = JSON.parse(text);
     const p = line.params;

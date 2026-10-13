@@ -16,21 +16,23 @@ if [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]] && [
   smoke_directory="$root/port/web/smoke/$GAIUS_MINECRAFT_VERSION"
 fi
 # The smoke compiler reads the same mutable overlay JARs as release builds.
-# Keep the writer lock until TeaVM exits so a concurrent rebuild cannot corrupt
-# an already-open ZipFile.
-overlay_lock="$root/port/work/.build-overlays.lock"
+# Keep the writer lock of the overlay directory (overlay-lock.sh) until TeaVM
+# exits so a concurrent rebuild cannot corrupt an already-open ZipFile.
+source "$root/port/scripts/overlay-lock.sh"
+overlay_lock=""
 overlay_lock_owner=""
 release_overlay_lock() {
   local status="$?"
   trap - EXIT
   if [[ -n "${overlay_lock_owner:-}" ]]; then
-    gaius_teavm_lock_release "$overlay_lock" "$overlay_lock_owner" || true
+    gaius_overlay_lock_release "$overlay_lock" "$overlay_lock_owner" || true
   fi
   exit "$status"
 }
 trap release_overlay_lock EXIT
-gaius_teavm_lock_acquire "$overlay_lock"
-overlay_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+gaius_overlay_lock_acquire "$root" "$overlay_directory"
+overlay_lock="$GAIUS_OVERLAY_LOCK_PATH"
+overlay_lock_owner="$GAIUS_OVERLAY_LOCK_OWNER_TOKEN"
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null

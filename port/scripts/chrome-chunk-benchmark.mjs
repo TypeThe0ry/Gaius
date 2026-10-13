@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import {spawn} from "node:child_process";
 import {Buffer} from "node:buffer";
 import {createHash} from "node:crypto";
@@ -10,6 +11,7 @@ import {createServer as createNetServer} from "node:net";
 import {tmpdir} from "node:os";
 import {basename, extname, isAbsolute, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
+import {configureWorldSeed as configureSharedWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
 import {
   browserServerTickWindow,
   collectInitialServerTickSamples,
@@ -156,7 +158,7 @@ const activeStoragePrefix = activeStorageConfig.prefix;
 // profiles. Keep the capability table explicit and fail closed for an unknown
 // profile (or a profile whose identity/capability fields do not match).
 const supportedReleaseDistanceCapabilities = Object.freeze({
-  "26.2": Object.freeze({
+  [CANONICAL_PROFILE.id]: Object.freeze({
     capability: "headed-chrome-worker-distance-8-6",
     clientDistribution: "named",
     protocolVersion: 776,
@@ -165,7 +167,7 @@ const supportedReleaseDistanceCapabilities = Object.freeze({
     workerDistance: "8:6",
     workerDistanceMode: "natural-observation",
   }),
-  "1.21.11": Object.freeze({
+  [LEGACY_PROFILE.id]: Object.freeze({
     capability: "headed-chrome-worker-distance-8-6",
     clientDistribution: "obfuscated-with-mappings",
     protocolVersion: 774,
@@ -612,7 +614,7 @@ if (args.includes("--help")) {
     "  --probe-f3                    After strict world readiness, toggle F3 twice and capture bounded evidence",
     "  --trace-f3-exceptions         With --probe-f3, enable bounded CDP native exception capture (diagnostic only)",
     "  --gpu-tier low|mid|high|ultra Pin the graphics quality tier (?gaiusTier=, default mid)",
-    "  --post 0|1                    Pin the 26.3 post-processing chain (?gaiusPost=); 0 for",
+    "  --post 0|1                    Pin the " + RENDERPEARL_PROFILE.id + " post-processing chain (?gaiusPost=); 0 for",
     "                                vanilla-comparison screenshots (default: the tier's choice)",
     "  --print-config                Print resolved benchmark configuration and exit",
   ].join("\n"));
@@ -1488,130 +1490,10 @@ async function clickFirstWorld(session) {
 }
 
 async function configureWorldSeed(session, seed) {
-  let tab = await findButton(session, "World", 3_000);
-  let usedWorldTabShortcut = false;
-  let worldTabShortcutHeld = false;
-  try {
-    if (tab && tab.text.trim().toLowerCase() === "world") {
-      await click(session, tab.x, tab.y);
-    } else {
-      const canUseWorldTabShortcut = await evaluate(session, "(() => {"
-        + "const state=window.__gaiusMinecraftState||{};"
-        + "const widgets=Array.isArray(state.screenWidgets)?state.screenWidgets:[];"
-        + "return String(state.screen||'').includes('CreateWorldScreen')&&"
-        + "widgets.some(widget=>widget&&widget.visible!==false&&"
-        + "/MenuTabBar|TabNavigationBar/.test(String(widget.type||'')));"
-        + "})()");
-      if (canUseWorldTabShortcut !== true) {
-        throw new Error("--world-seed requires the visible World tab or CreateWorldScreen TabNavigationBar");
-      }
-      usedWorldTabShortcut = true;
-      await dispatchKey(session, "ControlLeft", "keyDown");
-      worldTabShortcutHeld = true;
-      await dispatchKey(session, "Digit2", "keyDown");
-      await dispatchKey(session, "Digit2", "keyUp");
-      await sleep(100);
-    }
-  const seedPredicate = "widget&&widget.visible!==false&&widget.active!==false"
-    + "&&(String(widget.type||'').endsWith('CreateWorldScreen$WorldTab$1')"
-    + "||(/EditBox$/.test(String(widget.type||''))&&/seed/i.test(String(widget.text||''))))";
-  await waitFor(session, "(() => {const widgets=window.__gaiusMinecraftState?.screenWidgets||[];"
-    + "return widgets.filter(widget=>" + seedPredicate + ").length===1;})()",
-    5000, "the World tab seed input to replace the world-name input");
-  const widget = await evaluate(session, "(() => {"
-    + "const state=window.__gaiusMinecraftState||{};"
-    + "const widgets=Array.isArray(state.screenWidgets)?state.screenWidgets:[];"
-    + "const matches=widgets.filter(widget=>" + seedPredicate
-    + "&&Number.isFinite(Number(widget.x))&&Number.isFinite(Number(widget.y))"
-    + "&&Number.isFinite(Number(widget.width))&&Number.isFinite(Number(widget.height)));"
-    + "return matches.length===1?matches[0]:{count:matches.length};"
-    + "})()");
-  if (!widget || widget.count !== undefined) {
-    throw new Error("--world-seed requires exactly one visible active World EditBox; found "
-      + String(widget?.count ?? 0));
-  }
-  const canvas = await evaluate(session, "(() => {"
-    + "const canvas=document.querySelector('canvas');"
-    + "const rect=canvas&&canvas.getBoundingClientRect();"
-    + "const size=window.__gaiusMinecraftState?.screenSize;"
-    + "return rect&&size&&Number(size.width)>0&&Number(size.height)>0"
-    + "?{left:rect.left,top:rect.top,scaleX:rect.width/Number(size.width),scaleY:rect.height/Number(size.height)}:null;"
-    + "})()");
-  if (!canvas) throw new Error("--world-seed could not determine the canvas scale");
-  const x = Math.round(canvas.left + (Number(widget.x) + Number(widget.width) / 2) * canvas.scaleX);
-  const y = Math.round(canvas.top + (Number(widget.y) + Number(widget.height) / 2) * canvas.scaleY);
-  const focusPredicate = "(() => {"
-    + "const widgets=window.__gaiusMinecraftState?.screenWidgets||[];"
-    + "const matches=widgets.filter(widget=>" + seedPredicate + ");"
-    + "return matches.length===1&&matches[0].focused===true;"
-    + "})()";
-  await session.send("Input.dispatchMouseEvent", {
-    type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
+  return configureSharedWorldSeed(session, seed, {
+    findButton, click, dispatchKey, evaluate, waitFor, sleep,
+    outputPath: outputPath + ".world-seed",
   });
-  await session.send("Input.dispatchMouseEvent", {
-    type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1,
-  });
-  await waitFor(session, focusPredicate, 3_000, "the World seed EditBox focus before input");
-  // BrowserGlfw forwards DOM keydown characters to the canvas EditBox;
-  // Input.insertText bypasses that bridge, while synthetic Ctrl+A can itself
-  // be observed as an inserted "a".  Clear the 32-character input using End
-  // plus bounded backspaces,
-  // then send the requested seed through the same keydown/up path as a user.
-  await session.send("Input.dispatchKeyEvent", {
-    type: "keyDown", code: "End", key: "End", modifiers: 0,
-    windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35,
-  });
-  await session.send("Input.dispatchKeyEvent", {
-    type: "keyUp", code: "End", key: "End", modifiers: 0,
-    windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35,
-  });
-  for (let index = 0; index < 32; index++) {
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyDown", code: "Backspace", key: "Backspace", modifiers: 0,
-      windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
-    });
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyUp", code: "Backspace", key: "Backspace", modifiers: 0,
-      windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
-    });
-  }
-  for (const character of Array.from(seed)) {
-    const code = /^[a-z]$/i.test(character)
-      ? "Key" + character.toUpperCase()
-      : /^[0-9]$/.test(character) ? "Digit" + character : "Unidentified";
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyDown", code, key: character,
-      text: character, unmodifiedText: character, modifiers: 0,
-    });
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyUp", code, key: character, modifiers: 0,
-    });
-  }
-  // The input bridge can update Java before UI telemetry observes focus.
-  // Poll the same unique widget after input; do not re-click because that can
-  // hide dropped seed characters behind a superficially focused control.
-  await waitFor(session, focusPredicate, 3_000, "the World seed EditBox focus after input");
-  await mkdir(resolve(outputPath, ".."), {recursive: true});
-  let screenshotPath = outputPath + ".create-world-seed.png";
-  try {
-    const screenshot = await session.send("Page.captureScreenshot", {format: "png"});
-    await writeFile(screenshotPath, Buffer.from(screenshot.data, "base64"));
-  } catch (error) {
-    screenshotPath = null;
-  }
-  return {
-    configuredSeed: seed,
-    effectiveSeed: null,
-    acceptance: "unverified",
-    widget,
-    screenshotPath,
-    usedWorldTabShortcut,
-  };
-  } finally {
-    if (worldTabShortcutHeld) {
-      await dispatchKey(session, "ControlLeft", "keyUp").catch(() => {});
-    }
-  }
 }
 
 async function passProfileGate(session) {
@@ -2175,8 +2057,8 @@ async function runF3Probe(session) {
     resumeDebugger();
   };
   const enableNativeDebugger = async () => {
-    if (activeProfileId !== "26.2") {
-      throw new Error("--trace-f3-exceptions is bound to the verified 26.2 F3 classes.js artifact");
+    if (activeProfileId !== CANONICAL_PROFILE.id) {
+      throw new Error("--trace-f3-exceptions is bound to the verified " + CANONICAL_PROFILE.id + " F3 classes.js artifact");
     }
     const classesText = await readFile(resolve(distRoot, "classes.js"), "utf8");
     if (!classesText.includes("let N=err=>")) {
@@ -2366,7 +2248,7 @@ async function observeWorldReadiness(session) {
         keyboardLockPending: window.__gaiusKeyboardLockPending === true,
         keyboardLockError: window.__gaiusKeyboardLockLastError || null,
         inputStats: window.__gaiusInputStats || null,
-        // 26.2 BrowserGlfw queue or 26.3 BrowserSdl queue (never both on one page).
+        // ${CANONICAL_PROFILE.id} BrowserGlfw queue or ${RENDERPEARL_PROFILE.id} BrowserSdl queue (never both on one page).
         queuedEvents: Math.max(0, (window.__gaiusGlfwEvents?.length || 0)
           - (window.__gaiusGlfwEventHead || 0))
           + Math.max(0, (window.__gaiusSdlEvents?.length || 0)
@@ -5582,7 +5464,7 @@ try {
       "--disable-background-timer-throttling",
       "--disable-renderer-backgrounding",
       // Keep a suite-owned headed window's compositor/RAF active even when the
-      // Codex desktop is in front of it.  Without these flags Chrome can mark
+      // another desktop window is in front of it.  Without these flags Chrome can mark
       // the page hidden/occluded and the benchmark's waitForPaint() never
       // settles, producing a false startup hang before any game evidence.
       "--disable-backgrounding-occluded-windows",

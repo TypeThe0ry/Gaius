@@ -302,8 +302,9 @@ into the public registry.
 
 ## Rollback
 
-Keep the previous dist/, package-lock.json, and environment file outside the
-active release directory. To roll back, upload the previous application bundle,
+Keep the previous dist/, protocols/, package-lock.json, and environment file outside
+the active release directory. Keep protocol tables paired with their relay code.
+To roll back, upload the previous application bundle,
 restore the previous environment file if it changed, reinstall its locked
 dependencies, validate syntax, then restart the same unit:
 

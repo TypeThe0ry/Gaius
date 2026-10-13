@@ -1060,17 +1060,23 @@ BOOT_SCRIPT_PREFIX = '  <script data-gaius-boot="v1"'
 
 
 def patch_early_profile_id(text: str, profile: dict) -> str:
-    """Sets window.__gaiusProfileId in <head>, before the boot script tag.
+    """Sets window.__gaiusProfileId, __gaiusRenderSeam and __gaiusPatchSet in <head>, before the
+    boot script tag.
 
     The graphics quality layer that gaius-boot.js loads (or a portable page inlines in place of
-    that tag) caps the canvas ratio by profile, and on a portable page it runs before the
-    storage globals in <body> exist. A page from an older template gets the block inserted.
+    that tag) caps the canvas ratio by the profile's render seam generation, and on a portable
+    page it runs before the storage globals in <body> exist. Page code decides by these profile
+    fields, never by comparing version ids. A page from an older template gets the block
+    inserted.
     """
     block = (
         f'  <script {EARLY_PROFILE_MARKER}>\n'
         "    // The graphics quality layer the boot script loads caps the canvas ratio per profile, so the\n"
         "    // profile id must exist before any of it runs (postprocess-index-html.py fills it in).\n"
         f'    window.__gaiusProfileId = {json.dumps(profile["id"], ensure_ascii=True)};\n'
+        f'    window.__gaiusRenderSeam = {json.dumps(profile.get("renderSeam") or "none", ensure_ascii=True)};\n'
+        f'    window.__gaiusPatchSet = {json.dumps(profile.get("patchSet") or "", ensure_ascii=True)};\n'
+        f'    window.__gaiusTerrainSectionUniformBlock = {json.dumps(profile.get("terrainSectionUniformBlock", False))};\n'
         "  </script>\n"
     )
     text = EARLY_PROFILE_PATTERN.sub("", text)
@@ -1080,6 +1086,72 @@ def patch_early_profile_id(text: str, profile: dict) -> str:
     boot = text.find(BOOT_SCRIPT_PREFIX, 0, head_end)
     insertion = boot if boot >= 0 else head_end
     return text[:insertion] + block + text[insertion:]
+
+
+RUNTIME_CONFIG_MARKER = 'data-gaius-runtimes="v1"'
+RUNTIME_CONFIG_PATTERN = re.compile(
+    r'  <script data-gaius-runtimes="v1">\n.*?  </script>\n', re.DOTALL
+)
+CLIENT_RUNTIMES = ("js", "wasm", "auto")
+
+
+def runtime_config_script(
+    runtimes: dict | None = None,
+    default: str | None = None,
+    file_payloads: dict | None = None,
+    webgpu_shader_toolchain: dict | None = None,
+) -> str:
+    """The page configuration gaius-boot.js reads at parse time (v0.4.0 design D13/D14).
+
+    runtimes       window.__gaiusRuntimes, the builds this dist carries besides the JavaScript
+                   client: {"wasm": {"client": "classes.wasm", "server": ...}}
+    default        window.__gaiusRuntimeDefault ("js", "wasm" or "auto"); ?runtime= wins
+    file_payloads  window.__gaiusFilePayloads: the gzip+base64 script payloads that stand in for
+                   the binary files when the dist is opened from disk (file://), as written by
+                   build-portable-html.py write_file_payloads: {file: {script, bytes, gzip, sha256}}
+    webgpu_shader_toolchain
+                   window.__gaiusWebGpuShaderToolchain: {loader, version}, the shader toolchain
+                   that gaius-boot.js loads for ?gpu=webgpu when the profile's WebGPU front-end
+                   compiles GLSL in the page (make-wasm-page.py)
+    """
+    if default is not None and default not in CLIENT_RUNTIMES:
+        raise ValueError(f"unknown client runtime default: {default}")
+    lines = []
+    if runtimes:
+        lines.append(f"    window.__gaiusRuntimes = {_inline_json(runtimes)};\n")
+    if default:
+        lines.append(f"    window.__gaiusRuntimeDefault = {_inline_json(default)};\n")
+    if file_payloads:
+        lines.append(f"    window.__gaiusFilePayloads = {_inline_json(file_payloads)};\n")
+    if webgpu_shader_toolchain:
+        lines.append(
+            f"    window.__gaiusWebGpuShaderToolchain = {_inline_json(webgpu_shader_toolchain)};\n")
+    return f"  <script {RUNTIME_CONFIG_MARKER}>\n" + "".join(lines) + "  </script>\n"
+
+
+def _inline_json(value: object) -> str:
+    text = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    # Inline in a classic script: no element end tag can appear.
+    return text.replace("</", "<\\/")
+
+
+def apply_runtime_config(text: str, script: str) -> str:
+    """Puts runtime config before boot, or at the end of head for older page shells."""
+    text = RUNTIME_CONFIG_PATTERN.sub("", text)
+    head_end = text.find("</head>")
+    boot = text.find(BOOT_SCRIPT_PREFIX, 0, head_end if head_end >= 0 else len(text))
+    if boot < 0:
+        if head_end < 0:
+            raise RuntimeError("index.html has no </head> for the runtime configuration")
+        boot = head_end
+    return text[:boot] + script + text[boot:]
+
+
+def profile_from_index(text: str) -> str:
+    match = re.search(r'window\.__gaiusProfileId\s*=\s*"([^"\\]+)"\s*;', text)
+    if not match:
+        raise RuntimeError("index.html has no __gaiusProfileId")
+    return match.group(1)
 
 
 
@@ -2018,13 +2090,42 @@ def patch_index(
             "      });\n"
             "    }\n"
             "\n"
+            "    // One Gaius runtime per browser profile: a Web Lock, or a localStorage lease where Web Locks\n"
+            "    // are missing. A page that replaces the runtime in the same tab (reload, navigation) can ask\n"
+            "    // before the old document's lock is gone: the old page releases it on pagehide, but a lock\n"
+            "    // also lives until its document is destroyed, which may come later. So a lease held elsewhere\n"
+            "    // is waited for (runtimeLeaseHandoffMs) before the page reports another tab; a tab that keeps\n"
+            "    // running keeps its lease and the wait ends with that error.\n"
+            "    const runtimeLeaseHandoffMs = 8000;\n"
+            "    function releaseGaiusRuntimeLeaseOnPagehide(release) {\n"
+            "      addEventListener(\"pagehide\", release);\n"
+            "      addEventListener(\"unload\", release);\n"
+            "      addEventListener(\"pageshow\", event => {\n"
+            "        if (event.persisted) location.reload();\n"
+            "      });\n"
+            "    }\n"
+            "\n"
             "    async function acquireGaiusRuntimeLease() {\n"
             "      if (window.__gaiusRuntimeLeaseHeld || urlParams.get(\"allowMultipleTabs\") === \"1\") {\n"
             "        return true;\n"
             "      }\n"
+            "      let active = true;\n"
+            "      let releaseLease = () => {};\n"
+            "      const release = () => {\n"
+            "        if (!active) return;\n"
+            "        active = false;\n"
+            "        window.__gaiusRuntimeLeaseHeld = false;\n"
+            "        try {\n"
+            "          releaseLease();\n"
+            "        } catch (error) {\n"
+            "          console.warn(\"Could not release the runtime lease\", error);\n"
+            "        }\n"
+            "      };\n"
+            "      releaseGaiusRuntimeLeaseOnPagehide(release);\n"
+            "      window.__gaiusReleaseRuntimeLease = release;\n"
             "      const lockName = \"gaius-client-runtime-v1\";\n"
             "      if (navigator.locks && typeof navigator.locks.request === \"function\") {\n"
-            "        const acquired = await new Promise(resolve => {\n"
+            "        const requestLock = options => new Promise(resolve => {\n"
             "          let settled = false;\n"
             "          const finish = value => {\n"
             "            if (settled) return;\n"
@@ -2032,17 +2133,21 @@ def patch_index(
             "            resolve(value);\n"
             "          };\n"
             "          try {\n"
-            "            navigator.locks.request(lockName, {mode: \"exclusive\", ifAvailable: true}, lock => {\n"
-            "              if (!lock) {\n"
+            "            navigator.locks.request(lockName, options, lock => {\n"
+            "              if (!lock || !active) {\n"
             "                finish(false);\n"
             "                return;\n"
             "              }\n"
             "              window.__gaiusRuntimeLeaseHeld = true;\n"
             "              finish(true);\n"
             "              return new Promise(release => {\n"
-            "                window.__gaiusReleaseRuntimeLease = release;\n"
+            "                releaseLease = release;\n"
             "              });\n"
             "            }).catch(error => {\n"
+            "              if (options.signal && options.signal.aborted) {\n"
+            "                finish(false);\n"
+            "                return;\n"
+            "              }\n"
             "              console.warn(\"Web Locks runtime lease is unavailable\", error);\n"
             "              finish(null);\n"
             "            });\n"
@@ -2051,10 +2156,22 @@ def patch_index(
             "            finish(null);\n"
             "          }\n"
             "        });\n"
+            "        let acquired = await requestLock({mode: \"exclusive\", ifAvailable: true});\n"
+            "        if (!active) return false;\n"
+            "        if (acquired === false && typeof AbortController === \"function\") {\n"
+            "          bootTimings.runtimeLeaseWaitStart = performance.now();\n"
+            "          const handoff = new AbortController();\n"
+            "          releaseLease = () => handoff.abort();\n"
+            "          const timer = setTimeout(() => handoff.abort(), runtimeLeaseHandoffMs);\n"
+            "          acquired = await requestLock({mode: \"exclusive\", signal: handoff.signal});\n"
+            "          clearTimeout(timer);\n"
+            "        }\n"
+            "        if (!active) return false;\n"
             "        if (acquired !== null) return acquired;\n"
             "      }\n"
             "\n"
             "      const leaseKey = \"gaius.runtimeLease.v1\";\n"
+            "      const leaseStaleMs = 10000;\n"
             "      const leaseId = (crypto.randomUUID ? crypto.randomUUID() :\n"
             "        Date.now().toString(36) + Math.random().toString(36).slice(2));\n"
             "      const readLease = () => {\n"
@@ -2067,29 +2184,54 @@ def patch_index(
             "      const writeLease = () => {\n"
             "        localStorage.setItem(leaseKey, JSON.stringify({id: leaseId, at: Date.now()}));\n"
             "      };\n"
-            "      try {\n"
+            "      const heldElsewhere = () => {\n"
             "        const current = readLease();\n"
-            "        if (current && current.id !== leaseId && Date.now() - Number(current.at || 0) < 10000) {\n"
-            "          return false;\n"
+            "        return !!current && current.id !== leaseId && Date.now() - Number(current.at || 0) < leaseStaleMs;\n"
+            "      };\n"
+            "      let heartbeat;\n"
+            "      releaseLease = () => {\n"
+            "        clearInterval(heartbeat);\n"
+            "        const owned = readLease();\n"
+            "        if (owned && owned.id === leaseId) localStorage.removeItem(leaseKey);\n"
+            "      };\n"
+            "      const checkOwnership = () => {\n"
+            "        const owned = readLease();\n"
+            "        if (owned && owned.id === leaseId) return true;\n"
+            "        release();\n"
+            "        location.reload();\n"
+            "        return false;\n"
+            "      };\n"
+            "      const renewLease = () => {\n"
+            "        if (!active || !checkOwnership()) return;\n"
+            "        try {\n"
+            "          writeLease();\n"
+            "        } catch (error) {\n"
+            "          release();\n"
+            "          location.reload();\n"
             "        }\n"
+            "      };\n"
+            "      try {\n"
+            "        // A live tab renews its lease every 3 s; one that went away stops renewing and its lease\n"
+            "        // turns stale, so waiting a stale period plus the handoff is enough for either outcome.\n"
+            "        const waitUntil = Date.now() + leaseStaleMs + runtimeLeaseHandoffMs;\n"
+            "        while (heldElsewhere()) {\n"
+            "          if (!active || Date.now() >= waitUntil) return false;\n"
+            "          await new Promise(resolve => setTimeout(resolve, 250));\n"
+            "        }\n"
+            "        if (!active) return false;\n"
             "        writeLease();\n"
             "        await new Promise(resolve => setTimeout(resolve, 80));\n"
             "        const claimed = readLease();\n"
-            "        if (!claimed || claimed.id !== leaseId) return false;\n"
-            "        const heartbeat = setInterval(writeLease, 3000);\n"
-            "        const release = () => {\n"
-            "          clearInterval(heartbeat);\n"
-            "          const owned = readLease();\n"
-            "          if (owned && owned.id === leaseId) localStorage.removeItem(leaseKey);\n"
-            "        };\n"
-            "        addEventListener(\"pagehide\", release, {once: true});\n"
-            "        addEventListener(\"beforeunload\", release, {once: true});\n"
-            "        window.__gaiusReleaseRuntimeLease = release;\n"
+            "        if (!active || !claimed || claimed.id !== leaseId) return false;\n"
+            "        heartbeat = setInterval(renewLease, 3000);\n"
+            "        addEventListener(\"storage\", event => {\n"
+            "          if (active && (event.key === leaseKey || event.key === null)) checkOwnership();\n"
+            "        });\n"
             "        window.__gaiusRuntimeLeaseHeld = true;\n"
             "        return true;\n"
             "      } catch (error) {\n"
             "        console.warn(\"Cross-tab runtime lease is unavailable\", error);\n"
-            "        return true;\n"
+            "        return active;\n"
             "      }\n"
             "    }\n"
             "\n"
@@ -2951,14 +3093,14 @@ def patch_index(
         throw new Error("Online session UUID must contain 32 hexadecimal digits");
       }
       const args = [
-        "--version", "1.21.11",
+        "--version", "__GAIUS_VERSION__",
         "--versionType", "release",
         "--accessToken", online ? accessToken : "0",
         "--username", username,
         "--uuid", uuid,
         "--gameDir", "/gaius",
         "--assetsDir", "/gaius/assets",
-        "--assetIndex", "1.21.11",
+        "--assetIndex", "__GAIUS_ASSET_INDEX__",
         "--resourcePackDir", "/gaius/resourcepacks",
         "--width", String(Math.max(854, window.innerWidth || 854)),
         "--height", String(Math.max(480, window.innerHeight || 480))

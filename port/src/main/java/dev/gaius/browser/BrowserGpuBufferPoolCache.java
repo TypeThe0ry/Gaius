@@ -7,14 +7,74 @@ import java.util.List;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.typedarrays.Float64Array;
 
-/** Retains a bounded set of already-signalled staged GPU buffers across browser frames. */
+/**
+ * Retains a bounded set of already-signalled staged GPU buffers across browser frames.
+ *
+ * <p>The owner is vanilla's {@code GpuBufferPool}, patched per render seam generation, and the
+ * generations differ in where the pool sweeps the signalled recycle batches:
+ * <ul>
+ *   <li>at the start of {@code acquire}: {@link #beforeAcquire}, the owner's sweep with one
+ *       {@link #recycleResult} per polled batch, {@link #afterRecycleSweep}, {@link #removeAt} or
+ *       {@link #recordCreate}, then {@link #afterAcquire}; {@link #endFrame} runs when the used
+ *       list became a fenced pending batch;</li>
+ *   <li>at the tail of {@code endFrame}: {@code acquire} is {@link #beforeAcquire},
+ *       {@link #afterRecycleSweep} (after rounding the request; it validates the batches adopted
+ *       at the previous endFrame and selects the candidate), {@link #removeAt} or
+ *       {@link #recordCreate}, then {@link #afterAcquire}; {@code endFrame} is {@link #endFrame}
+ *       after the used list became a fenced pending batch and before the tail sweep, then
+ *       {@link #recycleResult} once per polled batch. Adopted buffers are therefore stamped
+ *       with the new frame, as with the other order where adoption happens during the next
+ *       frame's first acquire.</li>
+ * </ul>
+ * Between an endFrame sweep and the next acquire (or endFrame) the adopted batch may exceed the
+ * count/byte budget; the next acquire or endFrame trims it.
+ */
 public final class BrowserGpuBufferPoolCache {
     public static final int MAX_COUNT = 4;
     public static final long MAX_BYTES = 1024L * 1024L;
     public static final int MAX_IDLE_FRAMES = 3;
 
     private static final int TELEMETRY_INTERVAL_FRAMES = 4;
+    /** Field indices of the packed telemetry snapshot (see publishTelemetryBrowser). */
+    private static final int P_POOL_ID = 0;
+    private static final int P_USAGE = 1;
+    private static final int P_FRAME = 2;
+    private static final int P_AVAILABLE_COUNT = 3;
+    private static final int P_AVAILABLE_BYTES = 4;
+    private static final int P_ADMITTED_AVAILABLE_HIGH_WATER = 5;
+    private static final int P_ADMITTED_AVAILABLE_BYTES_HIGH_WATER = 6;
+    private static final int P_RETAINED_AVAILABLE_HIGH_WATER = 7;
+    private static final int P_RETAINED_AVAILABLE_BYTES_HIGH_WATER = 8;
+    private static final int P_PENDING_DEPTH = 9;
+    private static final int P_ACQUIRE_CALLS = 10;
+    private static final int P_CREATE_CALLS = 11;
+    private static final int P_REUSE_CALLS = 12;
+    private static final int P_RECYCLE_READY_BATCHES = 13;
+    private static final int P_RECYCLE_NOT_READY = 14;
+    private static final int P_RECYCLED_BUFFERS = 15;
+    private static final int P_CACHE_CLOSE_CALLS = 16;
+    private static final int P_CACHE_CLOSE_FAILURES = 17;
+    private static final int P_BUDGET_EVICTIONS = 18;
+    private static final int P_TTL_EVICTIONS = 19;
+    private static final int P_CONTEXT_DROPS = 20;
+    private static final int P_ANOMALY_DROPS = 21;
+    private static final int P_OVERFLOW_PURGES = 22;
+    private static final int P_REQUESTED_BYTES = 23;
+    private static final int P_ACQUIRED_BYTES = 24;
+    private static final int P_TELEMETRY_PUBLISHES = 25;
+    private static final int P_ADOPTION_OPERATIONS = 26;
+    private static final int P_SWEEP_VALIDATIONS = 27;
+    private static final int P_SWEEP_IDENTITY_COMPARISONS = 28;
+    private static final int P_SWEEP_SELECTION_COMPARISONS = 29;
+    private static final int P_TRIM_COMPARISONS = 30;
+    private static final int P_LIST_TRIM_CALLS = 31;
+    private static final int P_STORAGE_COMPACTION_FAILURES = 32;
+    private static final int P_OWNER_CLOSED = 33;
+    private static final int P_MAX_POOLS = 34;
+    private static final int P_COUNT = 35;
+    private static final double[] TELEMETRY = new double[P_COUNT];
     private static final int MAX_TELEMETRY_POOLS = 24;
     private static int nextPoolId = 1;
 
@@ -34,6 +94,8 @@ public final class BrowserGpuBufferPoolCache {
     private boolean ownerClosed;
     private boolean contextUnavailable;
     private boolean telemetryBridgeAvailable = true;
+    /** The JS side holds this pool's label once it was published (see publishTelemetryBrowser). */
+    private boolean telemetryLabelPublished;
     private boolean metadataExpanded;
     private boolean listMayNeedTrim;
     private int framesSinceTelemetry;
@@ -97,7 +159,7 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
-    /** Called before the owner polls signalled recycle batches. */
+    /** Called at the start of acquire; where the recycle sweep runs depends on the generation. */
     public void beforeAcquire() {
         acquireCalls++;
         clearExpectedCandidate();
@@ -115,7 +177,8 @@ public final class BrowserGpuBufferPoolCache {
 
     /**
      * Adopts one non-null, already-signalled batch in linear time. Duplicate, closed-state and
-     * candidate validation is deferred until the owner's complete removeIf sweep.
+     * candidate validation is deferred to the next {@link #afterRecycleSweep} (or
+     * {@link #endFrame}), which checks all adopted batches at once.
      */
     public void recycleResult(List<GpuBuffer> recycled) {
         if (recycled == null) {
@@ -173,7 +236,10 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
-    /** Validates all adopted batches together before vanilla takeBestAvailable runs. */
+    /**
+     * Validates all batches adopted since the last check together and selects the candidate
+     * before vanilla takeBestAvailable runs.
+     */
     public void afterRecycleSweep(int requestedRoundedSize) {
         clearExpectedCandidate();
         if (!requireContext()) {
@@ -253,7 +319,11 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
-    /** Called once after the owner has moved usedThisFrame into its fenced pending list. */
+    /**
+     * Called once after the owner has moved usedThisFrame into its fenced pending list and,
+     * where the recycle sweep runs at the tail of endFrame, before that sweep adopts signalled
+     * batches for the new frame.
+     */
     public void endFrame(int pendingDepth) {
         lastPendingDepth = Math.max(0, pendingDepth);
         if (frame == Integer.MAX_VALUE) {
@@ -758,23 +828,49 @@ public final class BrowserGpuBufferPoolCache {
         telemetryPublishes++;
         framesSinceTelemetry = 0;
         if (!telemetryBridgeAvailable) return;
-        // TeaVM's WebAssembly GC backend limits JSBody natives to 32 parameters; the
-        // WebAssembly GC build does not publish this telemetry yet (constant-folded).
-        if (HostLoop.isWasmGc()) return;
         String label = labelForPublish();
         try {
-            publishTelemetryBrowser(
-                    poolId, label, usage, frame, stampCount, availableBytes,
-                    admittedAvailableHighWater, admittedAvailableBytesHighWater,
-                    retainedAvailableHighWater, retainedAvailableBytesHighWater,
-                    lastPendingDepth, acquireCalls, createCalls, reuseCalls,
-                    recycleReadyBatches, recycleNotReady, recycledBuffers,
-                    cacheCloseCalls, cacheCloseFailures, budgetEvictions, ttlEvictions,
-                    contextDrops, anomalyDrops, overflowPurges, requestedBytes, acquiredBytes,
-                    telemetryPublishes, adoptionOperations, sweepValidations,
-                    sweepIdentityComparisons, sweepSelectionComparisons, trimComparisons,
-                    listTrimCalls, storageCompactionFailures, closed, reason,
-                    MAX_TELEMETRY_POOLS);
+            double[] t = TELEMETRY;
+            t[P_POOL_ID] = poolId;
+            t[P_USAGE] = usage;
+            t[P_FRAME] = frame;
+            t[P_AVAILABLE_COUNT] = stampCount;
+            t[P_AVAILABLE_BYTES] = availableBytes;
+            t[P_ADMITTED_AVAILABLE_HIGH_WATER] = admittedAvailableHighWater;
+            t[P_ADMITTED_AVAILABLE_BYTES_HIGH_WATER] = admittedAvailableBytesHighWater;
+            t[P_RETAINED_AVAILABLE_HIGH_WATER] = retainedAvailableHighWater;
+            t[P_RETAINED_AVAILABLE_BYTES_HIGH_WATER] = retainedAvailableBytesHighWater;
+            t[P_PENDING_DEPTH] = lastPendingDepth;
+            t[P_ACQUIRE_CALLS] = acquireCalls;
+            t[P_CREATE_CALLS] = createCalls;
+            t[P_REUSE_CALLS] = reuseCalls;
+            t[P_RECYCLE_READY_BATCHES] = recycleReadyBatches;
+            t[P_RECYCLE_NOT_READY] = recycleNotReady;
+            t[P_RECYCLED_BUFFERS] = recycledBuffers;
+            t[P_CACHE_CLOSE_CALLS] = cacheCloseCalls;
+            t[P_CACHE_CLOSE_FAILURES] = cacheCloseFailures;
+            t[P_BUDGET_EVICTIONS] = budgetEvictions;
+            t[P_TTL_EVICTIONS] = ttlEvictions;
+            t[P_CONTEXT_DROPS] = contextDrops;
+            t[P_ANOMALY_DROPS] = anomalyDrops;
+            t[P_OVERFLOW_PURGES] = overflowPurges;
+            t[P_REQUESTED_BYTES] = requestedBytes;
+            t[P_ACQUIRED_BYTES] = acquiredBytes;
+            t[P_TELEMETRY_PUBLISHES] = telemetryPublishes;
+            t[P_ADOPTION_OPERATIONS] = adoptionOperations;
+            t[P_SWEEP_VALIDATIONS] = sweepValidations;
+            t[P_SWEEP_IDENTITY_COMPARISONS] = sweepIdentityComparisons;
+            t[P_SWEEP_SELECTION_COMPARISONS] = sweepSelectionComparisons;
+            t[P_TRIM_COMPARISONS] = trimComparisons;
+            t[P_LIST_TRIM_CALLS] = listTrimCalls;
+            t[P_STORAGE_COMPACTION_FAILURES] = storageCompactionFailures;
+            t[P_OWNER_CLOSED] = closed ? 1 : 0;
+            t[P_MAX_POOLS] = MAX_TELEMETRY_POOLS;
+            // The label crosses once per pool and the reason only when it is not the periodic
+            // one: a Java string becomes a new JS string on every call on WebAssembly GC.
+            publishTelemetryBrowser(JsArrays.float64(t), telemetryLabelPublished ? null : label,
+                    "periodic".equals(reason) ? null : reason);
+            telemetryLabelPublished = true;
         } catch (Throwable failure) {
             telemetryBridgeAvailable = false;
         }
@@ -808,7 +904,17 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
+    /**
+     * Whether the render backend's context can take work (PLAN-DELTA 3.10, gate by backend): the
+     * WebGPU core's {@code contextAvailable()} when it renders ({@code GaiusWebGpu.active}),
+     * otherwise the WebGL 2 context and BrowserOpenGL's loss and submission state. Without the
+     * WebGPU branch the pool would be dropped as "no context" under WebGPU.
+     */
     @JSBody(script = """
+            const gpu=globalThis.GaiusWebGpu;
+            if (gpu && gpu.active===true && typeof gpu.contextAvailable==='function') {
+              try { return gpu.contextAvailable()===true; } catch (error) { return false; }
+            }
             const state=globalThis.__gaiusGL;
             const gl=globalThis.__gaiusWebGL;
             if (!state || !gl || state.gpuContextLost || state.gpuSubmissionBlocked
@@ -817,18 +923,15 @@ public final class BrowserGpuBufferPoolCache {
             """)
     private static native boolean browserContextAvailableJs();
 
-    @JSBody(params = {
-            "poolId", "label", "usage", "frame", "availableCount", "availableBytes",
-            "admittedAvailableHighWater", "admittedAvailableBytesHighWater",
-            "retainedAvailableHighWater", "retainedAvailableBytesHighWater", "pendingDepth",
-            "acquireCalls", "createCalls", "reuseCalls", "recycleReadyBatches",
-            "recycleNotReady", "recycledBuffers", "cacheCloseCalls", "cacheCloseFailures",
-            "budgetEvictions", "ttlEvictions", "contextDrops", "anomalyDrops",
-            "overflowPurges", "requestedBytes", "acquiredBytes", "telemetryPublishes",
-            "adoptionOperations", "sweepValidations", "sweepIdentityComparisons",
-            "sweepSelectionComparisons", "trimComparisons", "listTrimCalls",
-            "storageCompactionFailures", "ownerClosed", "reason", "maxPools"
-    }, script = """
+    /**
+     * Publishes one pool into {@code __gaiusGLStats.gpuBufferPoolCache} from a packed snapshot:
+     * index {@code P_X} holds field {@code x} (ownerClosed as 0/1). One typed array instead of
+     * 37 arguments keeps the call under TeaVM's WebAssembly GC limit of 32 JSBody parameters, so
+     * both targets publish the same object. {@code label} is null once JS holds the pool's label
+     * (kept in {@code globalThis.__gaiusGpuPoolLabels}, outside the published object) and
+     * {@code reason} is null for periodic publishes.
+     */
+    @JSBody(params = {"v", "label", "reason"}, script = """
             const stats=globalThis.__gaiusGLStats || (globalThis.__gaiusGLStats={});
             let root=stats.gpuBufferPoolCache;
             if (!root || root.version!==2 || !Array.isArray(root.pools)) {
@@ -838,80 +941,73 @@ public final class BrowserGpuBufferPoolCache {
             }
             const boundedIncrement=(value)=>Math.min(2147483647,
                     Math.max(0,Number(value)||0)+1);
+            const poolId=v[0]|0;
+            const labels=globalThis.__gaiusGpuPoolLabels || (globalThis.__gaiusGpuPoolLabels=new Map());
+            if (typeof label==='string') labels.set(poolId,label.slice(0,96));
             root.totalPublishes=boundedIncrement(root.totalPublishes);
             let slotIndex=-1;
             for (let index=0;index<root.pools.length;index++) {
-              if ((root.pools[index].poolId|0)===(poolId|0)) {
+              if ((root.pools[index].poolId|0)===poolId) {
                 slotIndex=index;
                 break;
               }
             }
-            if (ownerClosed) {
+            if (v[33]) {
+              labels.delete(poolId);
               if (slotIndex>=0) root.pools.splice(slotIndex,1);
               root.closedPools=boundedIncrement(root.closedPools);
-              root.lastClosedPoolId=poolId|0;
+              root.lastClosedPoolId=poolId;
               root.lastCloseReason=String(reason||'owner-close').slice(0,48);
               return;
             }
             let slot=slotIndex>=0?root.pools[slotIndex]:null;
-            if (!slot && root.pools.length<(maxPools|0)) {
-              slot={poolId:poolId|0};
+            if (!slot && root.pools.length<(v[34]|0)) {
+              slot={poolId:poolId};
               root.pools.push(slot);
             }
             if (!slot) {
               root.overflowPublishes=boundedIncrement(root.overflowPublishes);
-              root.lastOverflowPoolId=poolId|0;
-              root.lastOverflowUsage=usage|0;
+              root.lastOverflowPoolId=poolId;
+              root.lastOverflowUsage=v[1]|0;
               return;
             }
-            slot.label=String(label||'').slice(0,96);
-            slot.usage=usage|0;
-            slot.frame=frame|0;
-            slot.availableCount=availableCount|0;
-            slot.availableBytes=Number(availableBytes);
-            slot.admittedAvailableHighWater=Number(admittedAvailableHighWater);
-            slot.admittedAvailableBytesHighWater=Number(admittedAvailableBytesHighWater);
-            slot.retainedAvailableHighWater=retainedAvailableHighWater|0;
-            slot.retainedAvailableBytesHighWater=Number(retainedAvailableBytesHighWater);
-            slot.pendingDepth=pendingDepth|0;
-            slot.acquireCalls=Number(acquireCalls);
-            slot.createCalls=Number(createCalls);
-            slot.reuseCalls=Number(reuseCalls);
-            slot.recycleReadyBatches=Number(recycleReadyBatches);
-            slot.recycleNotReady=Number(recycleNotReady);
-            slot.recycledBuffers=Number(recycledBuffers);
-            slot.cacheCloseCalls=Number(cacheCloseCalls);
-            slot.cacheCloseFailures=Number(cacheCloseFailures);
-            slot.budgetEvictions=Number(budgetEvictions);
-            slot.ttlEvictions=Number(ttlEvictions);
-            slot.contextDrops=Number(contextDrops);
-            slot.anomalyDrops=Number(anomalyDrops);
-            slot.overflowPurges=Number(overflowPurges);
-            slot.requestedBytes=Number(requestedBytes);
-            slot.acquiredBytes=Number(acquiredBytes);
-            slot.telemetryPublishes=Number(telemetryPublishes);
-            slot.adoptionOperations=Number(adoptionOperations);
-            slot.sweepValidations=Number(sweepValidations);
-            slot.sweepIdentityComparisons=Number(sweepIdentityComparisons);
-            slot.sweepSelectionComparisons=Number(sweepSelectionComparisons);
-            slot.trimComparisons=Number(trimComparisons);
-            slot.listTrimCalls=Number(listTrimCalls);
-            slot.storageCompactionFailures=Number(storageCompactionFailures);
+            slot.label=labels.get(poolId)||'';
+            slot.usage=v[1]|0;
+            slot.frame=v[2]|0;
+            slot.availableCount=v[3]|0;
+            slot.availableBytes=Number(v[4]);
+            slot.admittedAvailableHighWater=Number(v[5]);
+            slot.admittedAvailableBytesHighWater=Number(v[6]);
+            slot.retainedAvailableHighWater=v[7]|0;
+            slot.retainedAvailableBytesHighWater=Number(v[8]);
+            slot.pendingDepth=v[9]|0;
+            slot.acquireCalls=Number(v[10]);
+            slot.createCalls=Number(v[11]);
+            slot.reuseCalls=Number(v[12]);
+            slot.recycleReadyBatches=Number(v[13]);
+            slot.recycleNotReady=Number(v[14]);
+            slot.recycledBuffers=Number(v[15]);
+            slot.cacheCloseCalls=Number(v[16]);
+            slot.cacheCloseFailures=Number(v[17]);
+            slot.budgetEvictions=Number(v[18]);
+            slot.ttlEvictions=Number(v[19]);
+            slot.contextDrops=Number(v[20]);
+            slot.anomalyDrops=Number(v[21]);
+            slot.overflowPurges=Number(v[22]);
+            slot.requestedBytes=Number(v[23]);
+            slot.acquiredBytes=Number(v[24]);
+            slot.telemetryPublishes=Number(v[25]);
+            slot.adoptionOperations=Number(v[26]);
+            slot.sweepValidations=Number(v[27]);
+            slot.sweepIdentityComparisons=Number(v[28]);
+            slot.sweepSelectionComparisons=Number(v[29]);
+            slot.trimComparisons=Number(v[30]);
+            slot.listTrimCalls=Number(v[31]);
+            slot.storageCompactionFailures=Number(v[32]);
             slot.lastPublishReason=String(reason||'periodic').slice(0,48);
             """)
     private static native void publishTelemetryBrowser(
-            int poolId, String label, int usage, int frame, int availableCount,
-            long availableBytes, long admittedAvailableHighWater,
-            long admittedAvailableBytesHighWater, int retainedAvailableHighWater,
-            long retainedAvailableBytesHighWater, int pendingDepth, long acquireCalls,
-            long createCalls, long reuseCalls, long recycleReadyBatches,
-            long recycleNotReady, long recycledBuffers, long cacheCloseCalls,
-            long cacheCloseFailures, long budgetEvictions, long ttlEvictions,
-            long contextDrops, long anomalyDrops, long overflowPurges,
-            long requestedBytes, long acquiredBytes, long telemetryPublishes,
-            long adoptionOperations, long sweepValidations, long sweepIdentityComparisons,
-            long sweepSelectionComparisons, long trimComparisons, long listTrimCalls,
-            long storageCompactionFailures, boolean ownerClosed, String reason, int maxPools);
+            Float64Array values, String label, String reason);
 
     int availableCountForTesting() { return stampCount; }
     long availableBytesForTesting() { return availableBytes; }

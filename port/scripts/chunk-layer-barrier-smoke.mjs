@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
+import {CANONICAL_PROFILE, LEGACY_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
+import {patcherSource} from "./patcher-sources.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const HOLDERS_PER_TURN = 16;
@@ -204,25 +206,20 @@ assert.deepEqual(oldOneHolderOrder.submitted, [0],
 
 const patchers = [
   {
-    profile: "26.2",
-    path: new URL(
-      "../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java",
-      import.meta.url,
-    ),
+    profile: CANONICAL_PROFILE.id,
+    patcher: "Minecraft262BrowserPatcher",
     scheduler: true,
   },
   {
-    profile: "1.21.11",
-    path: new URL(
-      "../tools/src/main/java/dev/gaius/tools/Minecraft12111BrowserPatcher.java",
-      import.meta.url,
-    ),
+    profile: LEGACY_PROFILE.id,
+    patcher: "Minecraft12111BrowserPatcher",
     scheduler: false,
   },
 ];
 
 for (const patcher of patchers) {
-  const source = await readFile(patcher.path, "utf8");
+  // The step with its domain classes (port/tools/patchkit/README.md, "Domains").
+  const source = patcherSource(patcher.patcher);
   assert.match(source, /BROWSER_HOLDERS_PER_TURN = 16/,
     `${patcher.profile} batch limit changed`);
 
@@ -289,10 +286,10 @@ for (const patcher of patchers) {
       "WORLDGEN_SCHEDULER",
       '"pulse"',
       "Opcodes.ILOAD, 7",
-    ], "26.2 per-holder scheduler pulse");
+    ], "" + CANONICAL_PROFILE.id + " per-holder scheduler pulse");
   } else {
     assert.doesNotMatch(source, /BrowserWorldgenScheduler|"pulse"|"checkpoint"/,
-      "1.21.11 holder cursor must remain scheduler-call free");
+      "" + LEGACY_PROFILE.id + " holder cursor must remain scheduler-call free");
   }
 }
 

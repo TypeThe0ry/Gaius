@@ -315,6 +315,9 @@
   // Submits a job (with the IR while the generator is new to the pool) and resends it with the IR
   // when the worker that ran it has not loaded the generator yet.
   async function submit(pool, gen, kindName, encode, opts) {
+    if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled("worldgen")) {
+      throw Object.assign(new Error("NEEDS_VANILLA: worldgen mirror is disabled"), {code: "needs-vanilla"});
+    }
     const jobId = takeJobId();
     const inline = gen.inlineLeft > 0;
     if (inline) gen.inlineLeft--;
@@ -346,6 +349,9 @@
   }
 
   async function load(pool, gen, options, opts) {
+    if (!global.GaiusKernelMirror || !global.GaiusKernelMirror.enabled("worldgen")) {
+      throw Object.assign(new Error("NEEDS_VANILLA: worldgen mirror is disabled"), {code: "needs-vanilla"});
+    }
     const jobId = takeJobId();
     return readLoadInfo(await pool.submit("load_generator", encodeLoad(gen, jobId, options), opts), jobId);
   }

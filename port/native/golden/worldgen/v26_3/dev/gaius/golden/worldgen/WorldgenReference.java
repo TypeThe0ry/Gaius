@@ -111,6 +111,8 @@ public final class WorldgenReference {
             }
             System.out.println(file.getFileName());
         }
+        dev.gaius.golden.worldgen.StageTiming.run(chunks, (chunkX, chunkZ) -> reference.write(
+                new DataOutputStream(java.io.OutputStream.nullOutputStream()), chunkX, chunkZ));
     }
 
     private record Reference(
@@ -127,23 +129,22 @@ public final class WorldgenReference {
             SamplerContext context = SamplerContext.builder().enableCaches().build();
             DensitySampler.Bound density =
                     randomState.samplersWithContext(context).get(settings.noiseRouter().finalDensity());
+            long densityStart = dev.gaius.golden.worldgen.StageTiming.start();
             try (ScopedDensityBuffer buffer = density.sampleVolume(volume)) {
+                dev.gaius.golden.worldgen.StageTiming.finish("density", cx, cz, densityStart);
                 for (int i = 0; i < volume.size(); i++) {
                     data.writeInt(Integer.reverseBytes(Float.floatToRawIntBits(buffer.get(i))));
                 }
             }
 
-            BiomeResolver resolver = chunkResolver(cx, cz);
-            for (int section = 0; section < 24; section++) {
-                for (int qy = 0; qy < 4; qy++) {
-                    for (int qz = 0; qz < 4; qz++) {
-                        for (int qx = 0; qx < 4; qx++) {
-                            Holder<Biome> b = resolver.getNoiseBiome(
-                                    (cx << 2) + qx, MIN_QUART_Y + section * 4 + qy, (cz << 2) + qz);
-                            data.writeInt(Integer.reverseBytes(biomeIds.get(b.value())));
-                        }
-                    }
-                }
+            Map<Long, int[]> storedBiomes = new HashMap<>();
+            long biomeStart = dev.gaius.golden.worldgen.StageTiming.start();
+            int[] biomeValues = chunkBiomeValues(cx, cz);
+            storedBiomes.put(ChunkPos.pack(cx, cz), biomeValues);
+
+            dev.gaius.golden.worldgen.StageTiming.finish("biomes", cx, cz, biomeStart);
+            for (int biome : biomeValues) {
+                data.writeInt(Integer.reverseBytes(biome));
             }
 
             int seaLevel = settings.seaLevel();
@@ -155,6 +156,7 @@ public final class WorldgenReference {
                     Strategy.createForBiomes(biomeMap), biomeMap.byId(0), null);
             ProtoChunk chunk = new ProtoChunk(new ChunkPos(cx, cz), UpgradeData.EMPTY, height, factory, null);
             int[] states = new int[volume.size()];
+            long terrainStart = dev.gaius.golden.worldgen.StageTiming.start();
             try (NoiseChunk noiseChunk = new NoiseChunk(randomState, null, settings, picker, Blender.empty(), volume)) {
                 Aquifer aquifer = noiseChunk.aquifer();
                 Heightmap oceanFloor = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.OCEAN_FLOOR_WG);
@@ -183,25 +185,29 @@ public final class WorldgenReference {
                         }
                     }
                 }
+                dev.gaius.golden.worldgen.StageTiming.finish("terrain", cx, cz, terrainStart);
                 for (int s : states) {
                     data.writeInt(Integer.reverseBytes(s));
                 }
                 // buildSurface reads biomes through the region's BiomeManager: the chunks' biomes
                 // (createResolverForChunk, the volume path) with the chunk's quart y clamp.
-                Map<Long, BiomeResolver> resolvers = new HashMap<>();
                 BiomeResolver chunkBiomes = (qx, qy, qz) -> {
                     int clamped = Math.max(MIN_QUART_Y, Math.min(MIN_QUART_Y + 95, qy));
                     int ccx = qx >> 2;
                     int ccz = qz >> 2;
-                    BiomeResolver r = resolvers.computeIfAbsent(ChunkPos.pack(ccx, ccz), k -> chunkResolver(ccx, ccz));
-                    return r.getNoiseBiome(qx, clamped, qz);
+                    int[] values = storedBiomes.computeIfAbsent(ChunkPos.pack(ccx, ccz), k -> chunkBiomeValues(ccx, ccz));
+                    int relativeY = clamped - MIN_QUART_Y;
+                    return biomeMap.byId((values[(relativeY >> 2) * 64
+                            + ((relativeY & 3) * 4 + (qz & 3)) * 4 + (qx & 3)]));
                 };
                 @SuppressWarnings("deprecation")
                 long zoomSeed = BiomeManager.obfuscateSeed(randomState.seed());
                 BiomeManager biomeManager = new BiomeManager(chunkBiomes, zoomSeed);
+                long surfaceStart = dev.gaius.golden.worldgen.StageTiming.start();
                 randomState.surfaceSystem().buildSurface(randomState, biomeManager,
                         new WorldGenerationContext(generator, height), chunk, noiseChunk,
                         settings.materialRule().value(), null);
+                dev.gaius.golden.worldgen.StageTiming.finish("surface", cx, cz, surfaceStart);
             }
             for (int z = 0; z < 16; z++) {
                 for (int x = 0; x < 16; x++) {
@@ -222,6 +228,35 @@ public final class WorldgenReference {
                     }
                 }
             }
+            for (int x = -1; x <= 4; x++) {
+                for (int z = -1; z <= 4; z++) {
+                    int qx = (cx << 2) + x;
+                    int qz = (cz << 2) + z;
+                    int[] values = storedBiomes.computeIfAbsent(ChunkPos.pack(qx >> 2, qz >> 2),
+                            k -> chunkBiomeValues(qx >> 2, qz >> 2));
+                    for (int y = 0; y < 96; y++) {
+                        data.writeInt(Integer.reverseBytes(values[(y >> 2) * 64
+                                + ((y & 3) * 4 + (qz & 3)) * 4 + (qx & 3)]));
+                    }
+                }
+            }
+        }
+
+        int[] chunkBiomeValues(int cx, int cz) {
+            int[] values = new int[24 * 64];
+            BiomeResolver resolver = chunkResolver(cx, cz);
+            for (int section = 0; section < 24; section++) {
+                for (int qx = 0; qx < 4; qx++) {
+                    for (int qy = 0; qy < 4; qy++) {
+                        for (int qz = 0; qz < 4; qz++) {
+                            Holder<Biome> biome = resolver.getNoiseBiome((cx << 2) + qx,
+                                    MIN_QUART_Y + section * 4 + qy, (cz << 2) + qz);
+                            values[section * 64 + (qy * 4 + qz) * 4 + qx] = biomeIds.get(biome.value());
+                        }
+                    }
+                }
+            }
+            return values;
         }
 
         /** {@code createBiomes}' resolver for one chunk. */

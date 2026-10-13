@@ -5,7 +5,11 @@ param(
     [string]$TargetBranch,
     [switch]$SkipBuild,
     [switch]$AllowDirty,
-    [switch]$Draft
+    [switch]$Draft,
+    # v0.4: the release root of port/scripts/build-release-matrix.sh. Nothing is built here then;
+    # the sites, the WebAssembly GC builds and the JavaScript fallback (rebuilt or frozen) come
+    # from that root and its release-matrix.json, and its size gate (pages-size.json) must pass.
+    [string]$ReleaseRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +27,14 @@ if ($status -and -not $AllowDirty) { throw 'Working tree is dirty. Re-run with -
 $head = (git rev-parse --verify HEAD).Trim()
 if ([string]::IsNullOrWhiteSpace($TargetBranch)) { $TargetBranch = (git branch --show-current).Trim() }
 if ([string]::IsNullOrWhiteSpace($TargetBranch)) { throw 'Detached HEAD requires -TargetBranch.' }
+$matrix = $null
+if (-not [string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+    $ReleaseRoot = (Resolve-Path $ReleaseRoot).Path
+    $matrix = Get-Content (Join-Path $ReleaseRoot 'release-matrix.json') -Raw | ConvertFrom-Json
+    $pagesSize = Get-Content (Join-Path $ReleaseRoot 'pages-size.json') -Raw | ConvertFrom-Json
+    if (-not $pagesSize.ok) { throw "The Pages sites in $ReleaseRoot do not pass the size gate (pages-size.json)." }
+    $SkipBuild = $true
+}
 if (-not $SkipBuild) {
     foreach ($profile in $Profiles) {
         $profilePath = "versions/$profile.json"
@@ -38,16 +50,37 @@ if (-not $SkipBuild) {
     }
 }
 
+# Where a profile's JavaScript build and site archive are: the classic per-profile roots, or
+# the release matrix's JavaScript fallback (rebuilt in the release root, or frozen elsewhere)
+# and its site archive.
+function Get-ProfileLayout([string]$profile) {
+    if ($null -eq $matrix) {
+        return @{
+            Build = "port/target/$profile"; Overlays = "port/work/overlays/$profile"; Dist = "port/web/dist/$profile"
+            Site = Join-Path $root "port/target/$profile/Gaius-site-$profile.tar.gz"; Frozen = $false; Wasm = $null
+            Reports = "port/target/$profile"
+        }
+    }
+    $entry = $matrix.profiles.$profile
+    if ($null -eq $entry) { throw "Profile $profile is not in $ReleaseRoot/release-matrix.json" }
+    return @{
+        Build = $entry.js.build; Overlays = Join-Path (Split-Path $entry.js.build -Parent) 'overlays'; Dist = $entry.js.dist
+        Site = Join-Path $ReleaseRoot "Gaius-site-$profile.tar.gz"; Frozen = ($entry.js.decision -eq 'frozen')
+        Wasm = Join-Path $ReleaseRoot "$profile/wasm"; Reports = Join-Path $ReleaseRoot "$profile/logs"
+    }
+}
+
 function Assert-ProfileArtifactsCurrent([string]$profile) {
     $profilePath = "versions/$profile.json"
     if (-not (Test-Path (Join-Path $root "port/$profilePath"))) {
         throw "Missing profile: $profilePath"
     }
+    $layout = Get-ProfileLayout $profile
     $env:GAIUS_VERSION_PROFILE_PATH = $profilePath
-    $env:GAIUS_BUILD_ROOT = "port/target/$profile"
-    $env:GAIUS_OVERLAY_DIRECTORY = "port/work/overlays/$profile"
-    $env:GAIUS_DIST_DIRECTORY = "port/web/dist/$profile"
-    $dist = Join-Path $root $env:GAIUS_DIST_DIRECTORY
+    $env:GAIUS_BUILD_ROOT = $layout.Build
+    $env:GAIUS_OVERLAY_DIRECTORY = $layout.Overlays
+    $env:GAIUS_DIST_DIRECTORY = $layout.Dist
+    $dist = if ([System.IO.Path]::IsPathRooted($layout.Dist)) { $layout.Dist } else { Join-Path $root $layout.Dist }
     $roles = @(
         @('client', 'classes.js'),
         @('singleplayer-worker', 'singleplayer-server.js'),
@@ -64,20 +97,38 @@ function Assert-ProfileArtifactsCurrent([string]$profile) {
     if ((Get-Content $index -Raw).Contains('data-gaius-shader-toolchain')) {
         $roles += ,@('shader-toolchain', 'gaius-shader-toolchain.json')
     }
+    # A frozen fallback was built from an earlier tree: its artifacts must still be the ones its
+    # sidecars name (the matrix decided that no trigger requires a rebuild).
+    $check = if ($layout.Frozen) { 'frozen' } else { 'verify' }
     foreach ($entry in $roles) {
         $artifact = Join-Path $dist $entry[1]
         if (-not (Test-Path $artifact)) { throw "Missing $profile artifact: $artifact" }
-        & python (Join-Path $root 'port/scripts/gaius_build_identity.py') verify `
+        & python (Join-Path $root 'port/scripts/gaius_build_identity.py') $check `
             --root $root --role $entry[0] --artifact $artifact *> $null
         if ($LASTEXITCODE) {
             throw "Stale or invalid $profile artifact identity: $artifact. Rebuild without -SkipBuild."
         }
     }
     $contract = Join-Path $root 'apps/bridge/browser-full-path-artifact-contract-smoke.mjs'
-    $report = Join-Path $env:GAIUS_BUILD_ROOT 'browser-full-path-artifact-contract-prerelease.json'
+    $reports = if ([System.IO.Path]::IsPathRooted($layout.Reports)) { $layout.Reports } else { Join-Path $root $layout.Reports }
+    New-Item -ItemType Directory -Force $reports | Out-Null
+    $report = Join-Path $reports 'browser-full-path-artifact-contract-prerelease.json'
     node $contract *> $report
     if ($LASTEXITCODE) {
         throw "Portable artifact contract failed for $profile; see $report"
+    }
+    if ($null -ne $layout.Wasm) {
+        # The WebAssembly GC client and server of the release matrix (build-wasmgc.sh sidecars).
+        $env:GAIUS_BUILD_ROOT = Join-Path $layout.Wasm 'build'
+        $env:GAIUS_OVERLAY_DIRECTORY = Join-Path $layout.Wasm 'overlays'
+        $env:GAIUS_DIST_DIRECTORY = Join-Path $layout.Wasm 'dist'
+        foreach ($entry in @(@('wasm-client', 'classes.wasm'), @('wasm-singleplayer-worker', 'singleplayer-server.wasm'))) {
+            $artifact = Join-Path $env:GAIUS_DIST_DIRECTORY $entry[1]
+            if (-not (Test-Path $artifact)) { throw "Missing $profile artifact: $artifact" }
+            & python (Join-Path $root 'port/scripts/gaius_build_identity.py') verify `
+                --root $root --role $entry[0] --artifact $artifact *> $null
+            if ($LASTEXITCODE) { throw "Stale or invalid $profile artifact identity: $artifact. Rebuild the release matrix." }
+        }
     }
 }
 
@@ -87,17 +138,23 @@ foreach ($profile in $Profiles) {
 $stage = Join-Path $root "port/target/local-prerelease/$Tag"
 if (Test-Path $stage) { throw "Refusing to overwrite staging directory: $stage" }
 New-Item -ItemType Directory -Force $stage | Out-Null
+if (-not [string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+    $pagesMatrix = Join-Path $ReleaseRoot 'Gaius-pages-matrix.json'
+    if (-not (Test-Path $pagesMatrix)) { throw "Missing Pages matrix: $pagesMatrix" }
+    Copy-Item $pagesMatrix (Join-Path $stage 'Gaius-pages-matrix.json')
+}
 foreach ($profile in $Profiles) {
-    $dist = Join-Path $root "port/web/dist/$profile"
+    $layout = Get-ProfileLayout $profile
+    $dist = if ([System.IO.Path]::IsPathRooted($layout.Dist)) { $layout.Dist } else { Join-Path $root $layout.Dist }
     foreach ($name in @('Gaius.html', 'Gaius.manifest.json')) {
         $source = Join-Path $dist $name
         if (-not (Test-Path $source) -or (Get-Item $source).Length -eq 0) { throw "Missing artifact: $source" }
         $dest = if ($name -eq 'Gaius.html') { "Gaius-$profile.html" } else { "Gaius-$profile.manifest.json" }
         Copy-Item $source (Join-Path $stage $dest)
     }
-    # The multi-file GitHub Pages site (build-version-release.sh); pages.yml only deploys the
-    # site layout when all three archives are release assets listed in SHA256SUMS.
-    $site = Join-Path $root "port/target/$profile/Gaius-site-$profile.tar.gz"
+    # The multi-file GitHub Pages site (build-version-release.sh, or the release matrix); pages.yml
+    # only deploys the site layout when all three archives are release assets listed in SHA256SUMS.
+    $site = $layout.Site
     if (-not (Test-Path $site) -or (Get-Item $site).Length -eq 0) { throw "Missing artifact: $site" }
     if ((Get-Item $site).LastWriteTimeUtc -lt (Get-Item (Join-Path $dist 'Gaius.html')).LastWriteTimeUtc) {
         throw "Stale $profile site archive: $site predates its Gaius.html. Rebuild without -SkipBuild."
@@ -106,7 +163,7 @@ foreach ($profile in $Profiles) {
 }
 $plugin = Join-Path $root "apps/server-plugin/target/gaius-server-plugin-$version.jar"
 if (Test-Path $plugin) { Copy-Item $plugin (Join-Path $stage (Split-Path $plugin -Leaf)) }
-[ordered]@{ tag=$Tag; version=$version; sourceHead=$head; sourceBranch=$TargetBranch; dirty=[bool]$status; generatedAt=(Get-Date).ToUniversalTime().ToString('o'); profiles=@($Profiles); relay='runtime-configured via relay URL' } |
+[ordered]@{ tag=$Tag; version=$version; sourceHead=$head; sourceBranch=$TargetBranch; dirty=[bool]$status; generatedAt=(Get-Date).ToUniversalTime().ToString('o'); profiles=@($Profiles); relay='runtime-configured via relay URL'; releaseMatrix=$(if ($null -ne $matrix) { $matrix.commit } else { $null }) } |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $stage 'prerelease.manifest.json') -Encoding utf8
 $notesPath = Join-Path $stage 'RELEASE-NOTES.md'
 @"

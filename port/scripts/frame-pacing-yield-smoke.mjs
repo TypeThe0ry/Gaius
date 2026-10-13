@@ -7,14 +7,15 @@
 // Both profiles run the same scheduler script (the SDL shim copies BrowserGlfw's), so the
 // simulations below are shared; only the source contract differs.
 
+import {CANONICAL_PROFILE, RENDERPEARL_PROFILE} from "./verification-profiles.mjs";
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
 
 const profileIndex = process.argv.indexOf("--profile");
-const profile = profileIndex >= 0 ? process.argv[profileIndex + 1] : "26.2";
-assert.ok(profile === "26.2" || profile === "26.3", `unsupported profile ${profile}`);
-const sdl = profile === "26.3";
+const profile = profileIndex >= 0 ? process.argv[profileIndex + 1] : CANONICAL_PROFILE.id;
+assert.ok(profile === CANONICAL_PROFILE.id || profile === RENDERPEARL_PROFILE.id, `unsupported profile ${profile}`);
+const sdl = profile === RENDERPEARL_PROFILE.id;
 const sdlRoot = "../overrides/libraries/lwjgl-sdl/src/main/java/org/lwjgl/sdl/";
 const sourcePath = new URL(
   sdl ? sdlRoot + "BrowserSdlDom.java"
@@ -35,7 +36,8 @@ if (sdl) {
     "SDL_GL_SetSwapInterval does not store the interval");
   assert.match(video, /private static int swapInterval;/,
     "SDL swap interval is not retained for the asynchronous present boundary");
-  assert.match(source, /static void swapWindow\(int swapInterval\) \{\s*boolean hidden = swapBuffersJs\(\);\s*presentYield\(hidden, swapInterval\);\s*\}/,
+  // The present counter is the bookkeeping the game-loop boundary compares (loopBoundary).
+  assert.match(source, /static void swapWindow\(int swapInterval\) \{\s*presentCount\+\+;\s*boolean hidden = swapBuffersJs\(\);\s*presentYield\(hidden, swapInterval\);\s*\}/,
     "BrowserSdlDom.swapWindow is not present bookkeeping followed by the yield");
 }
 function jsBodyBefore(marker) {
@@ -53,11 +55,19 @@ function jsBodyBefore(marker) {
 
 assert.match(source, /@Async\s+private static native void yieldAfterPresent\(boolean hidden, int interval\)/,
   "swapBuffers yield is not a TeaVM async continuation boundary");
-// The present yields through presentYield: the JSPI WebAssembly GC build parks the thread on the
-// same frame-yield callback (HostLoop.jspi() is constant-folded), every other build takes the
-// TeaVM async boundary above.
+// The present yields through presentYield: the JSPI WebAssembly GC build (HostLoop.jspi() is
+// constant-folded) only records the swap interval and waits at the head of the Minecraft.run
+// loop instead (HostLoop.awaitAnimationFrame, design D4); every other build takes the TeaVM
+// async boundary above.
+// On the SDL shim a frame presented from a JavaScript callback (no TeaVM thread) skips its yield:
+// only TeaVM's refusal to suspend there is swallowed, any other failure propagates.
+const presentYieldFallback = sdl
+  ? String.raw`try \{\s*yieldAfterPresent\(hidden, interval\);\s*\} catch \(RuntimeException e\) \{\s*`
+    + String.raw`if \(!isNonThreadingSuspension\(e\)\) \{\s*throw e;\s*\}\s*recordSkippedPresentYield\(\);\s*\}`
+  : String.raw`yieldAfterPresent\(hidden, interval\);`;
 assert.match(source,
-  /private static void presentYield\(boolean hidden, int interval\) \{\s*if \(HostLoop\.jspi\(\)\) \{[^}]*\}\s*return;\s*\}\s*yieldAfterPresent\(hidden, interval\);\s*\}/,
+  new RegExp(String.raw`private static void presentYield\(boolean hidden, int interval\) \{\s*if \(HostLoop\.jspi\(\)\) \{\s*`
+    + String.raw`HostLoop\.framePresented\(hidden, interval\);\s*return;\s*\}\s*` + presentYieldFallback + String.raw`\s*\}`),
   "presentYield does not fall back to the TeaVM async yield outside the JSPI build");
 if (!sdl) {
   assert.match(source, /private static int swapInterval;/,
@@ -810,7 +820,7 @@ assert.ok(highRefreshOnePercentLow > 138,
   `cooperative 144 Hz 1% low regressed: ${highRefreshOnePercentLow.toFixed(1)} FPS`);
 
 console.log(
-  `Frame pacing yield smoke passed (${sdl ? "26.3 BrowserSdl.SDL_GL_SwapWindow" : "26.2 BrowserGlfw.swapBuffers"}):`,
+  `Frame pacing yield smoke passed (${sdl ? "" + RENDERPEARL_PROFILE.id + " BrowserSdl.SDL_GL_SwapWindow" : "" + CANONICAL_PROFILE.id + " BrowserGlfw.swapBuffers"}):`,
   `uncapped avg=${uncapped.averageFps.toFixed(1)}fps,`,
   `uncapped 1% low=${uncapped.onePercentLow.toFixed(1)}fps,`,
   `cheap uncapped 60Hz=${cheapUncapped60.toFixed(1)}fps, 144Hz=${cheapUncapped144.toFixed(1)}fps,`,
