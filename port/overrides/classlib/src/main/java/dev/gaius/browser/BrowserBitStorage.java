@@ -131,7 +131,18 @@ public final class BrowserBitStorage {
             int valuesPerLong,
             int bits);
 
-    @JSBody(params = {"packed", "output", "size", "bits", "valuesPerLong"}, script = """
+    /**
+     * Unpacks {@code size} values into {@code output} through the Wasm hot path or, failing
+     * that, the JavaScript loop. False means the caller keeps the vanilla loop.
+     */
+    public static boolean unpack(long[] packed, int[] output, int size, int bits,
+            int valuesPerLong) {
+        // The JavaScript-fallback counter is telemetry; a stripped build passes a constant false.
+        return unpackJs(packed, output, size, bits, valuesPerLong, BrowserBuildFlags.telemetry());
+    }
+
+    @JSBody(params = {"packed", "output", "size", "bits", "valuesPerLong", "countFallback"},
+            script = """
             try {
               var source = packed && packed.data ? packed.data : packed;
               var target = output && output.data ? output.data : output;
@@ -149,8 +160,10 @@ public final class BrowserBitStorage {
                 }
               }
 
-              var counters = globalThis.__gaiusMinecraftCounters || (globalThis.__gaiusMinecraftCounters = {});
-              counters.bitStorageJsUnpack = (counters.bitStorageJsUnpack || 0) + 1;
+              if (countFallback) {
+                var counters = globalThis.__gaiusMinecraftCounters || (globalThis.__gaiusMinecraftCounters = {});
+                counters.bitStorageJsUnpack = (counters.bitStorageJsUnpack || 0) + 1;
+              }
               var bitMask = BigInt.asIntN(64, (BigInt(1) << BigInt(bitCount)) - BigInt(1));
               var out = 0;
               var fullCells = Math.floor(valueCount / perLong);
@@ -181,10 +194,11 @@ public final class BrowserBitStorage {
               return false;
             }
             """)
-    public static native boolean unpack(
+    private static native boolean unpackJs(
             @JSByRef long[] packed,
             @JSByRef int[] output,
             int size,
             int bits,
-            int valuesPerLong);
+            int valuesPerLong,
+            boolean countFallback);
 }

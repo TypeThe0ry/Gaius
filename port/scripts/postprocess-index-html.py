@@ -690,6 +690,51 @@ def apply_gaius_boot_art(text: str) -> str:
     )
 
 
+GAIUS_TOUCH_CONTROLS_MARKER = 'data-gaius-touch-controls="v1"'
+GAIUS_TOUCH_VIEWPORT = (
+    '  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, '
+    'user-scalable=no, interactive-widget=resizes-visual">\n'
+)
+
+
+def apply_gaius_touch_controls(text: str) -> str:
+    """Install the touchscreen controls (port/web/launcher/touch-controls.{css,js}).
+
+    Like apply_gaius_boot_art, a self-contained style and script. The script stays inert until a
+    touch screen is used; it drives the game through window.__gaiusInput, which the GLFW and SDL
+    bridges install. Phones also need a viewport without user zoom. It deliberately stays inside the
+    safe area (no viewport-fit=cover): the canvas fills the layout viewport and would otherwise be
+    drawn under a notch or the home indicator.
+    """
+    if GAIUS_TOUCH_CONTROLS_MARKER in text:
+        return text
+    launcher = Path(__file__).resolve().parents[1] / "web" / "launcher"
+    css = (launcher / "touch-controls.css").read_text(encoding="utf-8")
+    script = (launcher / "touch-controls.js").read_text(encoding="utf-8")
+    if "</script" in script.lower() or "</style" in css.lower():
+        raise RuntimeError("touch controls must not contain closing script or style tags")
+    text, viewport_count = re.subn(
+        r'  <meta name="viewport" content="[^"]*">\n',
+        lambda _match: GAIUS_TOUCH_VIEWPORT,
+        text,
+        count=1,
+    )
+    if viewport_count != 1:
+        raise RuntimeError("index.html patch point was not found: viewport meta")
+    text = replace_required(
+        text,
+        "</head>\n",
+        "  <style " + GAIUS_TOUCH_CONTROLS_MARKER + ">\n" + css + "  </style>\n</head>\n",
+        "Gaius touch controls CSS",
+    )
+    return replace_required(
+        text,
+        "</body>\n",
+        "  <script " + GAIUS_TOUCH_CONTROLS_MARKER + ">\n" + script + "  </script>\n</body>\n",
+        "Gaius touch controls script",
+    )
+
+
 def apply_gaius_client_shell(text: str) -> str:
     """Install the stable browser-client shell without changing game contracts."""
     if GAIUS_SHELL_MARKER in text:
@@ -1003,7 +1048,38 @@ def patch_storage_persistence(text: str, profile: dict) -> str:
     if insertion < 0:
         raise RuntimeError("index.html persistence bootstrap script was not found")
     text = text[:insertion] + globals_block + text[insertion:]
-    return text
+    return patch_early_profile_id(text, profile)
+
+
+EARLY_PROFILE_MARKER = 'data-gaius-profile-early="v1"'
+EARLY_PROFILE_PATTERN = re.compile(
+    r'  <script data-gaius-profile-early="v1">\n.*?  </script>\n',
+    flags=re.DOTALL,
+)
+BOOT_SCRIPT_PREFIX = '  <script data-gaius-boot="v1"'
+
+
+def patch_early_profile_id(text: str, profile: dict) -> str:
+    """Sets window.__gaiusProfileId in <head>, before the boot script tag.
+
+    The graphics quality layer that gaius-boot.js loads (or a portable page inlines in place of
+    that tag) caps the canvas ratio by profile, and on a portable page it runs before the
+    storage globals in <body> exist. A page from an older template gets the block inserted.
+    """
+    block = (
+        f'  <script {EARLY_PROFILE_MARKER}>\n'
+        "    // The graphics quality layer the boot script loads caps the canvas ratio per profile, so the\n"
+        "    // profile id must exist before any of it runs (postprocess-index-html.py fills it in).\n"
+        f'    window.__gaiusProfileId = {json.dumps(profile["id"], ensure_ascii=True)};\n'
+        "  </script>\n"
+    )
+    text = EARLY_PROFILE_PATTERN.sub("", text)
+    head_end = text.find("</head>")
+    if head_end < 0:
+        raise RuntimeError("index.html has no </head> for the early profile id")
+    boot = text.find(BOOT_SCRIPT_PREFIX, 0, head_end)
+    insertion = boot if boot >= 0 else head_end
+    return text[:insertion] + block + text[insertion:]
 
 
 
@@ -1855,13 +1931,14 @@ def patch_index(
     )
 
     if '<link rel="icon" href="data:,">' not in text:
-        text = replace_required(
+        text, favicon_count = re.subn(
+            r'(  <meta name="viewport" content="[^"]*">\n)',
+            lambda match: match.group(1) + '  <link rel="icon" href="data:,">\n',
             text,
-            '  <meta name="viewport" content="width=device-width, initial-scale=1">\n',
-            '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
-            '  <link rel="icon" href="data:,">\n',
-            "favicon",
+            count=1,
         )
+        if favicon_count != 1:
+            raise RuntimeError("index.html patch point was not found: favicon")
 
     if "__gaiusBootTimings" not in text:
         text = replace_required(
@@ -3131,11 +3208,14 @@ def patch_index(
     text = patch_storage_persistence(text, selected_profile)
     text = apply_gaius_client_shell(text)
     text = apply_gaius_boot_art(text)
+    text = apply_gaius_touch_controls(text)
     text = patch_release_version(text)
     text = patch_shader_toolchain_loader(text, classes_js, index, minecraft_version)
 
-    if text != original:
-        index.write_text(text, encoding="utf-8")
+    # A page an earlier run wrote with CRLF (Windows newline translation) is rewritten as LF:
+    # the Pages and portable builders match its tags byte-for-byte.
+    if text != original or b"\r\n" in index.read_bytes():
+        index.write_text(text, encoding="utf-8", newline="\n")
         return True
     return False
 

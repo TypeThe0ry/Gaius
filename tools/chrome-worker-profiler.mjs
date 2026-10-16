@@ -1,6 +1,7 @@
 import {mkdir, writeFile} from 'node:fs/promises';
 import {dirname} from 'node:path';
 import {installMacrotaskDiagnostic} from './worker-macrotask-diagnostic.mjs';
+import {RUNTIME_GUARD_EXPRESSION} from './teavm-runtime-guards.mjs';
 
 // Diagnostic runs only: profiling overhead must not certify latency targets.
 export async function startWorkerProfiler(cdp, outputPrefix, {
@@ -104,7 +105,8 @@ export async function startWorkerProfiler(cdp, outputPrefix, {
         try {
           const snapshot = await command(entry, 'Runtime.evaluate', {
             expression: 'JSON.stringify({network:globalThis.__gaiusNetworkStats||null,'
-              + 'worldgen:globalThis.__gaiusWorldgenStats||null})',
+              + 'worldgen:globalThis.__gaiusWorldgenStats||null,'
+              + `runtimeGuards:${RUNTIME_GUARD_EXPRESSION}})`,
             returnByValue: true,
           });
           entry.globals = JSON.parse(snapshot.result.value);

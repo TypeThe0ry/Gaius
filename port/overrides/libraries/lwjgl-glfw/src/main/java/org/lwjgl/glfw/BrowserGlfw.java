@@ -658,40 +658,36 @@ public final class BrowserGlfw {
               // Mixing scheduler.yield() into every fourth present makes Chromium defer that
               // continuation behind compositor arbitration, producing a stable 3:1 cadence
               // and periodic multi-refresh frame bubbles on high-refresh displays.
-              // Cheap frames (the title screen draws one in about 1.5 ms) would otherwise run
-              // at hundreds of FPS back to back and starve the compositor: the page showed
-              // 5-14 FPS while the game presented 650. Uncapped frames therefore run at most
-              // three presents per display refresh in a world and one in menus (no level, the
-              // vanilla menu limit); the last one waits for rAF. In a world, frames that take
-              // half a refresh or longer are never held.
-              let pacer=root.__gaiusUncappedPresentPacer;
-              if (!pacer || !Array.isArray(pacer.waiters)) {
-                pacer={presents:0,rafPending:false,waiters:[]};
-                root.__gaiusUncappedPresentPacer=pacer;
-              }
-              const canPace=typeof requestAnimationFrame==='function';
-              if (canPace && !pacer.rafPending) {
-                pacer.rafPending=true;
-                requestAnimationFrame(() => {
-                  pacer.rafPending=false;
-                  pacer.presents=0;
-                  const waiters=pacer.waiters;
-                  pacer.waiters=[];
-                  for (let index=0; index<waiters.length; index++) waiters[index]();
-                });
-              }
+              // Menus (no level): the title screen draws a frame in about 1.5 ms, so uncapped
+              // presents ran at hundreds of FPS back to back and starved the compositor (the
+              // page showed 5-14 FPS while the game presented 650). In menus each present waits
+              // for the next rAF, the vanilla menu limit. In a world presents stay uncapped:
+              // BrowserRenderScheduler compiles and uploads terrain sections on a per-frame
+              // budget, so holding world frames would slow chunk rendering.
               const state=root.__gaiusMinecraftState;
-              const presentsPerRefresh=state && state.level ? 3 : 1;
-              pacer.presents++;
-              if (canPace && pacer.presents>=presentsPerRefresh) {
+              if (state && state.level || typeof requestAnimationFrame!=='function') {
+                postTask();
+              } else {
+                let pacer=root.__gaiusUncappedPresentPacer;
+                if (!pacer || !Array.isArray(pacer.waiters)) {
+                  pacer={rafPending:false,waiters:[]};
+                  root.__gaiusUncappedPresentPacer=pacer;
+                }
                 if (telemetryEnabled) {
                   telemetry.uncappedRafWaitCount=(Number(telemetry.uncappedRafWaitCount)||0)+1;
                 }
                 pacer.waiters.push(() => {
                   if (!resumed) postTask();
                 });
-              } else {
-                postTask();
+                if (!pacer.rafPending) {
+                  pacer.rafPending=true;
+                  requestAnimationFrame(() => {
+                    pacer.rafPending=false;
+                    const waiters=pacer.waiters;
+                    pacer.waiters=[];
+                    for (let index=0; index<waiters.length; index++) waiters[index]();
+                  });
+                }
               }
             }
             """)
@@ -872,9 +868,12 @@ public final class BrowserGlfw {
               window.__gaiusPointerLockErrors.push({message: message, at: Date.now()});
               if (window.__gaiusPointerLockErrors.length > 20) window.__gaiusPointerLockErrors.shift();
             };
+            // Touch controls drive the disabled cursor through window.__gaiusInput.look()
+            // (a virtual pointer lock), so a real lock is never requested while they are active.
             const requestPointerLockIfWanted = () => {
               const c = canvas();
-              if (!window.__gaiusWantPointerLock || !c || !c.requestPointerLock || document.pointerLockElement === c) {
+              if (!window.__gaiusWantPointerLock || window.__gaiusTouchActive || !c || !c.requestPointerLock ||
+                  document.pointerLockElement === c) {
                 return;
               }
               try {
@@ -1024,8 +1023,23 @@ public final class BrowserGlfw {
               const forcedPixelRatio = urlNumber('pixelRatio');
               if (forcedPixelRatio > 0) return clamp(forcedPixelRatio, 0.2, 3.0);
               const urlMax = urlNumber('maxDpr');
-              const maxDpr = urlMax > 0 ? urlMax : (Number(window.__gaiusMaxDpr) || 1.0);
               const raw = Number(devicePixelRatio) || 1.0;
+              let maxDpr = urlMax > 0 ? urlMax : (Number(window.__gaiusMaxDpr) || 1.0);
+              // The quality runtime caps the ratio per GPU tier. The launcher's frame-rate
+              // governor still applies once it has stepped __gaiusMaxDpr below its default.
+              const quality = window.GaiusQuality ? window.GaiusQuality.runtime : null;
+              if (!(urlMax > 0) && quality && typeof quality.resolvePixelRatio === 'function') {
+                let tierMax = NaN;
+                try {
+                  tierMax = Number(quality.resolvePixelRatio(raw));
+                } catch (ignored) {
+                  tierMax = NaN;
+                }
+                if (tierMax > 0) {
+                  const governed = Number(window.__gaiusMaxDpr) < (Number(window.__gaiusDefaultMaxDpr) || 0);
+                  maxDpr = governed ? Math.min(tierMax, Number(window.__gaiusMaxDpr)) : tierMax;
+                }
+              }
               return clamp(Math.min(raw, maxDpr), minDpr, 3.0);
             };
             window.__gaiusApplyCanvasResolution = (width, height, emitEvent) => {
@@ -1069,6 +1083,85 @@ public final class BrowserGlfw {
               const key=codeMap[e.code]===undefined?-1:codeMap[e.code]; window.__gaiusGlfwKeys[key]=false;
               pushEvent([1,key,e.keyCode,0,mods(e),0,0]);
             });
+            // Direct input for the launcher's touch controls (touch-controls.js). Positions are
+            // CSS pixels relative to #mc-canvas like the mouse listeners below, and buttons use
+            // GLFW numbers (0 left, 1 right, 2 middle). Nothing here focuses the canvas or asks
+            // for fullscreen or pointer lock, so a focused text field keeps the virtual keyboard
+            // open. look() moves the cursor relatively; with the cursor disabled the MouseHandler
+            // turns position differences into camera rotation, so no pointer lock is needed.
+            const injected = {keys: Object.create(null), buttons: Object.create(null), mods: 0};
+            const injectedModBits = {
+              ShiftLeft:1,ShiftRight:1,ControlLeft:2,ControlRight:2,AltLeft:4,AltRight:4,MetaLeft:8,MetaRight:8
+            };
+            const legacyKeyCodes = {
+              Escape:27,Enter:13,Backspace:8,Tab:9,Delete:46,ShiftLeft:16,ShiftRight:16,ControlLeft:17,
+              ControlRight:17,AltLeft:18,AltRight:18,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,F5:116
+            };
+            const pushInjectedMove = () => {
+              pushMouseMove([4,0,0,0,0,window.__gaiusCursorX||0,window.__gaiusCursorY||0]);
+            };
+            const injectKey = (code, down) => {
+              const key = codeMap[code];
+              if (key === undefined || !!injected.keys[code] === !!down) return false;
+              const bit = injectedModBits[code] | 0;
+              if (bit) injected.mods = down ? (injected.mods | bit) : (injected.mods & ~bit);
+              injected.keys[code] = !!down;
+              window.__gaiusGlfwKeys[key] = !!down;
+              const legacy = legacyKeyCodes[code] || ((key >= 48 && key <= 90) || key === 32 ? key : 0);
+              pushEvent([1,key,legacy,down?1:0,injected.mods,0,0]);
+              return true;
+            };
+            const injectButton = (button, down) => {
+              const b = button | 0;
+              if (b < 0 || b > 7 || !!injected.buttons[b] === !!down) return false;
+              injected.buttons[b] = !!down;
+              window.__gaiusGlfwButtons[b] = !!down;
+              pushEvent([3,b,down?1:0,injected.mods,0,window.__gaiusCursorX||0,window.__gaiusCursorY||0]);
+              return true;
+            };
+            window.__gaiusInput = {
+              backend: 'glfw',
+              pointer: (x, y) => {
+                window.__gaiusCursorX = +x || 0;
+                window.__gaiusCursorY = +y || 0;
+                pushInjectedMove();
+              },
+              look: (dx, dy) => {
+                window.__gaiusCursorX = (window.__gaiusCursorX || 0) + (+dx || 0);
+                window.__gaiusCursorY = (window.__gaiusCursorY || 0) + (+dy || 0);
+                pushInjectedMove();
+              },
+              button: injectButton,
+              key: injectKey,
+              text: value => {
+                const text = value == null ? '' : String(value);
+                let count = 0;
+                for (let i = 0; i < text.length; i++) {
+                  const codePoint = text.codePointAt(i);
+                  if (codePoint > 0xFFFF) i++;
+                  if (codePoint < 32 || codePoint === 127) continue;
+                  pushEvent([2,codePoint,0,0,0,0,0]);
+                  count++;
+                }
+                return count > 0;
+              },
+              // Wheel steps, positive away from the user (GLFW yoffset).
+              wheel: (dx, dy) => {
+                pushEvent([5,0,0,0,0,+dx||0,+dy||0]);
+              },
+              releaseAll: () => {
+                Object.keys(injected.keys).forEach(code => { if (injected.keys[code]) injectKey(code, false); });
+                Object.keys(injected.buttons).forEach(b => { if (injected.buttons[b]) injectButton(b | 0, false); });
+              },
+              state: () => {
+                return {
+                  backend: 'glfw',
+                  wantPointerLock: !!window.__gaiusWantPointerLock,
+                  textInput: null,
+                  textInputArea: null
+                };
+              }
+            };
             addEventListener('mousedown', e => {
               const c = canvas();
               if (c) c.focus();
@@ -1121,7 +1214,10 @@ public final class BrowserGlfw {
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
             } else {
-              const pixelRatio=Math.min(devicePixelRatio||1,1);
+              const quality=window.GaiusQuality?window.GaiusQuality.runtime:null;
+              const pixelRatio=quality&&typeof quality.resolvePixelRatio==='function'
+                ?(Number(quality.resolvePixelRatio(devicePixelRatio||1))||1)
+                :Math.min(devicePixelRatio||1,1);
               canvasElement.style.width=width+'px'; canvasElement.style.height=height+'px';
               canvasElement.width=Math.max(1,Math.round(width*pixelRatio));
               canvasElement.height=Math.max(1,Math.round(height*pixelRatio));
@@ -1142,6 +1238,15 @@ public final class BrowserGlfw {
               preserveDrawingBuffer: preserveDrawingBuffer
             });
             if (!window.__gaiusWebGL) throw new Error('WebGL 2 is required');
+            // Lets the quality runtime enable its extensions on the game context before
+            // the first frame instead of attaching lazily.
+            if (window.GaiusQuality && window.GaiusQuality.runtime) {
+              try {
+                window.GaiusQuality.runtime.onContext(window.__gaiusWebGL);
+              } catch (ignored) {
+                // The runtime reports its own failures; the context stays usable.
+              }
+            }
             """)
     private static native void createCanvas(int width, int height, String title);
 
@@ -1153,7 +1258,10 @@ public final class BrowserGlfw {
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
             } else {
-              const pixelRatio=Math.min(devicePixelRatio||1,1);
+              const quality=window.GaiusQuality?window.GaiusQuality.runtime:null;
+              const pixelRatio=quality&&typeof quality.resolvePixelRatio==='function'
+                ?(Number(quality.resolvePixelRatio(devicePixelRatio||1))||1)
+                :Math.min(devicePixelRatio||1,1);
               canvasElement.style.width=width+'px'; canvasElement.style.height=height+'px';
               canvasElement.width=Math.max(1,Math.round(width*pixelRatio));
               canvasElement.height=Math.max(1,Math.round(height*pixelRatio));
@@ -1330,8 +1438,12 @@ public final class BrowserGlfw {
               const canvasElement=document.getElementById('mc-canvas');
               if (value===0x00034003) {
                 window.__gaiusWantPointerLock = true;
-              } else if (document.exitPointerLock) {
+              } else {
+                // Cleared even without the Pointer Lock API: the touch controls read this
+                // flag to tell gameplay from GUI screens.
                 window.__gaiusWantPointerLock = false;
+              }
+              if (value!==0x00034003 && document.exitPointerLock) {
                 try {
                   const exitResult = document.exitPointerLock();
                   if (exitResult && exitResult.catch) exitResult.catch(() => {});

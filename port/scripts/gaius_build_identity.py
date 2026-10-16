@@ -28,9 +28,17 @@ WORLDGEN_TELEMETRY_MODES = frozenset(("task-pulsed", "checkpoint-only"))
 
 SOURCE_DIRECTORIES = (
     "port/src/main",
+    # Profile source sets (generate-pom.sh stages them over port/src/main/java).
+    "port/src/versions",
     "port/overrides",
     "port/tools/src/main",
     "port/wasm/hotpath",
+    # The v0.4 page runtime every distribution ships next to (or inlined into) the launcher:
+    # boot script, Service Worker, kernel runtime/worker/job codecs and the quality layer.
+    "port/web/boot",
+    "port/web/sw",
+    "port/web/kernels",
+    "port/web/runtime",
 )
 SOURCE_FILES = (
     "VERSION",
@@ -51,6 +59,10 @@ SOURCE_FILES = (
     "port/scripts/postprocess-teavm-js.py",
     "port/scripts/postprocess-index-html.py",
     "port/web/launcher/index.template.html",
+    "port/web/launcher/boot-art.css",
+    "port/web/launcher/boot-art.js",
+    "port/web/launcher/touch-controls.css",
+    "port/web/launcher/touch-controls.js",
     "port/scripts/build-vanilla-assets-pack.py",
     "port/scripts/build-wasm-hotpath.sh",
     "port/scripts/generate-wasm-hotpath.py",

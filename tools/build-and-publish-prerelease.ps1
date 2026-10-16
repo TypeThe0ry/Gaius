@@ -95,6 +95,14 @@ foreach ($profile in $Profiles) {
         $dest = if ($name -eq 'Gaius.html') { "Gaius-$profile.html" } else { "Gaius-$profile.manifest.json" }
         Copy-Item $source (Join-Path $stage $dest)
     }
+    # The multi-file GitHub Pages site (build-version-release.sh); pages.yml only deploys the
+    # site layout when all three archives are release assets listed in SHA256SUMS.
+    $site = Join-Path $root "port/target/$profile/Gaius-site-$profile.tar.gz"
+    if (-not (Test-Path $site) -or (Get-Item $site).Length -eq 0) { throw "Missing artifact: $site" }
+    if ((Get-Item $site).LastWriteTimeUtc -lt (Get-Item (Join-Path $dist 'Gaius.html')).LastWriteTimeUtc) {
+        throw "Stale $profile site archive: $site predates its Gaius.html. Rebuild without -SkipBuild."
+    }
+    Copy-Item $site (Join-Path $stage "Gaius-site-$profile.tar.gz")
 }
 $plugin = Join-Path $root "apps/server-plugin/target/gaius-server-plugin-$version.jar"
 if (Test-Path $plugin) { Copy-Item $plugin (Join-Path $stage (Split-Path $plugin -Leaf)) }

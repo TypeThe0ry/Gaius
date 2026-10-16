@@ -211,7 +211,8 @@ verify_worker_release_profile() {
 
 generate_client_release_pom() {
   client_pom="$build_root/release-generated-pom.xml"
-  GAIUS_POM="$client_pom" \
+  GAIUS_TEAVM_ROLE=client \
+    GAIUS_POM="$client_pom" \
     GAIUS_TARGET_DIRECTORY="$dist" \
     GAIUS_TARGET_FILE="${GAIUS_TARGET_FILE:-classes.js}" \
     GAIUS_RESOURCE_DIRECTORY="$build_root/generated-resources" \
@@ -227,6 +228,18 @@ export GAIUS_DEBUG_INFO="${GAIUS_DEBUG_INFO:-false}"
 export GAIUS_MINIFYING="${GAIUS_MINIFYING:-true}"
 export GAIUS_SHORT_FILE_NAMES="${GAIUS_SHORT_FILE_NAMES:-true}"
 export GAIUS_ASSERTIONS_REMOVED="${GAIUS_ASSERTIONS_REMOVED:-true}"
+# Releases drop the gaius-telemetry platform tag for both roles, so code
+# guarded by @PlatformMarker("gaius-telemetry") compiles to constant false and
+# its telemetry-only @JSBody calls leave the hot paths (generate-pom.sh role
+# table).  GAIUS_TEAVM_STRIP_TELEMETRY=false keeps them for a profiling build.
+export GAIUS_TEAVM_STRIP_TELEMETRY="${GAIUS_TEAVM_STRIP_TELEMETRY:-true}"
+case "$GAIUS_TEAVM_STRIP_TELEMETRY" in
+  true|false) ;;
+  *)
+    echo "Invalid GAIUS_TEAVM_STRIP_TELEMETRY: $GAIUS_TEAVM_STRIP_TELEMETRY (expected true or false)" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$GAIUS_TEA_OPTIMIZATION_LEVEL" != "ADVANCED" \
       && "$GAIUS_TEA_OPTIMIZATION_LEVEL" != "FULL" ]] \
@@ -268,6 +281,8 @@ if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
   fi
   grep -aFq 'gaius-java-finite-long-cast' "$client_js" \
     || { echo "Cannot resume release: finite-long postprocess marker is missing" >&2; exit 1; }
+  grep -aFq 'gaius-module-thread-slot' "$client_js" \
+    || { echo "Cannot resume release: module-level thread slot postprocess marker is missing" >&2; exit 1; }
   grep -aFq 'target-attestation' "$client_js" \
     || { echo "Cannot resume release: Relay target-attestation guard is missing" >&2; exit 1; }
   node --check "$client_js"
@@ -339,7 +354,8 @@ else
   fi
   server_pom="$build_root/server-worker/release-generated-pom.xml"
   if [[ ! -f "$server_pom" ]]; then
-    GAIUS_POM="$server_pom" \
+    GAIUS_TEAVM_ROLE=singleplayer-worker \
+      GAIUS_POM="$server_pom" \
       GAIUS_TARGET_DIRECTORY="$dist" \
       GAIUS_TARGET_FILE="singleplayer-server.js" \
       GAIUS_RESOURCE_DIRECTORY="$build_root/server-worker/generated-resources" \

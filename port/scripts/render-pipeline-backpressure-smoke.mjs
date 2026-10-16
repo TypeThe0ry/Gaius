@@ -79,8 +79,9 @@ function javaTool(name) {
 }
 
 for (const contract of [
-  "MAX_UPLOAD_ALLOCATIONS_PER_FRAME = 8",
-  "UPLOAD_WORK_BUDGET_NANOS = 2_000_000L",
+  "int maxUploadAllocationsPerFrame,",
+  "long uploadWorkNanos,",
+  "long uploadBytesPerFrame,",
   "MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME = 8",
   "UBER_NODE_CLEANUP_BUDGET_NANOS = 250_000L",
   "MAX_UPLOAD_RETRY_YIELDS = 2_048",
@@ -114,7 +115,8 @@ for (const contract of [
   "currentUploadDrainCount",
   "uploadBudgetExhaustions",
   "dispatcherUploadDeferrals",
-  "Window.cancelAnimationFrame",
+  "FRAME_WATCHDOG_MILLIS = 50",
+  "TModernRuntimeSupport.yieldToEventLoop(0)",
   "longestTaskMillis",
 ]) {
   assert.ok(scheduler.includes(contract), `missing render scheduler contract: ${contract}`);
@@ -272,19 +274,24 @@ try {
     "lambda$new$0 must construct exactly one vertex and one index UberGpuBuffer");
   const vertexCall = heapConstructors[0].index;
   const indexCall = heapConstructors[1].index;
-  assert.match(heapInstructions[vertexCall - 10]?.instruction || "", /new\s+.*UberGpuBuffer/,
+  assert.match(heapInstructions[vertexCall - 11]?.instruction || "", /new\s+.*UberGpuBuffer/,
     "vertex heap constructor allocation moved");
-  assert.equal(heapInstructions[vertexCall - 9]?.instruction, "dup",
+  assert.equal(heapInstructions[vertexCall - 10]?.instruction, "dup",
     "vertex heap constructor DUP moved");
-  assert.match(heapInstructions[vertexCall - 7]?.instruction || "", /ChunkSectionLayer\.label/,
+  assert.match(heapInstructions[vertexCall - 8]?.instruction || "", /ChunkSectionLayer\.label/,
     "vertex heap label argument changed");
-  assert.match(heapInstructions[vertexCall - 6]?.instruction || "", /^bipush\s+32$/,
+  assert.match(heapInstructions[vertexCall - 7]?.instruction || "", /^bipush\s+32$/,
     "vertex heap usage must remain 32");
-  assert.match(heapInstructions[vertexCall - 5]?.instruction || "",
+  assert.match(heapInstructions[vertexCall - 6]?.instruction || "",
     /^ldc(?:_w)?\s+.*\/\/ int 16777216\b/,
     "vertex UberGpuBuffer heap is not 16 MiB");
-  assert.match(heapInstructions[vertexCall - 3]?.instruction || "", /VertexFormat\.getVertexSize/,
+  assert.match(heapInstructions[vertexCall - 4]?.instruction || "", /VertexFormat\.getVertexSize/,
     "vertex heap stride no longer comes from VertexFormat.getVertexSize");
+  // v0.4: the stride is rounded to a 4-vertex alignment so every section base vertex is a
+  // multiple of 4 (shared quad index buffer); gaiusTerrainAlign=0 keeps the vanilla stride.
+  assert.match(heapInstructions[vertexCall - 3]?.instruction || "",
+    /BrowserTerrainBatch\.vertexHeapAlignment:\(I\)I/,
+    "vertex heap stride is not wrapped in BrowserTerrainBatch.vertexHeapAlignment");
   assert.match(heapInstructions[vertexCall - 1]?.instruction || "", /Field stagingBuffer:/,
     "vertex heap no longer uses the dispatcher staging buffer");
 
@@ -573,6 +580,15 @@ public final class Platform {
     public static void schedule(Runnable command, int timeout) { command.run(); }
 }
 `],
+    ["dev/gaius/browser/render/BrowserMeshInstallQueue.java", String.raw`
+package dev.gaius.browser.render;
+public final class BrowserMeshInstallQueue {
+    private BrowserMeshInstallQueue() {}
+    public static int inFlight() { return 0; }
+    public static int readyCount() { return 0; }
+    public static long drain(long byteBudget, long deadlineNanos) { return 0L; }
+}
+`],
     ["dev/gaius/browser/BrowserRenderSchedulerRetryRegression.java", String.raw`
 package dev.gaius.browser;
 
@@ -689,6 +705,11 @@ public final class BrowserRenderSchedulerUberCleanupRegression {
         Field scanLimitField = scheduler.getDeclaredField("MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME");
         scanLimitField.setAccessible(true);
         int scanLimit = scanLimitField.getInt(null);
+        // beginFrame reads the per-frame Budget, whose profile probe is a @JSBody native;
+        // pin the normal profile so the JVM harness never calls it.
+        Field fastProfileInitialized = scheduler.getDeclaredField("fastProfileInitialized");
+        fastProfileInitialized.setAccessible(true);
+        fastProfileInitialized.setBoolean(null, true);
 
         Method beginFrame = scheduler.getDeclaredMethod("beginFrame");
         Method begin = scheduler.getDeclaredMethod(

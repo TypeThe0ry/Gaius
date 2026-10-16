@@ -123,9 +123,16 @@ export function assertTerrain263(rawJavapClass) {
   assert.match(instructions(render)[0].text, /BrowserRenderScheduler\.beginFrame/,
     "GameRenderer.render must open the browser frame budget first");
   const renderCode = instructions(render);
-  const skip = indexOfInstruction(renderCode, "shouldSkipWorldRenderForScreen");
+  // v0.4: QualityPatches263 routes the MinecraftClientPatcher throttle through the quality
+  // runtime (reduced-rate world refresh behind inventory screens) and records rendered frames.
+  assert.equal(indexOfInstruction(renderCode, "shouldSkipWorldRenderForScreen"), -1,
+    "26.3 inventory throttle still calls BrowserOpenGL.shouldSkipWorldRenderForScreen");
+  const skip = indexOfInstruction(renderCode,
+    "BrowserQualityFrame.shouldSkipWorldRender:(Ljava/lang/Object;)Z");
   const renderLevel = indexOfInstruction(renderCode, "Method renderLevel:()V");
   assert.ok(skip >= 0 && renderLevel > skip, "inventory world-render throttle missing");
+  assert.ok(indexOfInstruction(renderCode, "BrowserQualityFrame.worldFrameDone:(III)V") > renderLevel,
+    "inventory throttle frame snapshot (worldFrameDone) missing after renderLevel");
   assert.equal(renderCode[skip + 2].text, "aload_1",
     "throttle skip path must pop the local-1 profiler");
   assert.match(renderCode[skip + 3].text, /ProfilerFiller\.pop/);

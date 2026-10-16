@@ -50,7 +50,9 @@ STALE_ENTRIES = (
 STALE_PREFIXES = ("com/mojang/blaze3d/opengl/", "com/mojang/blaze3d/vulkan/")
 
 # Every class a P3 patch writes (MinecraftClientPatcher, Minecraft262BrowserPatcher,
-# RenderPatches263) plus the LWJGL 3.4.3 entry points; the JVM verifier links each of them.
+# RenderPatches263 and its QualityPatches263 hooks) plus the LWJGL 3.4.3 entry points; the JVM
+# verifier links each of them.  Minecraft is not listed: earlier client patches write some of its
+# methods without stack map frames (TeaVM does not need them), so only its bytecode is asserted.
 VERIFIED_CLASSES = (
     "net/minecraft/client/PreferredGraphicsApi",
     "net/minecraft/client/ClientBootstrap",
@@ -62,6 +64,8 @@ VERIFIED_CLASSES = (
     "net/minecraft/client/renderer/texture/TextureAtlas",
     "net/minecraft/client/renderer/texture/SpriteContents",
     "net/minecraft/client/renderer/GameRenderer",
+    "net/minecraft/client/renderer/LevelRenderer",
+    "net/minecraft/client/Options",
     "net/minecraft/client/gui/screens/options/VideoSettingsScreen",
     f"{GL}/GlHeuristics",
     "net/minecraft/client/gui/components/debug/DebugEntrySystemSpecs",
@@ -274,6 +278,9 @@ def run(overlay_dir: Path, overlay_262_dir: Path | None = None,
         "com/mojang/blaze3d/vertex/BufferBuilder",
         "net/minecraft/client/renderer/texture/TextureAtlas",
         "net/minecraft/client/renderer/GameRenderer",
+        "net/minecraft/client/renderer/LevelRenderer",
+        "net/minecraft/client/Minecraft",
+        "net/minecraft/client/Options",
         "net/minecraft/client/gui/screens/options/VideoSettingsScreen",
         f"{GL}/GlHeuristics",
         "net/minecraft/client/gui/components/debug/DebugEntrySystemSpecs",
@@ -366,16 +373,83 @@ def run(overlay_dir: Path, overlay_262_dir: Path | None = None,
                     + re.escape(f"{RP}/api/buffers/GpuBuffer.close:()V"), prepare) is not None
           and "com/mojang/blaze3d/buffers/GpuBuffer" not in atlas)
 
-    # OIT off.
-    improved = method_section(
-        classes.text("net/minecraft/client/renderer/GameRenderer"), " useImprovedTransparency()")
-    check("GameRenderer.useImprovedTransparency returns false",
-          re.search(r"0: iconst_0\s*\n\s*1: ireturn", improved) is not None)
-    quality = method_section(
-        classes.text("net/minecraft/client/gui/screens/options/VideoSettingsScreen"),
-        " qualityOptions(")
-    check("VideoSettingsScreen no longer offers improved transparency",
-          "Options.improvedTransparency" not in quality and "Options.biomeBlendRadius" in quality)
+    # Improved Transparency by capability and tier (QualityPatches263
+    # .patchImprovedTransparencyByTier): the vanilla bodies stay under gaius$vanilla* names and
+    # the public methods filter them.
+    game_renderer = classes.text("net/minecraft/client/renderer/GameRenderer")
+    quality_frame = "dev/gaius/browser/quality/BrowserQualityFrame"
+    improved = method_section(game_renderer, " useImprovedTransparency()")
+    vanilla_improved = method_section(game_renderer, " gaius$vanillaUseImprovedTransparency()")
+    check("GameRenderer.useImprovedTransparency filters the vanilla value by GPU capability",
+          "Method gaius$vanillaUseImprovedTransparency:()Z" in improved
+          and "dev/gaius/browser/quality/BrowserQualityCaps.filterImprovedTransparency:(Z)Z"
+          in improved
+          and vanilla_improved.lstrip().startswith("private ")
+          and "improvedTransparency:Z" in vanilla_improved)
+    video = classes.text("net/minecraft/client/gui/screens/options/VideoSettingsScreen")
+    quality = method_section(video, " qualityOptions(")
+    vanilla_quality = method_section(video, " gaius$vanillaQualityOptions(")
+    # The public method passes the vanilla array and the Improved Transparency option (the one
+    # entry the filter may drop) to BrowserQualityOptions.filterQualityOptions.
+    vanilla_at = quality.find("Method gaius$vanillaQualityOptions:")
+    option_at = quality.find("Options.improvedTransparency:")
+    filter_at = quality.find(
+        "dev/gaius/browser/quality/BrowserQualityOptions.filterQualityOptions:")
+    check("VideoSettingsScreen offers improved transparency only through the capability filter",
+          0 <= vanilla_at < option_at < filter_at
+          and quality.count("Options.improvedTransparency:") == 1
+          and "Options.improvedTransparency" in vanilla_quality
+          and "Options.biomeBlendRadius" in vanilla_quality)
+
+    # World render scale and post chain hooks (QualityPatches263.patchLevelQualityHooks).
+    create_pass = method_section(classes.text(f"{GL}/GlCommandEncoder"), " createRenderPass(")
+    viewport_width_at = create_pass.find(f"{quality_frame}.levelViewportWidth:(I)I")
+    viewport_height_at = create_pass.find(f"{quality_frame}.levelViewportHeight:(I)I")
+    check("GlCommandEncoder.createRenderPass passes its viewport through the level render scale",
+          0 <= viewport_width_at < viewport_height_at)
+    render_level = method_section(game_renderer, " renderLevel()")
+    begin_at = render_level.find(f"{quality_frame}.beginLevel:(IIZ)V")
+    level_render_at = render_level.find("net/minecraft/client/renderer/LevelRenderer.render:(")
+    end_at = render_level.find(f"{quality_frame}.endLevel:(IIILjava/lang/Object;)V")
+    # beginLevel keeps the frame at full resolution for improved transparency or entity outlines
+    # (the entity_outline post chain samples full main-target-sized textures).
+    outline_flag_at = render_level.find(
+        "net/minecraft/client/renderer/state/level/LevelRenderState.shouldShowEntityOutlines:Z")
+    check("GameRenderer.renderLevel brackets LevelRenderer.render with beginLevel/endLevel",
+          0 <= outline_flag_at < begin_at < level_render_at < end_at
+          and "Method useImprovedTransparency:()Z" in render_level[:begin_at]
+          and render_level.count(f"{quality_frame}.beginLevel:") == 1
+          and render_level.count(f"{quality_frame}.endLevel:") == 1
+          and "LevelRenderer.gaius$entityOutlineTextureId:()I" in render_level)
+    outline = method_section(classes.text("net/minecraft/client/renderer/LevelRenderer"),
+                             " gaius$entityOutlineTextureId()")
+    check("LevelRenderer.gaius$entityOutlineTextureId()I exists",
+          "public int gaius$entityOutlineTextureId()" in outline
+          and "currentFrameRendersEntityOutline:Z" in outline)
+
+    # Inventory world throttle (QualityPatches263.patchInventoryWorldRenderThrottle).
+    render = method_section(game_renderer, " render()")
+    skip_at = render.find(f"{quality_frame}.shouldSkipWorldRender:(Ljava/lang/Object;)Z")
+    render_level_call = render.find("Method renderLevel:()V")
+    done_at = render.find(f"{quality_frame}.worldFrameDone:(III)V")
+    check("GameRenderer.render throttles inventory screens through the quality hooks",
+          0 <= skip_at < render_level_call < done_at
+          and render.count(f"{quality_frame}.shouldSkipWorldRender:") == 1
+          and render.count(f"{quality_frame}.worldFrameDone:") == 1
+          and "shouldSkipWorldRenderForScreen" not in render)
+
+    # Graphics preset startup replay (Minecraft262BrowserPatcher
+    # .patchGraphicsPresetStartupReplay, shared with 26.2).
+    minecraft_init = method_section(
+        classes.text("net/minecraft/client/Minecraft"),
+        "net.minecraft.client.Minecraft(net.minecraft.client.main.GameConfig)")
+    startup = method_section(classes.text("net/minecraft/client/Options"),
+                             " gaius$applyStartupGraphicsPreset(")
+    check("Minecraft.<init> replays the graphics preset only through the startup gate",
+          minecraft_init.count("Options.gaius$applyStartupGraphicsPreset:") == 1
+          and "Options.applyGraphicsPreset:" not in minecraft_init
+          and "BrowserQualityOptions.replayGraphicsPresetAtStartup:()Z" in startup
+          and "Method applyGraphicsPreset:" in startup)
 
     # Wireframe stays available (vanilla iconst_1): glPolygonMode is a browser no-op and the two
     # optional wireframe pipelines are only used behind the dev-only F3+W toggle; reporting the

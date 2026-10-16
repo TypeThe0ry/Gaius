@@ -122,6 +122,10 @@ LC_ALL=C sort -u -o "$server_resource_list_tmp" "$server_resource_list_tmp"
 mv "$server_resource_list_tmp" "$server_resource_list"
 assert_java_sorted_resource_list "$server_resource_list"
 export GAIUS_POM="$server_target/generated-pom.xml"
+# The Worker role's TeaVM compiler options come from the role table in
+# generate-pom.sh (POM <properties>); GAIUS_TEAVM_WORKER_<OPTION> overrides one
+# of them for the Worker only.
+export GAIUS_TEAVM_ROLE="singleplayer-worker"
 export GAIUS_MAIN_CLASS="dev.gaius.browser.BrowserIntegratedServerMain"
 export GAIUS_TARGET_DIRECTORY="$staged_dist"
 export GAIUS_TARGET_FILE="singleplayer-server.js"
@@ -146,9 +150,10 @@ echo "POM: $pom"
 echo "Log: $log"
 
 set +e
-# gaius.teavm.syncClinits: class initialization edges do not make callers TeaVM-async in
-# the Worker (TeaVMCoreBrowserPatcher; the runtime skips yields inside class initializers).
-MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500} -Dgaius.teavm.syncClinits=true" \
+# MAVEN_OPTS only sizes the compiler JVM.  The Worker's TeaVM options
+# (syncClinits and the rest of the role table) are POM <properties>; a
+# leftover gaius.teavm JVM system property fails the build.
+MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}" \
   "$root/port/mvnw" \
   --batch-mode \
   --errors \

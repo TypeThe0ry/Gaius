@@ -50,9 +50,13 @@ function balancedMethod(source, start) {
 const production = await readFile(runtimeSupport, 'utf8');
 const asyncStart = production.indexOf('    /**\n     * Suspends only the current TeaVM continuation');
 assert.ok(asyncStart >= 0, 'real yieldToEventLoop Javadoc not found');
-const asyncMethod = production.slice(asyncStart,
-  production.indexOf('\n\n    private static void yieldToEventLoop', asyncStart));
-const callbackStart = production.indexOf('    private static void yieldToEventLoop', asyncStart);
+// yieldToEventLoop, inClassInitializer and the @Async suspendToEventLoop declaration, then the
+// callback overload that TeaVM runs for it.
+const callbackAnchor = '\n\n    private static void suspendToEventLoop(int delayMillis, AsyncCallback<Void> callback)';
+const callbackAt = production.indexOf(callbackAnchor, asyncStart);
+assert.ok(callbackAt >= 0, 'real suspendToEventLoop callback overload not found');
+const asyncMethod = production.slice(asyncStart, callbackAt);
+const callbackStart = callbackAt + 2;
 const callbackMethod = balancedMethod(production, callbackStart);
 const functorStart = production.indexOf('    @JSFunctor', callbackStart);
 const functor = balancedMethod(production, functorStart);

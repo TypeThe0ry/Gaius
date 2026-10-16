@@ -202,11 +202,27 @@ assert.equal(state.shadowRequiredBuffers.has(2), false);
 assert.equal(state.shouldShadowBufferTarget(gl.COPY_READ_BUFFER, 1), false);
 assert.equal(state.shouldShadowBufferTarget(gl.COPY_WRITE_BUFFER, 2), false);
 assert.equal(state.shouldShadowBufferTarget(0x8c2a, 1), true, "TEXTURE_BUFFER requirement lost");
+// Element uploads keep no CPU shadow by default (a base-vertex fallback reads back lazily
+// and marks the buffer required); gaiusElementShadow=always restores the upload shadow.
+assert.equal(
+  state.shouldShadowBufferTarget(gl.ELEMENT_ARRAY_BUFFER, 1),
+  false,
+  "default ELEMENT upload requested a CPU shadow",
+);
+state.elementShadowAlways = true;
 assert.equal(
   state.shouldShadowBufferTarget(gl.ELEMENT_ARRAY_BUFFER, 1),
   true,
-  "ELEMENT/base-vertex fallback requirement lost",
+  "ELEMENT/base-vertex fallback requirement lost under gaiusElementShadow=always",
 );
+state.elementShadowAlways = false;
+state.shadowRequiredBuffers.add(1);
+assert.equal(
+  state.shouldShadowBufferTarget(gl.ELEMENT_ARRAY_BUFFER, 1),
+  true,
+  "ELEMENT buffer marked shadow-required lost its shadow",
+);
+state.shadowRequiredBuffers.delete(1);
 state.misalignedBufferRefs = new Map([[2, 1]]);
 assert.equal(
   state.shouldShadowBufferTarget(gl.ARRAY_BUFFER, 2),

@@ -83,6 +83,10 @@ public final class MinecraftServerWorkerPatcher {
         ClassNode executor = read(jar, ABSTRACT_EXECUTOR + ".class");
         patchAbstractExecutor(executor, headPriorityPatched);
         write(executor, outputRoot.resolve(ABSTRACT_EXECUTOR + ".class"));
+        // 26.2+: first light of generated chunks through the Rust light kernel (skips older profiles).
+        dev.gaius.tools.kernel.LightKernelPatches.patch(jar, outputRoot);
+        // 26.2+: chunk generation (biomes, noise fill, surface) through the Rust worldgen kernel.
+        dev.gaius.tools.kernel.WorldgenKernelPatches.patch(jar, outputRoot);
         if (jsonRpcPatched) {
             System.out.println("Disabled the dedicated JSON-RPC management server for the browser Worker");
         }

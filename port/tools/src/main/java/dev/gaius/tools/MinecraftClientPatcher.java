@@ -1,5 +1,6 @@
 package dev.gaius.tools;
 
+import dev.gaius.tools.kernel.MeshKernelPatches;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +37,9 @@ public final class MinecraftClientPatcher {
     private static final int BROWSER_SECTION_INDEX_HEAP_BYTES = 4 * 1024 * 1024;
     private static final int BROWSER_SECTION_STAGING_BYTES = 16 * 1024 * 1024;
     private static final int BROWSER_GPU_RETIRE_SLOTS = 8;
+    private static final String TERRAIN_BATCH = "dev/gaius/browser/render/BrowserTerrainBatch";
+    private static final String NEIGHBOR_READINESS =
+            "dev/gaius/browser/render/BrowserNeighborReadiness";
 
     private MinecraftClientPatcher() {
     }
@@ -413,7 +417,21 @@ public final class MinecraftClientPatcher {
         PatchRegistry.run("MinecraftClientPatcher.generateSoundApiStubs", () -> generateSoundApiStubs(root));
         PatchRegistry.run("MinecraftClientPatcher.generateCryptoApiStubs", () -> generateCryptoApiStubs(root));
         PatchRegistry.run("MinecraftClientPatcher.generateUnsafeStub", () -> generateUnsafeStub(root));
+        // 26.2 and 26.3 take the mesh kernel patches in Minecraft262BrowserPatcher, after the
+        // compile task rewrites there; any other profile logs here that it keeps vanilla meshing.
+        if (!isModernProfile(minecraftVersion)) {
+            PatchRegistry.run("MinecraftClientPatcher.meshKernelPatches", () -> meshKernelPatches(args[0], root, minecraftVersion));
+        }
         PatchRegistry.printSummary();
+    }
+
+    /** Legacy profiles only: {@link MeshKernelPatches} leaves the section compiler alone. */
+    private static void meshKernelPatches(String jar, Path root, String minecraftVersion)
+            throws IOException {
+        if (MeshKernelPatches.apply(jar, root, minecraftVersion)) {
+            throw new IllegalStateException(
+                    "Minecraft " + minecraftVersion + " must keep the vanilla section compiler");
+        }
     }
 
     private static void patchOptionsBrowserLowSimulationDistance(String jar, Path output)
@@ -5597,7 +5615,7 @@ public final class MinecraftClientPatcher {
         replace(method, code, 2, 1);
         boolean deltaFreeFrame = gameRendererDeltaFreeFrame(node, jar);
         patchGameRendererBrowserFrameBudget(node, deltaFreeFrame);
-        patchGameRendererBrowserInventoryWorldRenderThrottle(node, deltaFreeFrame);
+        patchGameRendererBrowserInventoryWorldRenderThrottle(node, deltaFreeFrame, jar);
         patchGameRendererBrowserTargetingAfterCamera(node);
         writeComputeFrames(node, output);
     }
@@ -5722,8 +5740,24 @@ public final class MinecraftClientPatcher {
         System.out.println("Patched block targeting after " + method.name + method.desc);
     }
 
+    /**
+     * Throttles the world render behind inventory screens.
+     *
+     * <p>26.3 ({@code deltaFreeFrame}) keeps the
+     * {@code BrowserOpenGL.shouldSkipWorldRenderForScreen} shape here;
+     * {@code QualityPatches263.patchInventoryWorldRenderThrottle} rewrites it to the quality
+     * hooks later in the chain. 26.2 and 1.21.11 get those hooks directly:
+     * {@code BrowserQualityFrame.shouldSkipWorldRender(Object)Z} decides per frame (the tier's
+     * reduced world refresh rate; without the quality runtime the old render-two-frames-then-skip
+     * rule), and {@code BrowserQualityFrame.worldFrameDone(III)V} at the merge point after the
+     * world section snapshots rendered frames and restores the snapshot on skipped ones. The
+     * restore is required: both profiles clear the main target's colour and depth every frame
+     * before this world section (26.2 at the top of {@code GameRenderer.render}, 1.21.11 in
+     * {@code Minecraft.runTick} right before {@code GameRenderer.render}), so a skipped world
+     * section otherwise leaves the clear colour behind the inventory.</p>
+     */
     private static void patchGameRendererBrowserInventoryWorldRenderThrottle(
-            ClassNode node, boolean deltaFreeFrame) {
+            ClassNode node, boolean deltaFreeFrame, String jar) throws IOException {
         // 26.3: render()V calls renderLevel()V with only the receiver on the stack, and the
         // profiler lives in local 1 instead of local 3.
         MethodNode method = find(node, "render",
@@ -5799,12 +5833,21 @@ public final class MinecraftClientPatcher {
                 "gaius$getScreen",
                 "()Lnet/minecraft/client/gui/screens/Screen;",
                 false));
-        throttle.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "org/lwjgl/opengl/BrowserOpenGL",
-                "shouldSkipWorldRenderForScreen",
-                "(Lnet/minecraft/client/gui/screens/Screen;)Z",
-                false));
+        if (deltaFreeFrame) {
+            throttle.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "org/lwjgl/opengl/BrowserOpenGL",
+                    "shouldSkipWorldRenderForScreen",
+                    "(Lnet/minecraft/client/gui/screens/Screen;)Z",
+                    false));
+        } else {
+            throttle.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    BROWSER_QUALITY_FRAME,
+                    "shouldSkipWorldRender",
+                    "(Ljava/lang/Object;)Z",
+                    false));
+        }
         throttle.add(new JumpInsnNode(Opcodes.IFEQ, continueWorld));
         throttle.add(new VarInsnNode(Opcodes.ALOAD, profilerLocal));
         throttle.add(new MethodInsnNode(
@@ -5816,6 +5859,136 @@ public final class MinecraftClientPatcher {
         throttle.add(new JumpInsnNode(Opcodes.GOTO, afterWorld));
         throttle.add(continueWorld);
         method.instructions.insertBefore(renderLevelThis, throttle);
+        if (deltaFreeFrame) {
+            return;
+        }
+
+        // worldFrameDone(colorTextureGlId, width, height) right after the merge label: the
+        // rendered and the skipped world section both reach it with an empty stack, while the
+        // no-level path still jumps to the original label after it.
+        InsnList done = new InsnList();
+        done.add(gameRendererMainTarget(node, method));
+        done.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                BLAZE3D_RENDER_TARGET,
+                "getColorTexture",
+                "()L" + BLAZE3D_GPU_TEXTURE + ";",
+                false));
+        done.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/client/renderer/GameRenderer",
+                GAME_RENDERER_GL_TEXTURE_ID,
+                "(L" + BLAZE3D_GPU_TEXTURE + ";)I",
+                false));
+        done.add(gameRendererMainTarget(node, method));
+        done.add(new FieldInsnNode(Opcodes.GETFIELD, BLAZE3D_RENDER_TARGET, "width", "I"));
+        done.add(gameRendererMainTarget(node, method));
+        done.add(new FieldInsnNode(Opcodes.GETFIELD, BLAZE3D_RENDER_TARGET, "height", "I"));
+        done.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                BROWSER_QUALITY_FRAME,
+                "worldFrameDone",
+                "(III)V",
+                false));
+        method.instructions.insert(afterWorld, done);
+        addGameRendererGlTextureIdHelper(node, jar);
+        System.out.println("Patched GameRenderer inventory world throttle to the quality hooks"
+                + " (BrowserQualityFrame.shouldSkipWorldRender/worldFrameDone)");
+    }
+
+    private static final String BROWSER_QUALITY_FRAME =
+            "dev/gaius/browser/quality/BrowserQualityFrame";
+    private static final String BLAZE3D_RENDER_TARGET = "com/mojang/blaze3d/pipeline/RenderTarget";
+    private static final String BLAZE3D_GPU_TEXTURE = "com/mojang/blaze3d/textures/GpuTexture";
+    private static final String BLAZE3D_GL_TEXTURE = "com/mojang/blaze3d/opengl/GlTexture";
+    private static final String GAME_RENDERER_GL_TEXTURE_ID = "gaius$glTextureId";
+
+    /**
+     * Loads the main render target inside the blaze3d {@code GameRenderer.render}: the
+     * {@code mainRenderTarget} field (26.2), or {@code minecraft.getMainRenderTarget()}
+     * (1.21.11, whose render method already reads it that way). Any other shape fails.
+     */
+    private static InsnList gameRendererMainTarget(ClassNode node, MethodNode render) {
+        String targetDesc = "L" + BLAZE3D_RENDER_TARGET + ";";
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        for (FieldNode field : node.fields) {
+            if (field.name.equals("mainRenderTarget") && field.desc.equals(targetDesc)
+                    && (field.access & Opcodes.ACC_STATIC) == 0) {
+                code.add(new FieldInsnNode(Opcodes.GETFIELD,
+                        "net/minecraft/client/renderer/GameRenderer", "mainRenderTarget",
+                        targetDesc));
+                return code;
+            }
+        }
+        boolean readsMinecraftTarget = false;
+        for (AbstractInsnNode instruction : render.instructions.toArray()) {
+            readsMinecraftTarget |= instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/Minecraft")
+                    && call.name.equals("getMainRenderTarget")
+                    && call.desc.equals("()" + targetDesc);
+        }
+        if (!readsMinecraftTarget) {
+            throw new IllegalStateException("GameRenderer.render has neither a mainRenderTarget"
+                    + " field nor a Minecraft.getMainRenderTarget() call");
+        }
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, "net/minecraft/client/renderer/GameRenderer",
+                "minecraft", "Lnet/minecraft/client/Minecraft;"));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "net/minecraft/client/Minecraft",
+                "getMainRenderTarget", "()" + targetDesc, false));
+        return code;
+    }
+
+    /**
+     * Adds {@code private static int gaius$glTextureId(GpuTexture texture)} to the blaze3d
+     * GameRenderer: 0 for null, else {@code ((GlTexture) texture).glId()}, the BrowserOpenGL
+     * texture name the quality runtime resolves. Checks the RenderTarget and GlTexture members
+     * it relies on first.
+     */
+    private static void addGameRendererGlTextureIdHelper(ClassNode node, String jar)
+            throws IOException {
+        String desc = "(L" + BLAZE3D_GPU_TEXTURE + ";)I";
+        if (findNullable(node, GAME_RENDERER_GL_TEXTURE_ID, desc) != null) {
+            throw new IllegalStateException(
+                    "GameRenderer." + GAME_RENDERER_GL_TEXTURE_ID + " already exists");
+        }
+        ClassNode target = read(jar, BLAZE3D_RENDER_TARGET + ".class");
+        long sizeFields = target.fields.stream()
+                .filter(field -> field.desc.equals("I")
+                        && (field.name.equals("width") || field.name.equals("height"))
+                        && (field.access & Opcodes.ACC_PUBLIC) != 0
+                        && (field.access & Opcodes.ACC_STATIC) == 0)
+                .count();
+        if (findNullable(target, "getColorTexture", "()L" + BLAZE3D_GPU_TEXTURE + ";") == null
+                || sizeFields != 2) {
+            throw new IllegalStateException(BLAZE3D_RENDER_TARGET
+                    + " no longer has getColorTexture() and public int width/height");
+        }
+        ClassNode glTexture = read(jar, BLAZE3D_GL_TEXTURE + ".class");
+        if (!BLAZE3D_GPU_TEXTURE.equals(glTexture.superName)
+                || findNullable(glTexture, "glId", "()I") == null) {
+            throw new IllegalStateException(BLAZE3D_GL_TEXTURE
+                    + " is no longer a GpuTexture with glId()I");
+        }
+        MethodNode helper = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                GAME_RENDERER_GL_TEXTURE_ID, desc, null, null);
+        LabelNode present = new LabelNode();
+        InsnList code = helper.instructions;
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new JumpInsnNode(Opcodes.IFNONNULL, present));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(present);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new TypeInsnNode(Opcodes.CHECKCAST, BLAZE3D_GL_TEXTURE));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, BLAZE3D_GL_TEXTURE, "glId", "()I", false));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        helper.maxLocals = 1;
+        helper.maxStack = 1;
+        node.methods.add(helper);
     }
 
     private static InsnList closeLevelLoadingScreenBeforeWorldRender() {
@@ -6885,6 +7058,13 @@ public final class MinecraftClientPatcher {
      * Lets a lit FULL center chunk compile before sparse browser delivery has supplied all eight
      * horizontal neighbors. Vanilla invalidates the surrounding section range when another chunk's
      * light becomes ready, so provisional edge meshes are rebuilt when those neighbors arrive.
+     *
+     * <p>26.2 and 26.3 keep vanilla's eight-neighbor check as gaius$allNeighborsReady and route
+     * hasAllNeighbors through BrowserNeighborReadiness.ready(center, allNeighbors, node), which
+     * compiles when all neighbors are ready, when the section is within two chunks of the player
+     * or when a neighbor has been missing for 300 ms; that removes most of the up to nine
+     * compiles a streaming section got under the unconditional center-only gate. 1.21.11 keeps
+     * the center-only gate.</p>
      */
     private static void patchSectionNeighborReadiness(
             String jar, Path outputRoot, String minecraftVersion) throws IOException {
@@ -6991,12 +7171,49 @@ public final class MinecraftClientPatcher {
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         if (current) {
+            String vanillaGate = "gaius$allNeighborsReady";
+            if (findNullable(node, vanillaGate, gateDescriptor) != null) {
+                throw new IOException("SectionUpdateTracker already has " + vanillaGate);
+            }
+            MethodNode vanilla = new MethodNode(
+                    Opcodes.ACC_PRIVATE, vanillaGate, gateDescriptor, null, null);
+            gate.accept(vanilla);
+            vanilla.access = Opcodes.ACC_PRIVATE;
+            vanilla.name = vanillaGate;
+            node.methods.add(vanilla);
             code.add(new VarInsnNode(Opcodes.ALOAD, 1));
             code.add(new VarInsnNode(Opcodes.LLOAD, 2));
-        } else {
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "doesChunkExistAt",
+                    readinessDescriptor,
+                    false));
             code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "sectionNode", "J"));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            code.add(new VarInsnNode(Opcodes.LLOAD, 2));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    owner,
+                    vanillaGate,
+                    gateDescriptor,
+                    false));
+            code.add(new VarInsnNode(Opcodes.LLOAD, 2));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    NEIGHBOR_READINESS,
+                    "ready",
+                    "(ZZJ)Z",
+                    false));
+            code.add(new InsnNode(Opcodes.IRETURN));
+            replace(gate, code, 6, 4);
+            writeComputeFrames(node, outputRoot.resolve(entry));
+            System.out.println("Patched section neighbor readiness: all neighbors, nearby, or "
+                    + "300 ms missing grace");
+            return;
         }
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "sectionNode", "J"));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 owner,
@@ -7004,8 +7221,10 @@ public final class MinecraftClientPatcher {
                 readinessDescriptor,
                 false));
         code.add(new InsnNode(Opcodes.IRETURN));
-        replace(gate, code, current ? 4 : 3, current ? 4 : 1);
+        replace(gate, code, 3, 1);
         writeComputeFrames(node, outputRoot.resolve(entry));
+        System.out.println("Section neighbor readiness: " + minecraftVersion
+                + " keeps the center-only gate (the timed neighbor gate covers 26.2 and 26.3)");
     }
 
     private static MethodNode requireSingleMethod(
@@ -7709,6 +7928,8 @@ public final class MinecraftClientPatcher {
             writeComputeFrames(node, output);
             return;
         }
+        System.out.println("Section vertex heap alignment and upload byte budget: skipped for "
+                + "the legacy section renderer (no UberGpuBuffer heaps)");
         MethodNode method = find(node, "uploadAllPendingUploads", "()V");
         InsnList code = new InsnList();
         LabelNode uploadLoop = new LabelNode();
@@ -9460,6 +9681,15 @@ public final class MinecraftClientPatcher {
                     && vertexSizeCall.name.equals("getVertexSize")
                     && vertexSizeCall.desc.equals("()I")) {
                 capacity.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
+                // Align vertex allocations to four vertices (112 bytes for BLOCK) so every
+                // section's base vertex is a multiple of four: its quads then line up with
+                // the shared quad index buffer of the GL layer and need no index copy.
+                heapFactory.instructions.insert(vertexSizeCall, new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        TERRAIN_BATCH,
+                        "vertexHeapAlignment",
+                        "(I)I",
+                        false));
                 vertexHeap++;
             } else if (usage.operand == 64
                     && shape.size() == 10
@@ -9482,7 +9712,8 @@ public final class MinecraftClientPatcher {
                             + uberConstructors + ", vertex=" + vertexHeap
                             + ", index=" + indexHeap);
         }
-        System.out.println("Reduced current section renderer browser allocation units");
+        System.out.println("Reduced current section renderer browser allocation units and "
+                + "aligned vertex heaps to four vertices");
     }
 
     /**
@@ -9760,6 +9991,63 @@ public final class MinecraftClientPatcher {
                 "(Ljava/lang/Object;)V",
                 false));
         upload.instructions.insert(entryStore, freeSelected);
+
+        VarInsnNode sizeStore = null;
+        for (AbstractInsnNode instruction = entryStore.getNext();
+                instruction != null && instruction != entryLoopExit.label;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/vertex/StagingBuffer$BufferHandle")
+                    && call.name.equals("size")
+                    && call.desc.equals("()J")
+                    && nextOpcode(call) instanceof VarInsnNode store
+                    && store.getOpcode() == Opcodes.LSTORE) {
+                if (sizeStore != null) {
+                    throw new IllegalStateException(
+                            "Current UberGpuBuffer staged entry size is read twice");
+                }
+                sizeStore = store;
+            }
+        }
+        if (sizeStore == null) {
+            throw new IllegalStateException("Current UberGpuBuffer staged entry size changed");
+        }
+        InsnList countBytes = new InsnList();
+        countBytes.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        countBytes.add(new VarInsnNode(Opcodes.LLOAD, sizeStore.var));
+        countBytes.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "noteUploadBytes",
+                "(Ljava/lang/Object;J)V",
+                false));
+        JumpInsnNode skippedEntryCheck = null;
+        for (AbstractInsnNode instruction = sizeStore.getNext();
+                instruction != null && instruction != entryLoopExit.label;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/vertex/TlsfAllocator")
+                    && call.name.equals("allocate")) {
+                break;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("it/unimi/dsi/fastutil/objects/ObjectOpenHashSet")
+                    && call.name.equals("contains")
+                    && nextOpcode(call) instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IFEQ) {
+                if (skippedEntryCheck != null) {
+                    throw new IllegalStateException(
+                            "Current UberGpuBuffer skipped entry check is repeated");
+                }
+                skippedEntryCheck = jump;
+            }
+        }
+        if (skippedEntryCheck == null) {
+            throw new IllegalStateException("Current UberGpuBuffer skipped entry check changed");
+        }
+        // Count only entries that are really uploaded; skipped (removed) entries close
+        // without an upload and must not use up the frame's upload byte budget.
+        upload.instructions.insertBefore(nextOpcode(skippedEntryCheck.label), countBytes);
 
         LabelNode processedEntry = new LabelNode();
         InsnList removeProcessed = new InsnList();
@@ -16574,7 +16862,8 @@ public final class MinecraftClientPatcher {
                 "(III)Lnet/minecraft/core/Holder;",
                 true));
         code.add(new InsnNode(Opcodes.ARETURN));
-        replace(method, code, 5, 6);
+        // Peak stack: source, the x and y arguments, then z >> 2, the corner bits and the mask.
+        replace(method, code, 6, 6);
         write(node, output);
     }
 

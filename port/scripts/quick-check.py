@@ -581,9 +581,17 @@ STORAGE_RUNTIME_GLOBALS = (
 )
 BUILD_IDENTITY_SOURCE_DIRECTORIES = (
     "port/src/main",
+    # Profile source sets (generate-pom.sh stages them over port/src/main/java).
+    "port/src/versions",
     "port/overrides",
     "port/tools/src/main",
     "port/wasm/hotpath",
+    # The v0.4 page runtime every distribution ships next to (or inlined into) the launcher:
+    # boot script, Service Worker, kernel runtime/worker/job codecs and the quality layer.
+    "port/web/boot",
+    "port/web/sw",
+    "port/web/kernels",
+    "port/web/runtime",
 )
 BUILD_IDENTITY_SOURCE_FILES = (
     "VERSION",
@@ -604,6 +612,10 @@ BUILD_IDENTITY_SOURCE_FILES = (
     "port/scripts/postprocess-teavm-js.py",
     "port/scripts/postprocess-index-html.py",
     "port/web/launcher/index.template.html",
+    "port/web/launcher/boot-art.css",
+    "port/web/launcher/boot-art.js",
+    "port/web/launcher/touch-controls.css",
+    "port/web/launcher/touch-controls.js",
     "port/scripts/build-vanilla-assets-pack.py",
     "port/scripts/build-wasm-hotpath.sh",
     "port/scripts/generate-wasm-hotpath.py",
@@ -1599,11 +1611,28 @@ def file_matches(path: Path, pattern: bytes) -> bool:
         return False
 
 
+# Bytes that make a match of a generated name part of a longer name or a property.
+GENERATED_NAME_PREDECESSORS = frozenset(
+    bytes([value])
+    for value in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$."
+)
+# "=" followed by a TeaVM function value: "(a,b)=>", "a=>" or "function".
+GENERATED_FUNCTION_VALUE = (
+    rb"\s*=\s*(?:\([A-Za-z0-9_$,\s]*\)\s*=>|[A-Za-z_$][A-Za-z0-9_$]*\s*=>|function\b)"
+)
+
+
 def generated_assignment_for_anchor(
     data: bytes,
     anchor: bytes,
 ) -> tuple[bytes, bytes] | None:
-    """Resolve a minified TeaVM A.<name> assignment that contains a stable JSBody anchor."""
+    """Resolve the minified TeaVM method definition that contains a stable JSBody anchor.
+
+    A method is a scope property past the top-level name budget ("A.x=(a)=>{") or
+    a top-level binding inside it, alone or in a let list ("let X=(a)=>{",
+    ",X=a=>{").  Only function definitions count, so assignments inside a method
+    body ("$p=2", "A.x=5") do not split it.
+    """
     anchor_offset = data.find(anchor)
     if anchor_offset < 0:
         return None
@@ -1611,7 +1640,8 @@ def generated_assignment_for_anchor(
     prefix = data[search_start:anchor_offset]
     assignments = list(
         re.finditer(
-            rb"(?:^|[;\n])(A\.[A-Za-z_$][A-Za-z0-9_$]*)\s*=",
+            rb"(?:^|[;\n,])\s*(?:let\s+)?((?:A\.)?[A-Za-z_$][A-Za-z0-9_$]*)"
+            + GENERATED_FUNCTION_VALUE,
             prefix,
         )
     )
@@ -1621,7 +1651,9 @@ def generated_assignment_for_anchor(
     symbol = match.group(1)
     assignment_start = search_start + match.start(1)
     next_assignment = re.search(
-        rb";\s*(?=A\.[A-Za-z_$][A-Za-z0-9_$]*\s*=)",
+        rb"[;,]\s*(?=(?:let\s+)?(?:A\.)?[A-Za-z_$][A-Za-z0-9_$]*"
+        + GENERATED_FUNCTION_VALUE
+        + rb")",
         data[anchor_offset:anchor_offset + 256 * 1024],
     )
     assignment_end = (
@@ -1666,6 +1698,9 @@ def generated_assignment_is_called(
         offset = data.find(call_prefix, offset)
         if offset < 0:
             return False
+        if offset > 0 and data[offset - 1:offset] in GENERATED_NAME_PREDECESSORS:
+            offset += len(call_prefix)
+            continue
         window = data[offset:min(len(data), offset + 4096)]
         if all(window.count(value) >= count for value, count in required):
             return True
@@ -1745,19 +1780,65 @@ def teavm_release_profile_matches(
     return result.returncode == 0
 
 
+def source_text(relative: str) -> str:
+    path = ROOT / relative
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def appears_in_order(text: str, *markers: str) -> bool:
+    """Whether every marker occurs in text, each first occurrence after the previous one."""
+    position = -1
+    for marker in markers:
+        position = text.find(marker, position + 1)
+        if position < 0:
+            return False
+    return True
+
+
+_PORTABLE_BUILDER = None
+
+
+def portable_builder():
+    """port/scripts/build-portable-html.py as a module (its gaius-b7 payload encoder)."""
+    global _PORTABLE_BUILDER
+    if _PORTABLE_BUILDER is None:
+        path = ROOT / "port" / "scripts" / "build-portable-html.py"
+        spec = importlib.util.spec_from_file_location("gaius_quickcheck_build_portable_html", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PORTABLE_BUILDER = module
+    return _PORTABLE_BUILDER
+
+
 def portable_embeds_gzip(portable: Path, key: str, compressed: Path) -> bool:
+    """Whether the portable page carries exactly these gzip bytes as payload asset ``key``.
+
+    The page embeds each asset as gaius-b7 text split over numbered
+    <script type="text/x-gaius-b7" data-gaius-asset=KEY data-part=N> elements.
+    """
     if not portable.is_file() or not compressed.is_file():
         return False
-    encoded = base64.b64encode(compressed.read_bytes()).decode("ascii")
-    chunks = [encoded[index:index + 1_000_000] for index in range(0, len(encoded), 1_000_000)]
-    expected = (f'"{key}":' + json.dumps(chunks, separators=(",", ":"))).encode("ascii")
     try:
+        module = portable_builder()
+        expected = module.encode_b7(compressed.read_bytes()).encode("utf-8")
+        pattern = re.compile(
+            rb'<script type="' + re.escape(module.PAYLOAD_TYPE.encode("ascii"))
+            + rb'" data-gaius-asset="' + re.escape(key.encode("ascii"))
+            + rb'" data-part="(\d+)">([^<]*)</script>'
+        )
         with portable.open("rb") as stream, mmap.mmap(
             stream.fileno(), 0, access=mmap.ACCESS_READ
         ) as data:
-            return data.find(expected) >= 0
-    except OSError:
+            parts = [(int(match.group(1)), match.group(2)) for match in pattern.finditer(data)]
+    except (OSError, ImportError, RuntimeError, ValueError):
         return False
+    return (
+        bool(parts)
+        and [index for index, _ in parts] == list(range(len(parts)))
+        and b"".join(body for _, body in parts) == expected
+    )
 
 
 def portable_embeds_assignment(portable: Path, name: str, value: object) -> bool:
@@ -2820,20 +2901,86 @@ def check_source_patches() -> None:
             and "Browser output stream did not truncate an existing file" in platform_smoke,
         ),
         (
-            "Server Worker compiles class-initialization edges synchronously and hashes Set.of/Map.of",
+            "Client and server Worker compile class-initialization edges synchronously and hash Set.of/Map.of",
             # gaius.teavm.syncClinits stops TeaVM from making every caller of an async class
             # initializer async (it turned 36k of 83k Worker methods into coroutines); the
-            # runtime skips cooperative yields while __gaiusClinitDepth is positive.
-            'SYNC_CLINITS_PROPERTY = "gaius.teavm.syncClinits"'
+            # runtime skips cooperative yields while __gaiusClinitDepth is positive.  Since
+            # v0.4.0 it is a role option of the generate-pom.sh role table (POM <properties>,
+            # read by GaiusTeaVMOptions) for both roles, not a MAVEN_OPTS system property.
+            "SYNC_CLINITS_PROPERTY = GaiusTeaVMOptions.SYNC_CLINITS"
                 in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and 'SYNC_CLINITS = PREFIX + "syncClinits"'
+                in (PORT / "tools/src/main/java/dev/gaius/tools/runtime/GaiusTeaVMOptions.java").read_text(errors="replace")
             and "patchAsyncMethodFinder(" in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
             and "patchRendererClinitDepth(" in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
-            and "-Dgaius.teavm.syncClinits=true" in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
-            and "syncClinits" not in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
+            and "<name>gaius.teavm.syncClinits</name>" in (PORT / "scripts/generate-pom.sh").read_text(errors="replace")
+            and (PORT / "scripts/generate-pom.sh").read_text(errors="replace").count("default_sync_clinits=true") == 2
+            and "-Dgaius.teavm." not in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
+            and "-Dgaius.teavm." not in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
+            and 'GAIUS_TEAVM_ROLE="singleplayer-worker"' in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
+            and "GAIUS_TEAVM_ROLE=client" in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
             and "TModernRuntimeSupport.inClassInitializer()"
                 in (PORT / "src/main/java/org/teavm/classlib/java/util/concurrent/locks/TLockSupport.java").read_text(errors="replace")
             and "patchTemplateCollectionLookups(jar, root);" in classlib_patcher
             and '"gaiusHashIndex"' in classlib_patcher,
+        ),
+        (
+            "TeaVM suspension guard failures stay visible when Java code catches them",
+            # The thread.js guard throws a JS Error that TeaVM wraps into a RuntimeException,
+            # so catch (Exception) can swallow it.  It also counts and logs, a class
+            # initializer suspension is counted, and the browser acceptance scripts fail on
+            # the counters or the console text (tools/teavm-runtime-guards.mjs).
+            "teavm_globals.console.error(gaiusError);"
+                in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and "globalThis.__gaiusClinitSuspensions ="
+                in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and "Can't enter monitor from another thread synchronously"
+                in (ROOT / "tools/teavm-runtime-guards.mjs").read_text(errors="replace")
+            and "runtimeGuards:${RUNTIME_GUARD_EXPRESSION}"
+                in (ROOT / "tools/chrome-worker-profiler.mjs").read_text(errors="replace")
+            and all(
+                "runtimeGuardFailures(" in (PORT / "scripts" / name).read_text(errors="replace")
+                for name in (
+                    "browser-startup-profile.mjs",
+                    "browser-multiplayer-cdp-driver.mjs",
+                    "browser-file-entry-acceptance.mjs",
+                )
+            ),
+        ),
+        (
+            "Release builds strip opt-in diagnostics through the gaius-telemetry platform marker",
+            # BrowserBuildFlags.telemetry() compiles to false without the gaius-telemetry
+            # platform tag (GAIUS_TEAVM_STRIP_TELEMETRY, the release default).  Only
+            # diagnostics that no acceptance, performance tool or game logic reads are
+            # guarded; __gaiusChunkPipelineTelemetry, __gaiusMemoryTelemetry,
+            # __gaiusServerTickTelemetry and __gaiusInputStats stay in releases.
+            '@PlatformMarker("gaius-telemetry")'
+                in (PORT / "overrides/classlib/src/main/java/dev/gaius/browser/BrowserBuildFlags.java").read_text(errors="replace")
+            and 'TELEMETRY_TAG = "gaius-telemetry"'
+                in (PORT / "tools/src/main/java/dev/gaius/tools/runtime/GaiusTeaVMOptions.java").read_text(errors="replace")
+            and "<name>gaius.teavm.telemetry</name>" in (PORT / "scripts/generate-pom.sh").read_text(errors="replace")
+            and 'GAIUS_TEAVM_STRIP_TELEMETRY="${GAIUS_TEAVM_STRIP_TELEMETRY:-true}"'
+                in (PORT / "scripts/build-teavm-release.sh").read_text(errors="replace")
+            and "BrowserBuildFlags.telemetry()" in browser_bit_storage
+            and all(
+                "BrowserBuildFlags.telemetry()"
+                in (PORT / "src/main/java/dev/gaius/browser" / name).read_text(errors="replace")
+                for name in (
+                    "BrowserChunkDrawTelemetry.java",
+                    "BrowserGuiEntityTelemetry.java",
+                    "BrowserBlockBreakingTelemetry.java",
+                    "BrowserGenerationSpawnTelemetry.java",
+                )
+            )
+            and all(
+                "BrowserBuildFlags" not in path.read_text(errors="replace")
+                for path in (
+                    PORT / "src/main/java/dev/gaius/browser/BrowserRenderScheduler.java",
+                    PORT / "src/main/java/dev/gaius/browser/BrowserInputTelemetry.java",
+                    PORT / "src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java",
+                    PORT / "overrides/libraries/lwjgl/src/main/java/org/lwjgl/system/BrowserMemory.java",
+                )
+            ),
         ),
         (
             "Browser FileChannel preserves existing region files unless truncation is explicit",
@@ -3176,7 +3323,10 @@ def check_source_patches() -> None:
             and "([J[IIII)Z" in client_patcher
             and "([JIII)I" in client_patcher
             and "([JIIII)I" in client_patcher
-            and "public static native boolean unpack" in browser_bit_storage
+            and "public static boolean unpack(long[] packed, int[] output" in browser_bit_storage
+            and "private static native boolean unpackJs(" in browser_bit_storage
+            and "BrowserBuildFlags.telemetry()" in browser_bit_storage
+            and "if (countFallback) {" in browser_bit_storage
             and browser_bit_storage.count("@JSByRef long[] packed") == 3
             and "@JSByRef int[] output" in browser_bit_storage
             and "public static native int get(" in browser_bit_storage
@@ -3283,6 +3433,15 @@ def check_source_patches() -> None:
             and "window.__gaiusGL.executeDraw(0,mode,first,count,0,0,0);" in text
             and "window.__gaiusGL.executeDraw(5,mode,count,type,offset,instances,baseVertex);" in text
             and "window.__gaiusGL.withGuiItemOffscreenScissorRepair(function()" not in text,
+        ),
+        (
+            "Rewritten terrain shaders fall back on compile and batches prove their lead draw",
+            "terrainShaderCompileFallbacks" in text
+            and "terrainShaderReverted" in text
+            and "terrainShaderAlternates" in text
+            and "this.drawSerial=((this.drawSerial|0)+1)|0;" in text
+            and "terrainBatchReject('no-lead-draw')" in text
+            and "terrainBatchReject('lead-draw')" in text,
         ),
         (
             "BrowserOpenGL bypasses draw cleanup machinery for stable world draws",
@@ -3629,8 +3788,14 @@ def check_source_patches() -> None:
         ),
         (
             "BrowserOpenGL maps WebGL buffers into registered MemoryUtil memory",
-            "MemoryUtil.memAlloc((int) length)" in text
-            and "MemoryUtil.memFree(mapped.buffer)" in text,
+            "acquireMappedBuffer(logicalBuffer, offset, (int) length, access)" in text
+            and "acquireMappedBuffer(buffer, offset, (int) length, access)" in text
+            and "address = MemoryUtil.nmemAlloc(1L << shift);" in text
+            and "MemoryUtil.memByteBuffer(address, length)" in text
+            and "MemoryUtil.memAlloc(length).order(ByteOrder.nativeOrder())" in text
+            and "MemoryUtil.memFree(mapped.buffer());" in text
+            and "MemoryUtil.nmemFree(mapped.poolAddress());" in text
+            and "releaseMappedStorage(mapped);" in text,
         ),
         (
             "BrowserOpenGL exports exact mapped-buffer flush sub-ranges",
@@ -3651,7 +3816,8 @@ def check_source_patches() -> None:
             and "targetEnd<=targetKnown" in text
             and text.count("const sameBufferOverlap=sourceBuffer===targetBuffer && length>0") >= 2
             and text.count("&& !sameBufferOverlap;") >= 2
-            and "if (validRange && length>0) state.shadowBufferSubDataForTarget" in text
+            and "if (validRange && length>0) {\n"
+                "                state.shadowBufferSubDataForTarget(target,buffer,start,data);" in text
             and text.count("if (validRange && length>0)") >= 2
             and "if (targetBuffer && validRange && length>0)" in text
             and "if (validRange && length>0)" in text
@@ -5740,10 +5906,15 @@ def check_source_patches() -> None:
             and "BrowserRenderScheduler" in client_patcher
             and "BROWSER_SECTION_UPLOAD_BUDGET = 8" in client_patcher
             and "BROWSER_SECTION_CLOSE_BUDGET = 16" in client_patcher
-            and "Window.requestAnimationFrame" in browser_render_scheduler
-            and "Platform.schedule(BrowserRenderScheduler::runAfterPaint, 0)" in browser_render_scheduler
-            and "MAX_TASKS_PER_FRAME = 8" in browser_render_scheduler
-            and "FRAME_WORK_BUDGET_NANOS = 2_000_000L" in browser_render_scheduler
+            and "Platform.startThread(BrowserRenderScheduler::runPump)" in browser_render_scheduler
+            and "FRAME_WATCHDOG_MILLIS = 50" in browser_render_scheduler
+            and "SLICE_NANOS = 2_000_000L" in browser_render_scheduler
+            and "TModernRuntimeSupport.yieldToEventLoop(0)" in browser_render_scheduler
+            and "if (!QUEUE.isEmpty() && !waitingForFrame) {" in browser_render_scheduler
+            and "failedTasks++;" in browser_render_scheduler
+            and "private record Budget(" in browser_render_scheduler
+            and "8, 16, 3_000_000L, 16, 3_000_000L, 2L * 1024L * 1024L, 2, 4," in browser_render_scheduler
+            and "return budget().maxTasksPerFrame();" in browser_render_scheduler
             and "requestEmergencyUpload" in browser_render_scheduler
             and "awaitUploadRetry" in browser_render_scheduler
             and "clearUploadRetry" in browser_render_scheduler
@@ -6374,7 +6545,8 @@ def check_source_patches() -> None:
             and "if (inClassInitializer()) {" in modern_runtime_support
             and "private static native void suspendToEventLoop(int delayMillis);"
                 in modern_runtime_support
-            and "return (globalThis.__gaiusClinitDepth | 0) > 0;" in modern_runtime_support
+            and "return (globalThis.__gaiusClinitDepth | 0) > 0" in modern_runtime_support
+            and "|| (globalThis.__gaiusNoSuspendDepth | 0) > 0;" in modern_runtime_support
             and "TThread.setCurrentThread(thread)" in modern_runtime_support
             and "Platform.schedule(resume, delayMillis)" in modern_runtime_support
             and "postMacrotask(() -> resume.run())" in modern_runtime_support
@@ -6551,28 +6723,28 @@ def check_source_patches() -> None:
                 and file_contains(DIST / "classes.js", "elementArrayBufferObject")
                 and not file_matches(
                     DIST / "classes.js",
-                    rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
-                    rb"(?:(?!;\};).){0,6144}switch\(A\."
+                    rb"=\(a,b,c,d,e,f,g,h\)=>\{"
+                    rb"(?:(?!;\};).){0,6144}switch\((?:A\.)?[A-Z]"
                     rb"(?:(?!;\};).){0,2048}"
-                    rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
+                    rb"\$p=2;case 2:(?:A\.)?[A-Z][\w$]*\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
                 )
             )
             if is_current_named_profile
             else (
                 not is_current_named_profile or file_matches(
                     DIST / "classes.js",
-                    rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
+                    rb"=\(a,b,c,d,e,f,g,h\)=>\{"
                     rb"(?:(?!;\};).){0,4096}"
                     rb"\w+=5121\+\w+\|0;"
                     rb"(?:(?!;\};).){0,2048}"
-                    rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);"
+                    rb"\$p=2;case 2:(?:A\.)?[A-Z][\w$]*\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);"
                 )
                 and not file_matches(
                     DIST / "classes.js",
-                    rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
-                    rb"(?:(?!;\};).){0,6144}switch\(A\."
+                    rb"=\(a,b,c,d,e,f,g,h\)=>\{"
+                    rb"(?:(?!;\};).){0,6144}switch\((?:A\.)?[A-Z]"
                     rb"(?:(?!;\};).){0,2048}"
-                    rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
+                    rb"\$p=2;case 2:(?:A\.)?[A-Z][\w$]*\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
                 )
             ),
         ),
@@ -6757,6 +6929,16 @@ def check_source_patches() -> None:
             and "double[] bounds = BrowserClimate.prepareBounds(parameters)" in platform_smoke
             and "long cached = BrowserClimate.distance(bounds, target)" in platform_smoke
             and "Browser climate distance changed" in platform_smoke,
+        ),
+        (
+            "@JSBody scripts never return object literals from arrow expression bodies",
+            # TeaVM's AstWriter reprints `() => ({...})` without the parentheses, turning the
+            # object into a labelled block; the generated classes.js then fails to parse.
+            not any(
+                re.search(r"=>\s*\(\s*\{", path.read_text(encoding="utf-8", errors="replace"))
+                for base in (PORT / "overrides", PORT / "src")
+                for path in base.rglob("*.java")
+            ),
         ),
         (
             "Browser worldgen removes biome helper closures and surface iterators",
@@ -7539,6 +7721,7 @@ def check_source_patches() -> None:
             and "gaius-browser-protocol-v1" in build_identity_helper
             and "gaius-active-overlay-inputs-v1" in build_identity_helper
             and "port/src/main" in build_identity_helper
+            and "port/src/versions" in build_identity_helper
             and "port/overrides" in build_identity_helper
             and "port/tools/src/main" in build_identity_helper
             and "compatibilitySha256" in build_identity_helper
@@ -7582,6 +7765,63 @@ def check_source_patches() -> None:
             and "launcher template regression passed" in index_template_test
             and '"26.2.json"' in index_template_test
             and '"1.21.11.json"' in index_template_test
+        ),
+        (
+            "Every distribution ships the page runtime, the server Worker kernel scripts and the quality wiring",
+            # The profile id the quality layer reads is set in <head> before the boot tag, the
+            # tier is picked before main, and its ratio cap feeds the frame-rate governor.
+            appears_in_order(
+                index_template,
+                '<script data-gaius-profile-early="v1">',
+                '<script data-gaius-boot="v1" src="gaius-boot.js"></script>',
+                "</head>",
+            )
+            and "def patch_early_profile_id(" in postprocess_index_html
+            and "window.__gaiusApplyQualityPixelRatio = function applyGaiusQualityPixelRatio()" in index_template
+            and appears_in_order(
+                index_template,
+                "await window.__gaiusFsReady;",
+                "await window.__gaiusBoot.beforeMain();",
+                "try { GaiusQuality.caps.ensureTier(); } catch (e) {}",
+                "window.__gaiusApplyQualityPixelRatio();",
+                "main(window.__gaiusDefaultArgs);",
+            )
+            and "if (gaiusRenderScaleGovernsFps()) {" in index_template
+            and 'urlParams.get("gaiusPixelated") === "0"' in index_template
+            # Local dist and release stage the runtime next to index.html; the portable page
+            # inlines it with inert copies of the server Worker's scripts; the boot script hands
+            # those scripts and the worldgen and light switches to the server Worker.
+            and appears_in_order(build_teavm, "gaius_teavm_publish_bundle", "build-wasm-variants.sh", "stage-web-runtime.py")
+            and appears_in_order(
+                build_version_release,
+                "build-wasm-variants.sh",
+                "stage-web-runtime.py",
+                "export GAIUS_KERNELS_PREPARED=1",
+                "build-teavm-release.sh",
+                "build-pages-site.py",
+            )
+            and "SERVER_WORKER_MODULES" in build_portable_html
+            and 'data-gaius-worker-script="{name}"' in build_portable_html
+            and "kernelScripts: serverWorkerKernelScripts()" in source_text("port/web/boot/gaius-boot.js")
+            and "lightKernel: serverLightConfig()" in source_text("port/web/boot/gaius-boot.js")
+            and "root.__gaiusLightKernelConfig = Object.assign(" in server_worker_bootstrap
+            and all(
+                directory in BUILD_IDENTITY_SOURCE_DIRECTORIES
+                for directory in ("port/web/boot", "port/web/sw", "port/web/kernels", "port/web/runtime")
+            )
+            and all(
+                command in repository_guard
+                for command in (
+                    "node port/scripts/gaius-boot-smoke.mjs",
+                    "node port/scripts/launcher-quality-smoke.mjs",
+                    "node port/scripts/service-worker-headers-smoke.mjs",
+                    "node port/scripts/kernel-runtime-smoke.mjs",
+                    "python3 port/scripts/test-build-pages-site.py",
+                    "python3 port/scripts/test-stage-web-runtime.py",
+                    "./build-wasm-variants.sh --out target/kernels",
+                    "node port/scripts/worldgen-kernel-pool-smoke.mjs",
+                )
+            ),
         ),
         (
             "Portable artifact identity fixtures cover profile and gzip skew",
@@ -7660,7 +7900,11 @@ def check_source_patches() -> None:
             and file_matches(
                 SERVER_WORKER_JS,
                 rb"/\*gaius-integrated-server-input-coroutine\*/.{0,8192}"
-                rb"(?:\.\$rt_startThread|A\.[A-Za-z_$][A-Za-z0-9_$]*)\(",
+                # The shim calls the runtime thread starter, which is a scope
+                # property (A.x), a pinned top-level binding or $rt_startThread.
+                rb"(?<![\w$.])(?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*"
+                rb"\(\s*\(\s*\)\s*=>\s*[A-Za-z_$][\w$]*"
+                rb"\.pumpIntegratedServerNetworkInput\(\)",
             )
             and not file_contains(
                 SERVER_WORKER_JS,
@@ -11796,7 +12040,10 @@ def check_overlay_bytecode() -> None:
             "Legacy GameRenderer throttles inventory-screen world background before renderLevel",
             is_current_named
             or (
-                "BrowserOpenGL.shouldSkipWorldRenderForScreen" in game_renderer
+                "dev/gaius/browser/quality/BrowserQualityFrame.shouldSkipWorldRender:(Ljava/lang/Object;)Z"
+                in game_renderer
+                and "dev/gaius/browser/quality/BrowserQualityFrame.worldFrameDone:(III)V" in game_renderer
+                and "BrowserOpenGL.shouldSkipWorldRenderForScreen" not in game_renderer
                 and "InterfaceMethod net/minecraft/util/profiling/ProfilerFiller.pop:()V" in game_renderer
                 and "Method renderLevel:(Lnet/minecraft/client/DeltaTracker;)V" in game_renderer
                 and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer

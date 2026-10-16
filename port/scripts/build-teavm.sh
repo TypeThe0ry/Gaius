@@ -328,7 +328,10 @@ echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') en
 echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
 echo "Mapped browser Unicode font assets: $copied_font_assets"
-pom="$(GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$staged_target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
+# The client role's TeaVM compiler options (maxTopLevelNames, syncClinits,
+# syncMonitors, async barrier, runtime name pinning, telemetry tag) come from
+# the role table in generate-pom.sh and end up in the POM <properties>.
+pom="$(GAIUS_TEAVM_ROLE=client GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$staged_target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
 log="$build_root/teavm-build.log"
 
 echo "Compiling the official Minecraft $version client with TeaVM"
@@ -336,6 +339,7 @@ echo "POM: $pom"
 echo "Log: $log"
 
 set +e
+# MAVEN_OPTS only sizes the compiler JVM; TeaVM options live in the POM.
 MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}" \
   "$root/port/mvnw" \
   --batch-mode \
@@ -462,6 +466,32 @@ if [[ "$build_status" -eq 0 && "$teavm_publish_allowed" == true ]]; then
       "$target_directory/vanilla-assets.pack.gz.build.json" \
     "$staged_target_directory/index.html" "$target_directory/index.html" \
     "${shader_toolchain_publish[@]}"
+  # v0.4 page runtime next to index.html: gaius-boot.js (the launcher's one boot tag), the
+  # Service Worker, the kernel runtime and job codecs, the quality layer and, when built, the
+  # wasm kernels. build-version-release.sh prepares the kernels for a release
+  # (GAIUS_KERNELS_PREPARED=1); a standalone client build makes them here (cargo rebuilds only
+  # what changed) unless GAIUS_SKIP_KERNELS=1. Without cargo or the wasm32 target the page
+  # keeps every vanilla path.
+  kernel_directory="$build_root/kernels"
+  if [[ "${GAIUS_KERNELS_PREPARED:-}" != "1" && "${GAIUS_SKIP_KERNELS:-}" != "1" ]]; then
+    if ! bash "$root/port/native/build-wasm-variants.sh" --out "$kernel_directory"; then
+      if [[ "${GAIUS_KERNELS_STRICT:-}" == "1" ]]; then
+        echo "The wasm kernels could not be built for Minecraft $version" >&2
+        exit 1
+      fi
+      echo "WARNING: no wasm kernels for Minecraft $version; the page keeps the vanilla paths" >&2
+      rm -rf "$kernel_directory"
+    fi
+  fi
+  if [[ "${GAIUS_KERNELS_PREPARED:-}" != "1" ]]; then
+    # Never leave a previous build's modules behind a kernels.json that no longer lists them.
+    rm -rf "$target_directory/kernels"
+  fi
+  stage_arguments=("$target_directory")
+  if [[ "${GAIUS_SKIP_KERNELS:-}" != "1" && -f "$kernel_directory/kernels.json" ]]; then
+    stage_arguments+=(--kernels "$kernel_directory")
+  fi
+  "$root/port/scripts/run-python.sh" "$root/port/scripts/stage-web-runtime.py" "${stage_arguments[@]}"
   gaius_teavm_remove_stale_incomplete_reports \
     "$build_root/teavm-gap.json" "$build_root/teavm-gap.md"
   if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then

@@ -1430,14 +1430,14 @@ try {
   });
   const rawGraphicsApply = graphicsPresetApply(rawGraphics);
   const patchedGraphicsApply = graphicsPresetApply(patchedGraphics);
-  // Minecraft.<init> re-applies the persisted preset, so the browser default FANCY
-  // preset must itself carry the 8/6 contract or it overwrites the seeded options.
+  // Applying a preset (Video Settings, or Minecraft.<init> with ?gaiusPresetReplay=1) writes its
+  // distances over the player's options, so FANCY and FABULOUS carry the 8/6 contract too.
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
-    ["bipush 8", "bipush 8", "bipush 32"],
-    "26.2 FAST/FANCY render distance is not the browser 8 contract");
+    ["bipush 8", "bipush 8", "bipush 8"],
+    "26.2 FAST/FANCY/FABULOUS render distance is not the browser 8 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
-    ["bipush 6", "bipush 6", "bipush 12"],
-    "26.2 FAST/FANCY simulation distance is not the browser 6 contract");
+    ["bipush 6", "bipush 6", "bipush 6"],
+    "26.2 FAST/FANCY/FABULOUS simulation distance is not the browser 6 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
     "26.2 raw FAST/FANCY render distance shape changed");
@@ -1453,12 +1453,18 @@ try {
     "26.2 FANCY graphics preset still overwrites the browser 8/6 distances");
   assert.equal(presetDistances(rawGraphicsApply, "FANCY"), "16/12",
     "26.2 raw FANCY graphics preset distance shape changed");
+  assert.equal(presetDistances(patchedGraphicsApply, "FABULOUS"), "8/6",
+    "26.2 FABULOUS graphics preset still overwrites the browser 8/6 distances");
+  assert.equal(presetDistances(rawGraphicsApply, "FABULOUS"), "32/12",
+    "26.2 raw FABULOUS graphics preset distance shape changed");
   assert.equal(graphicsPresetArmValue(patchedGraphicsApply, "FANCY", "mipmapLevels"), "iconst_4",
     "26.2 FANCY graphics preset lost vanilla mipmapLevels 4");
   assert.deepEqual(graphicsPresetPatchedValues(rawGraphicsApply, patchedGraphicsApply), [
     "FANCY renderDistance bipush 16 -> bipush 8",
     "FANCY simulationDistance bipush 12 -> bipush 6",
-  ], "26.2 graphics preset patch must change only the FANCY render/simulation distances");
+    "FABULOUS renderDistance bipush 32 -> bipush 8",
+    "FABULOUS simulationDistance bipush 12 -> bipush 6",
+  ], "26.2 graphics preset patch must change only the FANCY/FABULOUS render/simulation distances");
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
     "26.2 CUSTOM graphics preset arm changed");
@@ -2102,6 +2108,7 @@ try {
     graphicsPresetDistances: {
       fast: presetDistances(patchedGraphicsApply, "FAST"),
       fancy: presetDistances(patchedGraphicsApply, "FANCY"),
+      fabulous: presetDistances(patchedGraphicsApply, "FABULOUS"),
     },
     oneTwentyOneFastDistances: "8/6",
     holderBatchLimit: HOLDERS_PER_TURN,

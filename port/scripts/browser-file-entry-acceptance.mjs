@@ -16,6 +16,7 @@ import {analyzeTerrainPng, decodePng, terrainVisualPass} from "../../tools/terra
 import {startWorkerProfiler} from "../../tools/chrome-worker-profiler.mjs";
 import {summarizeFlightReadiness} from "../../tools/flight-readiness.mjs";
 import {configureWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
+import {RUNTIME_GUARD_EXPRESSION,clinitSuspensionCount,runtimeGuardFailures} from "../../tools/teavm-runtime-guards.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 // Without GAIUS_VERSION_PROFILE_PATH the default profile is port/config.json's
@@ -37,7 +38,9 @@ if (customSkinDataUrl && (!customSkinDataUrl.startsWith("data:image/png;base64,"
     || customSkinDataUrl.length > 12000)) {
   throw new Error("GAIUS_FILE_CUSTOM_SKIN_DATA_URL must be a bounded PNG data URL");
 }
-const targetUrl = `file:///${artifact.replaceAll("\\", "/").replace(/^([A-Za-z]):/, "$1:")}?fileAcceptance=${Date.now()}`;
+// GAIUS_FILE_QUERY appends runtime switches (for example gaiusMesher=0) for A/B runs.
+const extraQuery = String(process.env.GAIUS_FILE_QUERY || "").replace(/^[?&]+/, "");
+const targetUrl = `file:///${artifact.replaceAll("\\", "/").replace(/^([A-Za-z]):/, "$1:")}?fileAcceptance=${Date.now()}${extraQuery ? "&" + extraQuery : ""}`;
 
 function optionalBoundedNumber(name, minimum, maximum, integer=false) {
   const raw=process.env[name];
@@ -438,6 +441,40 @@ async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
   }
 
   const baselineLoaded=finite(baseline.state.loadedChunkCount);
+  if (process.env.GAIUS_FILE_MESH_AB === '1') {
+    // Mesh A/B diagnostic: stay at spawn, wait for the mesh kernel's model table (or a fixed
+    // time when the kernel is off), rebuild every section with F3+A, then capture the canvas.
+    const abStartedAt=Date.now();
+    let meshStatus=null;
+    while(Date.now()-abStartedAt<120000){
+      meshStatus=await evaluate(cdp,`(()=>{const k=globalThis.__gaiusMeshKernel;return k&&k.status?k.status():null;})()`);
+      if(!meshStatus?.codec?.enabled){ if(Date.now()-abStartedAt>=60000)break; }
+      else if(meshStatus.tables>0) break;
+      await sleep(2000);
+    }
+    const f3={key:"F3",code:"F3",windowsVirtualKeyCode:114,nativeVirtualKeyCode:114};
+    const keyA={key:"a",code:"KeyA",windowsVirtualKeyCode:65,nativeVirtualKeyCode:65};
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyDown",...f3});
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyDown",...keyA});
+    await sleep(120);
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyUp",...keyA});
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyUp",...f3});
+    await sleep(30000);
+    const before=meshStatus;
+    meshStatus=await evaluate(cdp,`(()=>{const k=globalThis.__gaiusMeshKernel;return k&&k.status?k.status():null;})()`);
+    const rect=await evaluate(cdp,`(()=>{const r=document.querySelector('canvas')?.getBoundingClientRect();return r?{x:r.left,y:r.top,width:r.width,height:r.height,scale:1}:null;})()`);
+    const shot=await cdp.send("Page.captureScreenshot",{format:"png",fromSurface:true,captureBeyondViewport:true,clip:rect});
+    const meshAbScreenshotPath=output.replace(/\.json$/i,"")+"-mesh-ab.png";
+    await mkdir(dirname(meshAbScreenshotPath),{recursive:true});
+    await writeFile(meshAbScreenshotPath,Buffer.from(shot.data||"","base64"));
+    await writeFile(baselineScreenshotPath,baseline.png);
+    const state=await readSingleplayerState(cdp);
+    return {ready:false,diagnosticOnly:true,baselineScreenshotPath,samples,
+      meshAb:{screenshotPath:meshAbScreenshotPath,waitedMillis:Date.now()-abStartedAt,
+        meshBeforeReload:before,meshAfterReload:meshStatus,player:state.player,
+        loadedChunkCount:state.loadedChunkCount},
+      error:'Mesh A/B diagnostic only; traversal acceptance deliberately not run'};
+  }
   if (process.env.GAIUS_FILE_STARTUP_PROFILE_ONLY === '1') {
     await mkdir(dirname(baselineScreenshotPath),{recursive:true});
     await writeFile(baselineScreenshotPath,baseline.png);
@@ -691,8 +728,24 @@ async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
   } catch(error) {
     chunkDrawTelemetryError=String(error?.message||error);
   }
+  // Evidence for the render pipeline, quality tier and wasm kernels; informational only.
+  let pipeline=null;
+  try {
+    pipeline=await evaluate(cdp,`(()=>{const g=globalThis;const pick=(o,re)=>o?Object.fromEntries(Object.entries(o).filter(([k,v])=>re.test(k)&&(typeof v!=='object'||v===null))):null;
+      const safe=f=>{try{return f();}catch(e){return {error:String(e&&e.message||e)};}};
+      return {gl:pick(g.__gaiusGLStats,/^(terrain|baseVertex|bakedIndex|mappedPool|quadIndex|shiftedIndex|multiDraw)/),
+        gpuCaps:safe(()=>g.__gaiusGpuCaps?{tier:g.__gaiusGpuCaps.tier,rendererClass:g.__gaiusGpuCaps.rendererClass,renderer:g.__gaiusGpuCaps.renderer,
+          multiDraw:g.__gaiusGpuCaps.multiDraw,terrainBatchMode:g.__gaiusGpuCaps.terrainBatchMode,anisotropicFiltering:g.__gaiusGpuCaps.anisotropicFiltering}:null),
+        quality:safe(()=>({settings:g.__gaiusQualitySettings||null,stats:g.__gaiusQualityStats||null,devicePixelRatio:g.devicePixelRatio})),
+        kernels:safe(()=>g.__gaiusKernels&&g.__gaiusKernels.telemetry?g.__gaiusKernels.telemetry():null),
+        meshKernel:safe(()=>g.__gaiusMeshKernel&&g.__gaiusMeshKernel.status?g.__gaiusMeshKernel.status():null),
+        guards:{noSuspendViolations:g.__gaiusNoSuspendViolations|0,clinitSuspensions:g.__gaiusClinitSuspensions|0,
+          lastNoSuspendViolation:g.__gaiusLastNoSuspendViolation?String(g.__gaiusLastNoSuspendViolation).slice(0,500):null}};})()`);
+  } catch(error) {
+    pipeline={error:String(error?.message||error)};
+  }
   const terrain={ready:false,screenshotPath,identity,baselineScreenshotPath,baselineIdentity,
-    chunkDrawTelemetry,chunkDrawTelemetryError,
+    chunkDrawTelemetry,chunkDrawTelemetryError,pipeline,
     startupPerformance:{
       start:'CDP create-world command requested',
       end:'first observed multi-chunk terrain screenshot passing visual checks',
@@ -1024,14 +1077,27 @@ try {
   }
   runtime = mode==="single" ? singleRuntime : await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}return {capturedAt:new Date().toISOString(),stage:'final',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
   const siblingFileRequests=runtime.resources.filter(x=>x.name.startsWith("file:")&&!x.name.toLowerCase().endsWith(basename(artifact).toLowerCase())).map(x=>x.name); const criticalFailedResources=failedResources.filter(x=>!String(x.url||"").startsWith("http://127.0.0.1:8080/proxy/auth?")); const blobUrls=[runtime.classesUrl,runtime.workerUrl,runtime.wasmUrl].filter(x=>x.startsWith("blob:"));
-  const baseReady=exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=3;
-  report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:true,success:false,titleScreen:title,customSkin,singleRuntime,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
+  // TeaVM suspension guard errors can be swallowed by Java catch blocks, so the
+  // counters and console text are checked besides uncaught exceptions.
+  const runtimeGuards=await evaluate(cdp,RUNTIME_GUARD_EXPRESSION); const guardFailures=runtimeGuardFailures({snapshots:[runtimeGuards],entries:[...consoleMessages,...exceptions],label:"page"});
+  const baseReady=guardFailures.length===0&&exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=3;
+  report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:true,success:false,titleScreen:title,customSkin,singleRuntime,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,runtimeGuards,runtimeGuardFailures:guardFailures,clinitSuspensions:clinitSuspensionCount([runtimeGuards]),gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
   } catch(error) { if(!artifactIdentity){try{artifactIdentity=await fileIdentity(artifact);}catch(_){}} let diagnostic=null; try { diagnostic=await evaluate(cdp,`(()=>{const b=window.__gaiusNettyBridge;return {href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,body:(document.body?.innerText||'').slice(0,4000),state:window.__gaiusMinecraftState||null,workers:window.__gaiusSingleplayerWorkers?Array.from(window.__gaiusSingleplayerWorkers.entries()).map(([k,v])=>({key:k,state:v?.state||null,worldgen:v?.worldgen||null,ready:v?.ready||null})):null,events:(window.__gaiusMinecraftEvents||[]).slice(-80),bridgeType:typeof b,bridgeKeys:b?Object.keys(b):null,networkStats:window.__gaiusNetworkStats||null,bridgeStats:b?.stats||null,bridgeInitTrace:window.__gaiusNettyBridgeInitTrace||[],bridgeInitError:window.__gaiusNettyBridgeInitError||null,portableBridgeTrace:window.__gaiusPortableBridgeTrace||[],bridgeTrace:window.__gaiusBridgeTrace||[],bridgeOwn:globalThis===window?Object.getOwnPropertyNames(window).filter(k=>k.toLowerCase().includes('bridge')||k.toLowerCase().includes('network')):[],resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize}))};})()`); } catch(_) {} report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:false,success:false,error:String(error.stack||error),customSkin,singleRuntime,runtime,diagnostic,consoleMessages,exceptions,failedResources,gates:{baseReady:false,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-20000),capturedAt:new Date().toISOString()};
 } finally {
   if (workerProfiler && report) {
     report.workerDiagnostic = await workerProfiler.stop();
     if (report.workerDiagnostic.captureProfile) {
       report.workerCpuProfile = report.workerDiagnostic;
+    }
+    // Worker guard counters and console are only visible while the Worker
+    // diagnostic session is attached.
+    const workerEntries=report.workerDiagnostic.entries||[];
+    const workerGuardFailures=workerEntries.flatMap((entry,index)=>runtimeGuardFailures({
+      snapshots:[entry.globals?.runtimeGuards],entries:[...(entry.console||[]),...(entry.exceptions||[])],label:`worker ${index}`}));
+    report.workerClinitSuspensions=clinitSuspensionCount(workerEntries.map(entry=>entry.globals?.runtimeGuards));
+    if(workerGuardFailures.length){
+      report.runtimeGuardFailures=[...(report.runtimeGuardFailures||[]),...workerGuardFailures];
+      report.gates={...(report.gates||{}),baseReady:false};
     }
   }
   const cdpClosed=await closeCdp(cdp);

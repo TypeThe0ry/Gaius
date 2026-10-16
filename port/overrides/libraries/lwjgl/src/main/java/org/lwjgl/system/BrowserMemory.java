@@ -66,6 +66,18 @@ public final class BrowserMemory {
     private static int peakTemporaryBytes;
     private static long temporaryAllocationFailureCount;
     private static boolean telemetryBridgeAvailable = true;
+    /**
+     * Memory pressure for the wasm kernel runtime ({@code window.__gaiusKernels.reportPressure}):
+     * live bytes are reported as a level of {@link #MAX_LIVE_BYTES} from half of it upwards, once
+     * per {@link #PRESSURE_STEP_BYTES} of growth and at most once a second, and an allocation
+     * failure reports 1. The allocation path only compares two longs.
+     */
+    private static final long PRESSURE_STEP_BYTES = Math.max(1L, MAX_LIVE_BYTES / 32L);
+    private static final long PRESSURE_FLOOR_BYTES = MAX_LIVE_BYTES / 2L;
+    private static final long PRESSURE_MIN_INTERVAL_MS = 1000L;
+    private static long nextPressureBytes = PRESSURE_FLOOR_BYTES;
+    private static long lastPressureReportMillis = Long.MIN_VALUE / 2L;
+    private static boolean pressureBridgeAvailable = true;
 
     private BrowserMemory() {
     }
@@ -1089,6 +1101,9 @@ public final class BrowserMemory {
         peakLiveRegions = Math.max(peakLiveRegions, REGIONS.size());
         peakLiveBytes = Math.max(peakLiveBytes, liveBytes);
         publishTelemetry();
+        if (liveBytes >= nextPressureBytes) {
+            reportPressure((double) liveBytes / (double) MAX_LIVE_BYTES, false);
+        }
         return (long) id << 32;
     }
 
@@ -1134,6 +1149,10 @@ public final class BrowserMemory {
         clearAddressCacheRegion(id);
         liveBytes -= removed.capacity;
         freeCount++;
+        if (liveBytes + 2L * PRESSURE_STEP_BYTES < nextPressureBytes) {
+            // Memory went well below the last report: report again once it grows back.
+            nextPressureBytes = Math.max(PRESSURE_FLOOR_BYTES, liveBytes + PRESSURE_STEP_BYTES);
+        }
         for (BufferReference reference : removed.buffers) {
             if (ADDRESSES.remove(reference) != null) {
                 associatedBuffers--;
@@ -1280,7 +1299,37 @@ public final class BrowserMemory {
     private static void recordAllocationFailure() {
         allocationFailureCount++;
         publishTelemetry();
+        reportPressure(1.0, true);
     }
+
+    private static void reportPressure(double level, boolean urgent) {
+        nextPressureBytes = Math.max(PRESSURE_FLOOR_BYTES, liveBytes + PRESSURE_STEP_BYTES);
+        if (!pressureBridgeAvailable) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!urgent && now - lastPressureReportMillis < PRESSURE_MIN_INTERVAL_MS) {
+            return;
+        }
+        lastPressureReportMillis = now;
+        try {
+            reportPressureBrowser(Math.min(1.0, level));
+        } catch (Throwable ignored) {
+            // JVM-side lifecycle tests do not install TeaVM JS bodies.
+            pressureBridgeAvailable = false;
+        }
+    }
+
+    @JSBody(params = "level", script = """
+            const kernels = globalThis.__gaiusKernels;
+            if (kernels && typeof kernels.reportPressure === 'function') {
+              try {
+                kernels.reportPressure(level);
+              } catch (ignored) {
+              }
+            }
+            """)
+    private static native void reportPressureBrowser(double level);
 
     private static ByteBuffer buffer(long address) {
         return region(address).bytes;

@@ -6,6 +6,11 @@ import {mkdtemp, mkdir, rm, writeFile} from "node:fs/promises";
 import {createServer} from "node:net";
 import {tmpdir} from "node:os";
 import {basename, dirname, resolve} from "node:path";
+import {
+  RUNTIME_GUARD_EXPRESSION,
+  clinitSuspensionCount,
+  runtimeGuardFailures,
+} from "../../tools/teavm-runtime-guards.mjs";
 
 const defaultChrome = process.platform === "win32"
   ? "C:/Program Files/Google/Chrome/Application/chrome.exe"
@@ -352,6 +357,7 @@ try {
     clientStartupProgress: window.__gaiusClientStartupProgress || [],
     startupProbe: window.__gaiusStartupProbe || null,
     audioStats: window.__gaiusAudioStats || null,
+    runtimeGuards: ${RUNTIME_GUARD_EXPRESSION},
     resourceEntries: performance.getEntriesByType('resource').map((entry) => ({
       name: entry.name,
       startTime: entry.startTime,
@@ -389,6 +395,11 @@ try {
     performanceMetrics: metrics.metrics || [],
     consoleMessages,
     exceptions,
+    runtimeGuardFailures: runtimeGuardFailures({
+      snapshots: [finalState.runtimeGuards],
+      entries: [...consoleMessages, ...exceptions],
+    }),
+    clinitSuspensions: clinitSuspensionCount([finalState.runtimeGuards]),
     chromeOutput: chromeOutput.join("").slice(-20_000),
   };
 
@@ -414,12 +425,18 @@ try {
     bootTimings: finalState.bootTimings,
     longTasks: finalState.startupProbe?.longTasks || [],
     exceptions,
+    runtimeGuardFailures: summary.runtimeGuardFailures,
+    clinitSuspensions: summary.clinitSuspensions,
   }, null, 2));
   if (titleError) {
     const partialOutput = profile
       ? `${outputPrefix}.cpuprofile and ${outputPrefix}.json`
       : `${outputPrefix}.json`;
     throw new Error(`${titleError.message}; partial results saved to ${partialOutput}`);
+  }
+  if (summary.runtimeGuardFailures.length > 0) {
+    throw new Error("TeaVM runtime guard failures (see runtimeGuardFailures in "
+      + `${outputPrefix}.json): ${summary.runtimeGuardFailures[0]}`);
   }
 } finally {
   if (cpuProfiling && session && !profileStopped) {

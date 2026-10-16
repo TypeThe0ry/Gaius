@@ -231,8 +231,15 @@ function assertBaseVertexBaseline() {
     "derived attribute source index did not return to baseline");
 }
 
-// Without the extension, element uploads retain a bounded CPU shadow so a first
-// base-vertex fallback never introduces a synchronous GPU readback in the draw path.
+// The default element policy keeps no upload-time CPU shadow: the first base-vertex
+// fallback on a buffer reads it back once and the shadow is maintained from then on.
+assert.equal(state.elementShadowAlways || false, false, "element shadows default to lazy");
+assert.equal(state.shouldShadowBufferTarget(gl.ELEMENT_ARRAY_BUFFER, 99), false,
+  "default element upload requested a CPU shadow");
+// gaiusElementShadow=always restores the upload-time shadow exercised below: without the
+// extension, element uploads retain a bounded CPU shadow so a first base-vertex fallback
+// never introduces a synchronous GPU readback in the draw path.
+state.elementShadowAlways = true;
 let sourceId = 1;
 let vao = bindElementSource(sourceId, new Uint8Array([1, 2, 3, 4]));
 assert.equal(state.bufferBytes.has(sourceId), true, "fallback upload did not retain a shadow");

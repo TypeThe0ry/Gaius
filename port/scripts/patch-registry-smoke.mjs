@@ -420,11 +420,13 @@ try {
   assert.match(result.err, /is not a 26\.3\+ client \(renderApi=BLAZE3D/);
   result = run(["dev.gaius.tools.Minecraft263BrowserPatcher", jar263, m263Root]);
   assert.notEqual(result.status, 0, "M263 requires the version argument");
-  // The 26.3 domains patch the output of the modern chain; on the vanilla jar the terrain
-  // chain check (TerrainPatches263.verifyTerrainChain) must refuse the missing chain hooks.
+  // The 26.3 domains patch the output of the modern chain; on the vanilla jar a chain check
+  // must refuse the missing chain hooks. Since v0.4 the render domain's inventory throttle
+  // rewrite (QualityPatches263) needs the MinecraftClientPatcher hook and refuses first;
+  // otherwise TerrainPatches263.verifyTerrainChain does.
   result = run(["dev.gaius.tools.Minecraft263BrowserPatcher", jar263, m263Root, "26.3"]);
   assert.notEqual(result.status, 0, "M263 accepted a jar the modern chain never patched");
-  assert.match(result.err, /26\.3 terrain chain is incomplete/);
+  assert.match(result.err, /26\.3 terrain chain is incomplete|inventory throttle \(MinecraftClientPatcher\.patchGameRendererBrowserInventoryWorldRenderThrottle\): expected exactly one call, found 0/);
 
   // Minecraft262BrowserPatcher: optional version argument, modern profiles only.
   result = run(["dev.gaius.tools.Minecraft262BrowserPatcher", jar262, join(work, "m262-out"), "1.21.11"]);

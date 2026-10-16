@@ -291,6 +291,22 @@ if (attachPortRequested || attachPort > 0) {
   );
 }
 const headless = args.includes("--headless");
+// Graphics quality pins. The GPU tier decides the quality runtime's defaults (Improved
+// Transparency, post-processing stages, inventory world rate, DPR cap), so a run must not
+// depend on the machine's measured tier. The graphics preset is no longer re-applied at
+// startup (GraphicsPresetStartupPatcher), so benchmarkOptionsText below carries the target
+// option values itself and the URL keeps ?gaiusPresetReplay=0.
+const QUALITY_TIERS = ["low", "mid", "high", "ultra"];
+const benchmarkGpuTier = String(
+  value("--gpu-tier", environmentContract.gpuTier || "mid"),
+).toLowerCase();
+if (!QUALITY_TIERS.includes(benchmarkGpuTier)) {
+  throw new Error(`--gpu-tier must be one of ${QUALITY_TIERS.join(", ")}; got ${benchmarkGpuTier}`);
+}
+const benchmarkPostChain = value("--post", "");
+if (benchmarkPostChain !== "" && benchmarkPostChain !== "0" && benchmarkPostChain !== "1") {
+  throw new Error(`--post must be 0 or 1; got ${benchmarkPostChain}`);
+}
 if (!smoke && headless) {
   throw new Error(
     "--headless is disabled for strict headed Chrome release evidence",
@@ -515,41 +531,48 @@ const benchmarkBuildIdentity = await readBenchmarkBuildIdentity();
 if (!benchmarkBuildIdentity.coherent) {
   throw new Error("Gaius.manifest.json does not describe one coherent benchmark build");
 }
+// Minecraft.<init> no longer re-applies the saved graphics preset (it did until v0.4.0 and
+// overwrote most of the values below with the preset's own), so every value the Fancy preset
+// sets is seeded explicitly here: the same 15 non-distance values as GraphicsPreset.apply's
+// FANCY arm on 1.21.11, 26.2 and 26.3, which keeps runs comparable with the earlier baselines.
+// The distances come from the benchmark profile and now take effect as seeded.
 const benchmarkOptionsText = [
   `version:${Number(activeVersionProfile.worldVersion)}`,
   "autoJump:false",
   "operatorItemsTab:true",
-  // Apply the graphics preset before the distance overrides: 26.2's preset
-  // bundles its own render/simulation distance, so applying it after those
-  // lines overwrote the seeded profile distance with the preset's vanilla 8/6.
   `graphicsPreset:${JSON.stringify(String(environmentContract.graphicsPreset || "fancy"))}`,
   `renderDistance:${expectedRenderDistance}`,
   `simulationDistance:${expectedSimulationDistance}`,
-  "entityDistanceScaling:0.5",
+  // Fancy: entityDistanceScaling 1.0.
+  "entityDistanceScaling:1.0",
   `maxFps:${Number(environmentContract.maxFps || 260)}`,
   // Keep long stationary benchmark phases from entering the AFK throttle.
   // MINIMIZED means only an actually minimized window is throttled; AFK would
   // cap a stationary foreground run at 30 FPS after one minute.
   // StringRepresentable serializes this enum as lowercase "minimized".
   'inactivityFpsLimit:"minimized"',
+  // Fancy: clouds FANCY ("true"), cloud range 64, AO on, cutout leaves on, Improved
+  // Transparency off, weather radius 10, chunk updates PLAYER_AFFECTED (1), 4 mipmap levels,
+  // anisotropy bit 1, RGSS texture filtering (1), biome blend 2, all particles (0), entity
+  // shadows on, menu blur 5.
   "renderClouds:\"true\"",
-  "cloudRange:32",
+  "cloudRange:64",
   "ao:true",
   "cutoutLeaves:true",
   "vignette:true",
-  "improvedTransparency:true",
-  "weatherRadius:3",
+  "improvedTransparency:false",
+  "weatherRadius:10",
   "chunkSectionFadeInTime:0.0",
-  "prioritizeChunkUpdates:0",
+  "prioritizeChunkUpdates:1",
   "mipmapLevels:4",
   "maxAnisotropyBit:1",
-  "textureFiltering:0",
-  "biomeBlendRadius:0",
-  "particles:2",
+  "textureFiltering:1",
+  "biomeBlendRadius:2",
+  "particles:0",
   "enableVsync:false",
-  "entityShadows:false",
+  "entityShadows:true",
   "bobView:false",
-  "menuBackgroundBlurriness:0",
+  "menuBackgroundBlurriness:5",
   "panoramaSpeed:1.0",
   "screenEffectScale:0.0",
   "fovEffectScale:0.0",
@@ -588,6 +611,9 @@ if (args.includes("--help")) {
     "  --pin-worker-distance         Diagnostic-only Worker distance harness override (never release evidence)",
     "  --probe-f3                    After strict world readiness, toggle F3 twice and capture bounded evidence",
     "  --trace-f3-exceptions         With --probe-f3, enable bounded CDP native exception capture (diagnostic only)",
+    "  --gpu-tier low|mid|high|ultra Pin the graphics quality tier (?gaiusTier=, default mid)",
+    "  --post 0|1                    Pin the 26.3 post-processing chain (?gaiusPost=); 0 for",
+    "                                vanilla-comparison screenshots (default: the tier's choice)",
     "  --print-config                Print resolved benchmark configuration and exit",
   ].join("\n"));
   process.exit(0);
@@ -611,6 +637,11 @@ if (args.includes("--print-config")) {
     attachPortRequested,
     attachMode: "disabled-input-required",
     isolatedEnvironment,
+    graphicsQuality: {
+      gpuTier: benchmarkGpuTier,
+      presetReplay: false,
+      post: benchmarkPostChain === "" ? "tier-default" : benchmarkPostChain,
+    },
     buildRoot: configuredBuildRoot,
     distRoot,
     overlayDirectory: configuredOverlayDirectory,
@@ -1181,6 +1212,10 @@ function configureBenchmarkUrl(rawUrl) {
   configured.searchParams.set("perfHud", "0");
   configured.searchParams.set("glStats", "1");
   configured.searchParams.set("gaiusServerTickTelemetry", "1");
+  // Pin the quality tier and keep the seeded options live (see benchmarkOptionsText).
+  configured.searchParams.set("gaiusTier", benchmarkGpuTier);
+  configured.searchParams.set("gaiusPresetReplay", "0");
+  if (benchmarkPostChain !== "") configured.searchParams.set("gaiusPost", benchmarkPostChain);
   // The launcher defaults the mesh buffer-shadow budget to 1 GiB (single 256 MiB),
   // which lets the WebGL shadow grow past the contract's 64 MiB budget and stall a
   // frame on one large shadow copy. Pin the runtime budget to the contract so the
@@ -3559,6 +3594,14 @@ async function finalTelemetry(session) {
     + "{width:value.width,height:value.height,clientWidth:value.clientWidth,"
     + "clientHeight:value.clientHeight}:null;})(),"
     + "display:Object.assign({},globalThis.__gaiusDisplay||{}),"
+    + "quality:(()=>{const caps=globalThis.__gaiusGpuCaps||null;"
+    + "const stats=globalThis.__gaiusQualityStats||null;"
+    + "return {tier:caps&&caps.tier?String(caps.tier):null,"
+    + "detectedTier:caps&&caps.detectedTier?String(caps.detectedTier):null,"
+    + "overridden:caps?!!caps.overridden:null,"
+    + "renderScale:stats?Number(stats.renderScale)||null:null,"
+    + "lastStages:stats?String(stats.lastStages||''):null,"
+    + "disabled:stats?!!stats.disabled:null};})(),"
     + "fps:Object.assign({},globalThis.__gaiusFps||{}),optionsText},"
     + "pipeline:Object.assign({},pipeline,{"
     + "taskHistogram:pipeline.taskHistogram?Array.from(pipeline.taskHistogram):[],"
@@ -4474,6 +4517,13 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     environmentIssues.push("Video Settings were not Unlimited with the Fancy preset");
   }
   if (options.enableVsync !== false) environmentIssues.push("VSync was not disabled");
+  // Only checked where the page loads the quality runtime (it publishes __gaiusGpuCaps).
+  const qualityTier = telemetry.environment?.quality?.tier ?? null;
+  if (qualityTier !== null && qualityTier !== benchmarkGpuTier) {
+    environmentIssues.push(
+      `graphics quality tier was ${qualityTier}; the benchmark pins ?gaiusTier=${benchmarkGpuTier}`,
+    );
+  }
   const actualInactivityFpsLimit = String(options.inactivityFpsLimit || "").toLowerCase();
   if (actualInactivityFpsLimit !== expectedInactivityFpsLimit) {
     environmentIssues.push(

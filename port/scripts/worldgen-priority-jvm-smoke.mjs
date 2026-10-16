@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -94,8 +94,14 @@ try {
     mkdirSync(patchOutput, { recursive: true });
     jar = join(root, "client-patched.jar");
     copyFileSync(rawJar, jar);
-    run(javac, ["--release", "21", "-proc:none", "-classpath", asmClasspath, "-d", toolClasses,
-      join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools/MinecraftServerWorkerPatcher.java")],
+    // The patcher registers the light and worldgen kernel patches (tools/kernel); -sourcepath
+    // picks up anything else they reference.
+    const toolSources = join(repositoryRoot, "port/tools/src/main/java");
+    const kernelPatches = join(toolSources, "dev/gaius/tools/kernel");
+    run(javac, ["--release", "21", "-proc:none", "-classpath", asmClasspath, "-sourcepath", toolSources,
+      "-d", toolClasses, join(toolSources, "dev/gaius/tools/MinecraftServerWorkerPatcher.java"),
+      ...readdirSync(kernelPatches).filter((name) => name.endsWith(".java")).sort()
+        .map((name) => join(kernelPatches, name))],
       "patcher compile");
     const patchLog = run(java, ["-classpath", [toolClasses, asmClasspath].join(delimiter),
       "dev.gaius.tools.MinecraftServerWorkerPatcher", jar, patchOutput], "MinecraftServerWorkerPatcher");

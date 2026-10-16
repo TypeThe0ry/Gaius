@@ -1,5 +1,6 @@
 package dev.gaius.tools;
 
+import dev.gaius.tools.quality.GraphicsPresetStartupPatcher;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -57,8 +58,24 @@ public final class Minecraft12111BrowserPatcher {
         }
         String jar = args[0];
         Path root = Path.of(args[1]);
-        patchGraphicsPresetBrowserDistances(jar, root);
-        patchChunkGenerationCooperation(jar, root);
+        PatchRegistry.configureProfile("1.21.11");
+        PatchRegistry.run("Minecraft12111BrowserPatcher.patchGraphicsPresetBrowserDistances", () -> patchGraphicsPresetBrowserDistances(jar, root));
+        PatchRegistry.run("Minecraft12111BrowserPatcher.patchChunkGenerationCooperation", () -> patchChunkGenerationCooperation(jar, root));
+        PatchRegistry.run("Minecraft12111BrowserPatcher.patchGraphicsPresetStartupReplay", () -> patchGraphicsPresetStartupReplay(jar, root));
+        PatchRegistry.printSummary();
+    }
+
+    /**
+     * Stops {@code Minecraft.<init>} from re-applying the saved graphics preset over the
+     * per-GPU-tier first-launch options (see {@link GraphicsPresetStartupPatcher}); the 1.21.11
+     * counterpart of {@code Minecraft262BrowserPatcher.patchGraphicsPresetStartupReplay}.
+     */
+    private static void patchGraphicsPresetStartupReplay(String jar, Path root)
+            throws IOException {
+        if (!GraphicsPresetStartupPatcher.apply(jar, root)) {
+            throw new IllegalStateException(
+                    "1.21.11 must have the graphics preset startup replay in Minecraft.<init>");
+        }
     }
 
     /**
@@ -72,6 +89,11 @@ public final class Minecraft12111BrowserPatcher {
      * getter receiver chains, the boxed integer stores, and the preset setter.
      * Any missing, duplicated, or reshaped target fails closed instead of
      * allowing an unrelated distance rewrite.</p>
+     *
+     * <p>Unlike the 26.2/26.3 patcher, the FANCY (16/12) and FABULOUS (32/12) arms keep their
+     * vanilla distances here (minecraft-12111-patcher-smoke pins all three arms to vanilla).
+     * With {@code patchGraphicsPresetStartupReplay} they only apply when the player picks
+     * that preset in Video Settings, or at startup with {@code ?gaiusPresetReplay=1}.</p>
      */
     private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
             throws IOException {

@@ -28,7 +28,7 @@ public final class BrowserChunkDrawTelemetry {
 
     /** Starts a new per-frame uniform map and clears all columns on a world switch. */
     public static void beginPrepare(Object world) {
-        if (!telemetryEnabled()) {
+        if (!BrowserBuildFlags.telemetry() || !telemetryEnabled()) {
             active = false;
             activeWorld = null;
             pendingUniformIndex = -1;
@@ -100,6 +100,24 @@ public final class BrowserChunkDrawTelemetry {
     /** Called by the ChunkSection uniform callback immediately before the GPU draw. */
     public static void armUniformIndex(int uniformIndex) {
         pendingUniformIndex = active ? uniformIndex : -1;
+    }
+
+    /** True while first-draw telemetry is recording, so batch callers can skip the loop. */
+    public static boolean batchTelemetryActive() {
+        return active;
+    }
+
+    /**
+     * Records one section drawn inside a terrain batch (BrowserTerrainBatch): the batch
+     * bypasses the per-draw uniform callback and draw hook, so it reports the uniform index
+     * and index count of each section it issued here.
+     */
+    public static void recordBatchedDraw(int uniformIndex, int indexCount) {
+        if (!active) {
+            return;
+        }
+        pendingUniformIndex = uniformIndex;
+        commitSuccessfulDraw(indexCount);
     }
 
     /**

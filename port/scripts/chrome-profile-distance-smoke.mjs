@@ -44,9 +44,10 @@ assert.equal(
   configuration.workerDistanceContract.effectiveDistanceModel,
   "min(client-options-preference,worker-server-distance)",
 );
-// Minecraft.<init> re-applies the seeded graphics preset over renderDistance and
-// simulationDistance, so the natural 8:6 Worker start only holds while the seeded
-// FANCY preset itself carries 8/6.  Vanilla FANCY is 16/12; the 26.2 patcher pins it.
+// Applying a graphics preset (Video Settings, or Minecraft.<init> with ?gaiusPresetReplay=1)
+// writes renderDistance and simulationDistance, so the natural 8:6 Worker start only holds
+// while the seeded FANCY preset itself carries 8/6.  Vanilla FANCY is 16/12 and FABULOUS
+// 32/12; the 26.2 patcher pins both.
 const performanceContract = JSON.parse(await readFile(configuration.contractPath, "utf8"));
 assert.equal(String(performanceContract.environment?.graphicsPreset).toLowerCase(), "fancy",
   "the natural 8:6 distance profile must seed the FANCY graphics preset");
@@ -59,6 +60,9 @@ assert.match(browserPatcherSource,
 assert.match(browserPatcherSource,
   /"FANCY",\s*"renderDistance",\s*16\);[\s\S]*?"FANCY",\s*"simulationDistance",\s*12\);\s*fancyRenderDistance\.operand = 8;\s*fancySimulationDistance\.operand = 6;/,
   "26.2 patcher must pin the FANCY preset to the browser 8/6 distances");
+assert.match(browserPatcherSource,
+  /"FABULOUS",\s*"renderDistance",\s*32\);[\s\S]*?"FABULOUS",\s*"simulationDistance",\s*12\);[\s\S]*?fabulousRenderDistance\.operand = 8;\s*fabulousSimulationDistance\.operand = 6;/,
+  "26.2 patcher must pin the FABULOUS preset to the browser 8/6 distances");
 assert.doesNotMatch(browserPatcherSource, /GraphicsPreset\.CUSTOM|"CUSTOM"/,
   "26.2 distance contract must not switch the graphics preset to CUSTOM");
 assert.equal(configuration.activeVersionProfile.storageSchema, 2);

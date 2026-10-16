@@ -7,19 +7,24 @@ public final class BrowserGenerationSpawnTelemetry {
     private BrowserGenerationSpawnTelemetry() {
     }
 
+    // A stripped build returns token 0, which the other entries ignore.
     public static int begin(Object world, int chunkX, int chunkZ) {
+        if (!BrowserBuildFlags.telemetry()) return 0;
         return recordBegin(world, chunkX, chunkZ);
     }
 
     public static void entityAdded(int token) {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordEntityAdded(token);
     }
 
     public static void complete(int token) {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordComplete(token);
     }
 
     public static void failed(int token) {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordFailed(token);
     }
 
